@@ -2,7 +2,7 @@
 
 用 Rust 重写终端会话/进程监督层的独立项目，目标是为本地终端与 SSH 终端提供**真实进程状态**、**精确退出/中断**和**交互事件**，而不是依赖输出文本中的完成标记。
 
-> 当前状态：需求与关键决策（OQ-1~6）已确认，协议/开发计划为草案（随实现定稿），尚未创建 Cargo 工作区或实现代码。先读 `docs/REQUIREMENTS.md` 与 `docs/PROTOCOL.md`。
+> 当前状态：需求与关键决策（OQ-1~6）已确认；M0 工程骨架（Cargo workspace、协议类型、CI 门禁）已建立，进入 M1（service 骨架）。协议/开发计划仍随实现定稿。先读 `docs/REQUIREMENTS.md` 与 `docs/PROTOCOL.md`。
 
 > 架构：**中心化 termx service**。终端归服务所有；opencode 模型/Web/CLI 都是客户端，经**本机 WebSocket（环回）+ token** 访问。opencode 会话重启只 detach，不杀终端。
 
@@ -33,5 +33,15 @@
 - Linux/macOS：直接调用 PTY 系统接口（`/dev/ptmx`、`grantpt/unlockpt`、termios/ioctl）管理主从端。
 - Windows：直接绑定 `CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`，配合 `STARTUPINFOEX` 与 Job Object；ConPTY 只作为字节传输层。
 - **自研**：VT/ANSI 解析、屏幕/滚动缓冲、光标/模式、键盘编码、粘贴/焦点、进程组/前台进程、事件状态机。
-- 终端核心跑在**独立 daemon 进程**，绝不继承 opencode 的 stdin/stdout/控制终端；CLI/opencode 通过 socket/JSON 事件通信。
+- 终端核心跑在**独立 daemon 进程**，绝不继承 opencode 的 stdin/stdout/控制终端；CLI/opencode 通过 WebSocket（环回）/JSON 事件通信。
 - 如果连 OS PTY/ConPTY 都不允许：只能支持普通程序的 stdin/stdout 管道模式，无法可靠支持 vim/top/ssh 密码提示等全屏交互程序；这是范围裁剪，不是实现细节。
+
+## 构建与测试
+要求 stable Rust ≥ 1.85（edition 2024）。仓库提交 `Cargo.lock`，本机与 CI 门禁统一使用 `--locked`：
+```sh
+cargo test --workspace --locked
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+Windows 本机可用 `scripts/ci.ps1` 一次跑完上述三项门禁。

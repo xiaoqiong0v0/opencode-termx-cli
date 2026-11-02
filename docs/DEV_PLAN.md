@@ -24,7 +24,7 @@
 | CLI | `clap` | 子命令 |
 | 时间/ID | `time`/`ulid` 或 `uuid`(v7) | 全局唯一 terminal_id |
 
-> 门禁：`cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`。
+> 门禁：`cargo fmt --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`。
 
 ## 3. Crate 结构（workspace）
 ```text
@@ -46,11 +46,11 @@ termx/
 ## 4. 里程碑
 ### M0 工程骨架
 - 交付：workspace、空 crate、CI 门禁脚本、`termx-protocol` 类型与事件枚举、测试夹具。
-- 门禁：`cargo test` 通过（协议序列化/反序列化、seq 单调、终态唯一单测）；fmt/clippy 干净。
+- 门禁：`cargo test` 通过（协议序列化/反序列化、终态分类单测）；fmt/clippy 干净。
 
 ### M1 service 骨架
-- 交付：daemon 启动、**本机 WebSocket（环回）+ token**、`hello`、会话键 `(root_session_id, name)` 与同名 `--force` 冲突处理、`terminal.list`、`attach/detach`（无真实 PTY 用 mock）、`subscribe` + cursor 回放。
-- 门禁：AC-10（service_lost）/AC-12（cursor 回放）/AC-15（鉴权）/AC-17（同名冲突）；多客户端 attach/detach/重连；空基线合法；非环回拒绝。
+- 交付：daemon 启动、**本机 WebSocket（环回）+ token**、`hello`、会话键 `(root_session_id, name)` 与同名 `--force` 冲突处理、`terminal.list`、`attach/detach`（无真实 PTY 用 mock）、`subscribe` + cursor 回放、方法参数引入 `TerminalLocator` 并支持 `(root_session_id, name)` 定位。
+- 门禁：AC-10（service_lost）/AC-12（cursor 回放）/AC-15（鉴权）/AC-17（同名冲突）；多客户端 attach/detach/重连；空基线合法；非环回拒绝；seq 单调、终态唯一由事件缓冲测试覆盖。
 
 ### M2 本地 PTY（核心）
 - 交付：`pty` 模式创建、`started/output`、真实 `exited/interrupted`、`status` 见 pid/pgid/foreground/树、`send`/`resize`/Ctrl-C、`terminate` 杀进程组、关闭无孤儿。
@@ -94,8 +94,8 @@ termx/
 
 ## 7. 质量门禁（每阶段）
 1. `cargo fmt --check` 通过。
-2. `cargo clippy -- -D warnings` 通过。
-3. `cargo test` 通过，新增关键路径有回归。
+2. `cargo clippy --all-targets --locked -- -D warnings` 通过。
+3. `cargo test --workspace --locked` 通过，新增关键路径有回归。
 4. 协议变更同步 `PROTOCOL.md`；需求变更同步 `REQUIREMENTS.md`。
 5. 事件顺序/终态唯一/无泄漏纳入真机验证。
 

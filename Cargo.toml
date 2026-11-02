@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/termx-protocol",
+    "crates/termx-terminal",
+    "crates/termx-proc",
+    "crates/termx-ssh",
+    "crates/termx-core",
+    "crates/termx-service",
+    "crates/termx-cli",
+    "crates/termx-helper",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+# M0 只预留下述公共依赖；PTY/SSH 等平台依赖留到 M1+ 按需引入。
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

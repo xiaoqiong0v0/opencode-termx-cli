@@ -1,0 +1,11 @@
+[package]
+name = "termx-protocol"
+description = "termx 协议 v1：消息、事件、状态与错误码（无 OS 依赖）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

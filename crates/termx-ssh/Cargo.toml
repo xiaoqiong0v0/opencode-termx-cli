@@ -1,0 +1,6 @@
+[package]
+name = "termx-ssh"
+description = "SSH 连接、PTY、helper 握手与降级（M0 占位）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

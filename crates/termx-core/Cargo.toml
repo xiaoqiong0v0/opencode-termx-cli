@@ -1,0 +1,9 @@
+[package]
+name = "termx-core"
+description = "会话状态机、registry、事件总线与背压（M0 占位）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+termx-protocol = { path = "../termx-protocol" }

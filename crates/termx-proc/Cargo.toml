@@ -1,0 +1,6 @@
+[package]
+name = "termx-proc"
+description = "PTY/ConPTY、进程组/树、wait/exit/signal（M0 占位）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

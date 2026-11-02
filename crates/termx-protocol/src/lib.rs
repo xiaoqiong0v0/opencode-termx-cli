@@ -1,0 +1,1358 @@
+//! termx 协议 v1 的类型定义。
+//!
+//! 本 crate 是 `docs/PROTOCOL.md` 的代码映射，不含任何 OS 依赖，可独立单测。
+//! 约定：每个 WebSocket text frame 承载一个完整 JSON 对象；事件无 `id`，
+//! 以 `terminal_id` + 每终端单调 `seq` 定位；`ts` 为 RFC3339 UTC 字符串。
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// 主协议版本标识，对应 `hello.proto`。
+pub const PROTOCOL_VERSION: &str = "termx/1";
+
+/// helper 协议版本标识，对应 `helper.hello.proto`。
+pub const HELPER_PROTOCOL_VERSION: &str = "termx-helper/1";
+
+/// 协议 JSON 编解码错误。
+#[derive(Debug, thiserror::Error)]
+pub enum CodecError {
+    /// JSON 序列化或反序列化失败。
+    #[error("协议 JSON 编解码失败: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// 将协议消息序列化为单个 text frame 的 JSON 文本。
+pub fn to_json<T: Serialize>(value: &T) -> Result<String, CodecError> {
+    Ok(serde_json::to_string(value)?)
+}
+
+/// 从单个 text frame 解析协议消息。
+pub fn from_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, CodecError> {
+    Ok(serde_json::from_str(text)?)
+}
+
+/// 生命周期状态（正交维度之一）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    /// 已创建，尚未开始运行。
+    Created,
+    /// 运行中。
+    Running,
+    /// 正在退出。
+    Exiting,
+    /// 自然退出（终态）。
+    Exited,
+    /// 被信号/控制中断（终态）。
+    Interrupted,
+    /// 失败（终态）。
+    Error,
+}
+
+impl LifecycleState {
+    /// 是否为终态（`exited` / `interrupted` / `error`）。
+    ///
+    /// 终态之后拒绝写操作，事件只发一次。
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Exited | Self::Interrupted | Self::Error)
+    }
+}
+
+/// 交互状态（运行期子状态，不参与生命周期）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionState {
+    /// 无交互对象。
+    None,
+    /// 前台处于交互式程序。
+    Interactive,
+    /// 疑似等待输入。
+    WaitingInput,
+}
+
+/// 交互/推断结论的置信度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// 低：仅启发式。
+    Low,
+    /// 中：多信号一致。
+    Medium,
+    /// 高：shell integration 等直接证据。
+    High,
+}
+
+/// 终端输出流来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stream {
+    /// PTY 合并流。
+    Pty,
+    /// 独立 stdout。
+    Stdout,
+    /// 独立 stderr。
+    Stderr,
+}
+
+/// 终端创建模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// 伪终端模式（合并 stdout/stderr）。
+    Pty,
+    /// 管道 stdio 模式。
+    Stdio,
+}
+
+/// 协议错误码，序列化为 snake_case。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// token 错误或握手失败。
+    AuthFailed,
+    /// 主协议/helper 版本不匹配。
+    VersionMismatch,
+    /// 参数或帧非法。
+    BadRequest,
+    /// 终端不存在或已清理。
+    NotFound,
+    /// 对终态终端做写操作。
+    AlreadyTerminal,
+    /// 同名 `(root_session_id, name)` 已存在且未带 `force`。
+    SessionExists,
+    /// 非 lease owner 或权限不足。
+    PermissionDenied,
+    /// 超过会话/缓冲/队列上限。
+    LimitExceeded,
+    /// 进程创建失败。
+    SpawnFailed,
+    /// PTY/ConPTY 创建失败。
+    PtyFailed,
+    /// SSH 连接失败。
+    SshConnectFailed,
+    /// helper 握手/启动失败。
+    HelperFailed,
+    /// 帧或状态机违例。
+    ProtocolError,
+    /// 服务崩溃/重启（客户端合成）。
+    ServiceLost,
+    /// 未分类错误。
+    Internal,
+}
+
+impl ErrorCode {
+    /// 该错误码是否建议客户端重试（对齐 `docs/PROTOCOL.md` §10）。
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::LimitExceeded
+                | Self::SshConnectFailed
+                | Self::HelperFailed
+                | Self::ServiceLost
+                | Self::Internal
+        )
+    }
+}
+
+/// 协议错误载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolError {
+    /// 错误码。
+    pub code: ErrorCode,
+    /// 人类可读说明（不含敏感数据）。
+    pub message: String,
+    /// 是否可重试。
+    pub retryable: bool,
+    /// 相关终端 ID；`session_exists` 时携带旧终端 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// 请求消息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Request {
+    /// 客户端生成、同一连接内唯一的请求 ID。
+    pub id: String,
+    /// RPC 方法名，如 `terminal.create`。
+    pub method: String,
+    /// 方法参数，形状由方法决定。
+    pub params: serde_json::Value,
+}
+
+/// 响应消息；成功时带 `result`，失败时带 `error`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Response {
+    /// 与请求配对的 ID。
+    pub id: String,
+    /// 是否成功。
+    pub ok: bool,
+    /// 成功结果；失败时缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// 失败错误；成功时缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolError>,
+}
+
+/// 事件信封：共用 `terminal_id` / `seq` / `ts`，具体类型由 `kind` 决定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// 所属终端 ID。
+    pub terminal_id: String,
+    /// 每终端单调递增序号，从 1 开始。
+    pub seq: u64,
+    /// RFC3339 UTC 时间戳。
+    pub ts: String,
+    /// 事件类型与载荷（以 `type` 标签平铺）。
+    #[serde(flatten)]
+    pub kind: EventKind,
+}
+
+/// 事件类型与载荷。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventKind {
+    /// 进程已创建。
+    Started {
+        /// 进程 ID。
+        pid: u32,
+        /// 进程组 ID。
+        pgid: u32,
+        /// 创建模式。
+        mode: Mode,
+    },
+    /// 输出增量。
+    Output {
+        /// base64 编码的输出字节。
+        data: String,
+        /// 输出流来源。
+        stream: Stream,
+    },
+    /// 背压丢弃的最旧 output 区间。
+    OutputDropped {
+        /// 区间起始 seq（含）。
+        from_seq: u64,
+        /// 区间结束 seq（含）。
+        to_seq: u64,
+    },
+    /// 疑似等待输入（非终态）。
+    WaitingInput {
+        /// 置信度。
+        confidence: Confidence,
+        /// 推断依据，如 `prompt` / `stdin_blocked`。
+        reason: String,
+    },
+    /// 交互对象进入/切换/退出。
+    InteractiveChanged {
+        /// 是否处于交互态。
+        active: bool,
+        /// 交互进程 PID；退出交互时可能缺省。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        /// 交互进程组 ID；退出交互时可能缺省。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pgid: Option<u32>,
+        /// 交互进程命令；退出交互时可能缺省。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// 置信度。
+        confidence: Confidence,
+    },
+    /// 某客户端附着。
+    Attached {
+        /// 客户端 ID。
+        client_id: String,
+    },
+    /// 某客户端断开（含 idle_timeout）。
+    Detached {
+        /// 客户端 ID。
+        client_id: String,
+        /// 断开原因。
+        reason: String,
+    },
+    /// 输入 lease 被抢占/释放。
+    LeaseRevoked {
+        /// 客户端 ID。
+        client_id: String,
+    },
+    /// 自然退出（终态）。
+    Exited {
+        /// 进程退出码。
+        exit_code: i32,
+    },
+    /// 信号/控制中断（终态）。
+    Interrupted {
+        /// 信号名，如 `SIGINT`。
+        signal: String,
+        /// 来源：`control-c` / `signal` / `timeout` / `terminate`。
+        source: String,
+    },
+    /// 失败（终态，含 `service_lost`）。
+    Error {
+        /// 错误码。
+        code: ErrorCode,
+        /// 错误说明。
+        message: String,
+        /// 是否可重试。
+        retryable: bool,
+    },
+    /// SSH/helper 能力与降级标识。
+    Capabilities {
+        /// helper 是否可用。
+        helper: bool,
+        /// helper/协议版本。
+        version: String,
+        /// 是否降级为 best-effort。
+        #[serde(rename = "bestEffort")]
+        best_effort: bool,
+    },
+}
+
+/// 进程树节点。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcNode {
+    /// 进程 ID。
+    pub pid: u32,
+    /// 父进程 ID。
+    pub ppid: u32,
+    /// 进程组 ID。
+    pub pgid: u32,
+    /// 命令行（已截断）。
+    pub cmd: String,
+}
+
+/// 终端状态快照。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSnapshot {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 生命周期状态。
+    pub state: LifecycleState,
+    /// 创建模式。
+    pub mode: Mode,
+    /// 主进程 ID（未创建时缺省）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// 进程组 ID（未创建时缺省）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
+    /// 父进程 ID（未创建时缺省）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    /// 前台进程组 ID（无 TTY 时缺省）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_pgrp: Option<u32>,
+    /// 进程树。
+    pub tree: Vec<ProcNode>,
+    /// 交互状态。
+    pub interactive: InteractionState,
+    /// 交互推断置信度。
+    pub confidence: Confidence,
+    /// 列数。
+    pub cols: u16,
+    /// 行数。
+    pub rows: u16,
+    /// 当前事件缓冲基线游标。
+    pub cursor: u64,
+}
+
+/// `terminal.read` 返回的一段输出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadChunk {
+    /// 事件序号。
+    pub seq: u64,
+    /// RFC3339 UTC 时间戳。
+    pub ts: String,
+    /// base64 编码的输出字节。
+    pub data: String,
+}
+
+/// `idle_timeout` 的时间单位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleTimeoutUnit {
+    /// 秒。
+    S,
+    /// 毫秒。
+    Ms,
+}
+
+/// `idle_timeout` 到期动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleTimeoutAction {
+    /// 仅断开客户端，终端继续运行。
+    Detach,
+    /// 终止终端。
+    Terminate,
+}
+
+/// 空闲超时配置；省略或 `value = 0` 表示永不超时。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleTimeout {
+    /// 时长数值。
+    pub value: u64,
+    /// 时间单位。
+    pub unit: IdleTimeoutUnit,
+    /// 到期动作；`value > 0` 时必填，`value = 0` 时可缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<IdleTimeoutAction>,
+}
+
+impl IdleTimeout {
+    /// 校验 `value > 0` 时 `action` 必须存在。
+    ///
+    /// 返回 `Err` 时给出可读原因，供 `bad_request` 使用。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.value > 0 && self.action.is_none() {
+            return Err("idle_timeout.value > 0 时 action 必填".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// `terminal.create` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateParams {
+    /// 创建模式。
+    pub mode: Mode,
+    /// 可执行程序。
+    pub cmd: String,
+    /// 程序参数。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 工作目录。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// 环境变量增量（JSON 对象 map）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    /// 列数（pty 可默认）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    /// 行数（pty 可默认）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+    /// 所属 opencode 会话 ID。
+    pub root_session_id: String,
+    /// 会话内名称，禁止 `/`、`\` 与空串。
+    pub name: String,
+    /// 同名已存在时是否终止旧终端后重建。
+    #[serde(default)]
+    pub force: bool,
+    /// 空闲超时；缺省表示永不超时。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<IdleTimeout>,
+}
+
+/// `terminal.create` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateResult {
+    /// 新建终端的 ID。
+    pub terminal_id: String,
+    /// 创建时的事件序列位置，供 `attach` 回放。
+    pub cursor: u64,
+}
+
+/// `terminal.attach` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 客户端已处理的最后 seq；缺省表示只要快照。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+}
+
+/// `subscribe` 的单个终端订阅项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribeTarget {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 起始游标；缺省表示从当前基线开始。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+}
+
+/// `subscribe` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubscribeParams {
+    /// 指定终端订阅列表。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminals: Option<Vec<SubscribeTarget>>,
+    /// 是否订阅全部终端。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all: Option<bool>,
+}
+
+/// 单个终端的订阅游标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionCursor {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 当前基线游标。
+    pub cursor: u64,
+    /// 需要重置本地视图的原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<ResetReason>,
+}
+
+/// `subscribe` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribeResult {
+    /// 每个订阅终端的游标。
+    pub cursors: Vec<SubscriptionCursor>,
+}
+
+/// 终端定位：`terminal_id` 或 `(root_session_id, name)` 二选一。
+///
+/// 两者都给时以 `terminal_id` 为准（见 `docs/PROTOCOL.md` §6）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TerminalLocator {
+    /// 终端内部 ID；存在时优先。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// 所属 opencode 会话 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<String>,
+    /// 会话内名称。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl TerminalLocator {
+    /// 三个定位字段是否都缺省。
+    pub fn is_empty(&self) -> bool {
+        self.terminal_id.is_none() && self.root_session_id.is_none() && self.name.is_none()
+    }
+}
+
+/// `hello` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloParams {
+    /// 主协议版本。
+    pub proto: String,
+    /// 鉴权 token。
+    pub token: String,
+    /// 客户端标识。
+    pub client: String,
+}
+
+/// helper / SSH 能力描述。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// helper 是否可用。
+    pub helper: bool,
+    /// helper/协议版本。
+    pub version: String,
+    /// 是否降级为 best-effort。
+    #[serde(rename = "bestEffort")]
+    pub best_effort: bool,
+}
+
+/// `hello` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloResult {
+    /// 主协议版本。
+    pub proto: String,
+    /// 服务端标识。
+    pub server: String,
+    /// 能力描述。
+    pub capabilities: Capabilities,
+}
+
+/// `terminal.claim` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 是否抢占现有 lease。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `terminal.claim` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimResult {
+    /// 当前 lease owner（客户端 ID）。
+    pub owner: String,
+    /// lease 标识。
+    pub lease: String,
+}
+
+/// `terminal.release` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+}
+
+/// 通用成功结果；用于 `detach` / `release` / `resize` / `signal` / `terminate` / `unsubscribe`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleResult {
+    /// 操作是否成功。
+    pub ok: bool,
+}
+
+/// `terminal.list` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ListParams {
+    /// 过滤的生命周期状态。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub states: Option<Vec<LifecycleState>>,
+    /// 返回条数上限。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `terminal.list` 的单条记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListItem {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 所属 opencode 会话 ID。
+    pub root_session_id: String,
+    /// 会话内名称。
+    pub name: String,
+    /// 生命周期状态。
+    pub state: LifecycleState,
+    /// 创建模式。
+    pub mode: Mode,
+    /// 主进程 ID（未创建时缺省）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// 空闲超时配置。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<IdleTimeout>,
+    /// 最后一次活动时间（RFC3339 UTC）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    /// 创建时间（RFC3339 UTC）。
+    pub created_at: String,
+}
+
+/// `terminal.attach` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachResult {
+    /// 当前基线游标。
+    pub cursor: u64,
+    /// 终端快照。
+    pub snapshot: TerminalSnapshot,
+    /// 需要重置本地视图的原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<ResetReason>,
+}
+
+/// `terminal.status` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResult {
+    /// 终端状态快照。
+    pub snapshot: TerminalSnapshot,
+}
+
+/// `terminal.read` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 起始游标（必填，对齐 PROTOCOL §6）。
+    pub cursor: u64,
+    /// 单次返回的字节上限。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+/// `terminal.read` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadResult {
+    /// 输出片段，按 `seq` 升序。
+    pub chunks: Vec<ReadChunk>,
+    /// 读取后的游标。
+    pub cursor: u64,
+    /// 需要重置本地视图的原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<ResetReason>,
+}
+
+/// 游标不可回放时的重置原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetReason {
+    /// 缓冲已因背压回绕。
+    BufferOverflow,
+    /// 游标早于缓冲下界。
+    TooOld,
+    /// 使用当前基线重新开始。
+    Baseline,
+}
+
+/// `terminal.send` 参数；`data` 与 `text` 二选一（同传取 `data`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// base64 编码的原始字节。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// UTF-8 文本。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// 是否追加换行。
+    #[serde(default)]
+    pub enter: bool,
+}
+
+/// `terminal.resize` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 列数。
+    pub cols: u16,
+    /// 行数。
+    pub rows: u16,
+}
+
+/// `terminal.signal` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 信号名，如 `SIGINT`。
+    pub signal: String,
+}
+
+/// `terminal.terminate` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminateParams {
+    /// 终端 ID。
+    pub terminal_id: String,
+    /// 是否强制终止（跳过优雅退出）。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `{ value, unit }` 形式的时间跨度，用于 `prune.older_than`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSpan {
+    /// 时长数值。
+    pub value: u64,
+    /// 时间单位。
+    pub unit: IdleTimeoutUnit,
+}
+
+/// `terminal.prune` 的清理基准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneBasis {
+    /// 按最后活动时间。
+    LastActivity,
+    /// 按创建时间。
+    CreatedAt,
+}
+
+/// `terminal.prune` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PruneParams {
+    /// 过滤的生命周期状态。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub states: Option<Vec<LifecycleState>>,
+    /// 早于该时长的会话才清理。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub older_than: Option<TimeSpan>,
+    /// 清理基准。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis: Option<PruneBasis>,
+}
+
+/// `terminal.prune` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneResult {
+    /// 被清理的终端 ID 列表。
+    pub removed: Vec<String>,
+}
+
+/// `unsubscribe` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UnsubscribeParams {
+    /// 要取消订阅的终端；缺省表示全部。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminals: Option<Vec<TerminalLocator>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value as JsonValue;
+
+    /// 构造带统一信封的示例事件。
+    fn sample_event(kind: EventKind) -> Event {
+        Event {
+            terminal_id: "01JABCDEF".to_string(),
+            seq: 7,
+            ts: "2026-11-02T09:00:00.000Z".to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn event_round_trips_all_kinds() {
+        let kinds = vec![
+            EventKind::Started {
+                pid: 100,
+                pgid: 100,
+                mode: Mode::Pty,
+            },
+            EventKind::Output {
+                data: "aGVsbG8=".to_string(),
+                stream: Stream::Stdout,
+            },
+            EventKind::OutputDropped {
+                from_seq: 3,
+                to_seq: 5,
+            },
+            EventKind::WaitingInput {
+                confidence: Confidence::Medium,
+                reason: "prompt".to_string(),
+            },
+            EventKind::InteractiveChanged {
+                active: false,
+                pid: None,
+                pgid: None,
+                command: None,
+                confidence: Confidence::Low,
+            },
+            EventKind::Attached {
+                client_id: "c-1".to_string(),
+            },
+            EventKind::Detached {
+                client_id: "c-1".to_string(),
+                reason: "idle_timeout".to_string(),
+            },
+            EventKind::LeaseRevoked {
+                client_id: "c-1".to_string(),
+            },
+            EventKind::Exited { exit_code: 7 },
+            EventKind::Interrupted {
+                signal: "SIGTERM".to_string(),
+                source: "terminate".to_string(),
+            },
+            EventKind::Error {
+                code: ErrorCode::ServiceLost,
+                message: "daemon 重启".to_string(),
+                retryable: true,
+            },
+            EventKind::Capabilities {
+                helper: true,
+                version: HELPER_PROTOCOL_VERSION.to_string(),
+                best_effort: false,
+            },
+        ];
+        assert_eq!(kinds.len(), 12, "EventKind 变体数量应为 12");
+
+        for kind in kinds {
+            let event = sample_event(kind);
+            let json = to_json(&event).expect("事件序列化失败");
+            let back: Event = from_json(&json).expect("事件反序列化失败");
+            assert_eq!(event, back);
+        }
+    }
+
+    #[test]
+    fn event_json_shares_envelope_and_uses_type_tag() {
+        let event = sample_event(EventKind::InteractiveChanged {
+            active: true,
+            pid: Some(4321),
+            pgid: Some(4321),
+            command: Some("python".to_string()),
+            confidence: Confidence::High,
+        });
+        let json: JsonValue =
+            serde_json::from_str(&to_json(&event).expect("序列化失败")).expect("JSON 解析失败");
+
+        assert_eq!(json["type"], "interactive_changed");
+        assert_eq!(json["terminal_id"], "01JABCDEF");
+        assert_eq!(json["seq"], 7);
+        assert_eq!(json["ts"], "2026-11-02T09:00:00.000Z");
+        assert_eq!(json["active"], true);
+        assert_eq!(json["confidence"], "high");
+    }
+
+    #[test]
+    fn error_codes_serialize_as_snake_case() {
+        let cases = [
+            (ErrorCode::AuthFailed, "auth_failed"),
+            (ErrorCode::VersionMismatch, "version_mismatch"),
+            (ErrorCode::BadRequest, "bad_request"),
+            (ErrorCode::NotFound, "not_found"),
+            (ErrorCode::AlreadyTerminal, "already_terminal"),
+            (ErrorCode::SessionExists, "session_exists"),
+            (ErrorCode::PermissionDenied, "permission_denied"),
+            (ErrorCode::LimitExceeded, "limit_exceeded"),
+            (ErrorCode::SpawnFailed, "spawn_failed"),
+            (ErrorCode::PtyFailed, "pty_failed"),
+            (ErrorCode::SshConnectFailed, "ssh_connect_failed"),
+            (ErrorCode::HelperFailed, "helper_failed"),
+            (ErrorCode::ProtocolError, "protocol_error"),
+            (ErrorCode::ServiceLost, "service_lost"),
+            (ErrorCode::Internal, "internal"),
+        ];
+        assert_eq!(cases.len(), 15, "ErrorCode 变体数量应为 15");
+
+        for (code, expected) in cases {
+            let json = serde_json::to_value(code).expect("错误码序列化失败");
+            assert_eq!(json, expected);
+        }
+    }
+
+    #[test]
+    fn lifecycle_terminal_states_are_recognized() {
+        let terminal = [
+            LifecycleState::Exited,
+            LifecycleState::Interrupted,
+            LifecycleState::Error,
+        ];
+        let non_terminal = [
+            LifecycleState::Created,
+            LifecycleState::Running,
+            LifecycleState::Exiting,
+        ];
+
+        for state in terminal {
+            assert!(state.is_terminal(), "{state:?} 应为终态");
+        }
+        for state in non_terminal {
+            assert!(!state.is_terminal(), "{state:?} 不应为终态");
+        }
+    }
+
+    #[test]
+    fn response_shapes_distinguish_ok_and_error() {
+        let ok = Response {
+            id: "c-001".to_string(),
+            ok: true,
+            result: Some(serde_json::json!({ "terminal_id": "01JABCDEF" })),
+            error: None,
+        };
+        let ok_json: JsonValue =
+            serde_json::from_str(&to_json(&ok).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(ok_json["ok"], true);
+        assert_eq!(ok_json["result"]["terminal_id"], "01JABCDEF");
+        assert!(ok_json.get("error").is_none());
+
+        let err = Response {
+            id: "c-002".to_string(),
+            ok: false,
+            result: None,
+            error: Some(ProtocolError {
+                code: ErrorCode::NotFound,
+                message: "终端不存在".to_string(),
+                retryable: false,
+                terminal_id: None,
+            }),
+        };
+        let err_json: JsonValue =
+            serde_json::from_str(&to_json(&err).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(err_json["ok"], false);
+        assert!(err_json.get("result").is_none());
+        assert_eq!(err_json["error"]["code"], "not_found");
+        assert_eq!(err_json["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn capabilities_uses_best_effort_camel_case() {
+        let event = sample_event(EventKind::Capabilities {
+            helper: false,
+            version: "termx-helper/1".to_string(),
+            best_effort: true,
+        });
+        let json: JsonValue =
+            serde_json::from_str(&to_json(&event).expect("序列化失败")).expect("JSON 解析失败");
+
+        assert_eq!(json["type"], "capabilities");
+        assert_eq!(json["bestEffort"], true);
+        assert_eq!(json["helper"], false);
+    }
+
+    #[test]
+    fn retryable_codes_match_protocol_table() {
+        let retryable = [
+            ErrorCode::LimitExceeded,
+            ErrorCode::SshConnectFailed,
+            ErrorCode::HelperFailed,
+            ErrorCode::ServiceLost,
+            ErrorCode::Internal,
+        ];
+        let non_retryable = [
+            ErrorCode::AuthFailed,
+            ErrorCode::VersionMismatch,
+            ErrorCode::BadRequest,
+            ErrorCode::NotFound,
+            ErrorCode::AlreadyTerminal,
+            ErrorCode::SessionExists,
+            ErrorCode::PermissionDenied,
+            ErrorCode::SpawnFailed,
+            ErrorCode::PtyFailed,
+            ErrorCode::ProtocolError,
+        ];
+
+        for code in retryable {
+            assert!(code.is_retryable(), "{code:?} 应可重试");
+        }
+        for code in non_retryable {
+            assert!(!code.is_retryable(), "{code:?} 不应可重试");
+        }
+    }
+
+    /// 构造覆盖全部可选字段的创建参数。
+    fn sample_create_params(idle_timeout: Option<IdleTimeout>) -> CreateParams {
+        let mut env = BTreeMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("LANG".to_string(), "C.UTF-8".to_string());
+
+        CreateParams {
+            mode: Mode::Pty,
+            cmd: "pwsh".to_string(),
+            args: vec!["-NoLogo".to_string()],
+            cwd: Some("D:\\work".to_string()),
+            env: Some(env),
+            cols: Some(120),
+            rows: Some(30),
+            root_session_id: "ses-1".to_string(),
+            name: "build".to_string(),
+            force: true,
+            idle_timeout,
+        }
+    }
+
+    #[test]
+    fn create_params_round_trip() {
+        let never = sample_create_params(Some(IdleTimeout {
+            value: 0,
+            unit: IdleTimeoutUnit::S,
+            action: None,
+        }));
+        let terminate = sample_create_params(Some(IdleTimeout {
+            value: 500,
+            unit: IdleTimeoutUnit::Ms,
+            action: Some(IdleTimeoutAction::Terminate),
+        }));
+
+        // env 必须序列化为 JSON 对象；value=0 时 action 不出现。
+        let never_json: JsonValue =
+            serde_json::from_str(&to_json(&never).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(never_json["env"]["TERM"], "xterm-256color");
+        assert_eq!(never_json["force"], true);
+        assert!(never_json["idle_timeout"].get("action").is_none());
+
+        for params in [never, terminate] {
+            let json = to_json(&params).expect("序列化失败");
+            let back: CreateParams = from_json(&json).expect("反序列化失败");
+            assert_eq!(params, back);
+        }
+    }
+
+    #[test]
+    fn idle_timeout_validate_requires_action_only_when_positive() {
+        let zero_without_action = IdleTimeout {
+            value: 0,
+            unit: IdleTimeoutUnit::S,
+            action: None,
+        };
+        assert!(zero_without_action.validate().is_ok());
+
+        let zero_with_action = IdleTimeout {
+            value: 0,
+            unit: IdleTimeoutUnit::Ms,
+            action: Some(IdleTimeoutAction::Terminate),
+        };
+        assert!(zero_with_action.validate().is_ok());
+
+        let positive_with_action = IdleTimeout {
+            value: 1,
+            unit: IdleTimeoutUnit::S,
+            action: Some(IdleTimeoutAction::Detach),
+        };
+        assert!(positive_with_action.validate().is_ok());
+
+        let positive_without_action = IdleTimeout {
+            value: 1,
+            unit: IdleTimeoutUnit::S,
+            action: None,
+        };
+        assert!(positive_without_action.validate().is_err());
+    }
+
+    /// 构造覆盖进程树与可选字段的快照。
+    fn sample_snapshot() -> TerminalSnapshot {
+        TerminalSnapshot {
+            terminal_id: "01JABCDEF".to_string(),
+            state: LifecycleState::Running,
+            mode: Mode::Pty,
+            pid: Some(100),
+            pgid: Some(100),
+            ppid: Some(1),
+            foreground_pgrp: Some(100),
+            tree: vec![ProcNode {
+                pid: 100,
+                ppid: 1,
+                pgid: 100,
+                cmd: "pwsh -NoLogo".to_string(),
+            }],
+            interactive: InteractionState::Interactive,
+            confidence: Confidence::High,
+            cols: 120,
+            rows: 30,
+            cursor: 42,
+        }
+    }
+
+    #[test]
+    fn snapshot_and_rpc_types_round_trip() {
+        let snapshot = sample_snapshot();
+        let snapshot_back: TerminalSnapshot =
+            from_json(&to_json(&snapshot).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(snapshot, snapshot_back);
+
+        let chunk = ReadChunk {
+            seq: 42,
+            ts: "2026-11-02T09:00:00.000Z".to_string(),
+            data: "aGVsbG8=".to_string(),
+        };
+        let chunk_back: ReadChunk =
+            from_json(&to_json(&chunk).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(chunk, chunk_back);
+
+        let attach = AttachParams {
+            terminal_id: "01JABCDEF".to_string(),
+            cursor: Some(41),
+        };
+        let attach_back: AttachParams =
+            from_json(&to_json(&attach).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(attach, attach_back);
+
+        let hello = HelloParams {
+            proto: PROTOCOL_VERSION.to_string(),
+            token: "secret".to_string(),
+            client: "termx-cli".to_string(),
+        };
+        let hello_json: JsonValue =
+            serde_json::from_str(&to_json(&hello).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(hello_json["proto"], PROTOCOL_VERSION);
+        let hello_back: HelloParams =
+            from_json(&to_json(&hello).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(hello, hello_back);
+    }
+
+    #[test]
+    fn none_options_are_omitted_from_json() {
+        let params = CreateParams {
+            mode: Mode::Stdio,
+            cmd: "cat".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+            root_session_id: "ses-1".to_string(),
+            name: "io".to_string(),
+            force: false,
+            idle_timeout: None,
+        };
+        let params_json: JsonValue =
+            serde_json::from_str(&to_json(&params).expect("序列化失败")).expect("JSON 解析失败");
+        for key in ["cwd", "env", "cols", "rows", "idle_timeout"] {
+            assert!(params_json.get(key).is_none(), "{key} 不应出现在 JSON 中");
+        }
+
+        let attach = AttachParams {
+            terminal_id: "01JABCDEF".to_string(),
+            cursor: None,
+        };
+        let attach_json: JsonValue =
+            serde_json::from_str(&to_json(&attach).expect("序列化失败")).expect("JSON 解析失败");
+        assert!(attach_json.get("cursor").is_none());
+
+        let error = ProtocolError {
+            code: ErrorCode::SessionExists,
+            message: "同名会话已存在".to_string(),
+            retryable: false,
+            terminal_id: None,
+        };
+        let error_json: JsonValue =
+            serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
+        assert!(error_json.get("terminal_id").is_none());
+
+        let mut snapshot = sample_snapshot();
+        snapshot.pid = None;
+        let snapshot_json: JsonValue =
+            serde_json::from_str(&to_json(&snapshot).expect("序列化失败")).expect("JSON 解析失败");
+        assert!(snapshot_json.get("pid").is_none());
+    }
+
+    #[test]
+    fn session_exists_error_carries_terminal_id() {
+        let error = ProtocolError {
+            code: ErrorCode::SessionExists,
+            message: "同名会话已存在".to_string(),
+            retryable: false,
+            terminal_id: Some("01JOLD".to_string()),
+        };
+        let json: JsonValue =
+            serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
+
+        assert_eq!(json["code"], "session_exists");
+        assert_eq!(json["terminal_id"], "01JOLD");
+    }
+
+    #[test]
+    fn terminal_locator_detects_empty_and_omits_none() {
+        assert!(TerminalLocator::default().is_empty());
+        assert!(
+            !TerminalLocator {
+                terminal_id: Some("01JABCDEF".to_string()),
+                ..TerminalLocator::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TerminalLocator {
+                root_session_id: Some("ses-1".to_string()),
+                name: Some("build".to_string()),
+                terminal_id: None,
+            }
+            .is_empty()
+        );
+
+        let locator = TerminalLocator {
+            terminal_id: Some("01JABCDEF".to_string()),
+            root_session_id: None,
+            name: None,
+        };
+        let json: JsonValue =
+            serde_json::from_str(&to_json(&locator).expect("序列化失败")).expect("JSON 解析失败");
+        assert!(json.get("root_session_id").is_none());
+        assert!(json.get("name").is_none());
+    }
+
+    #[test]
+    fn event_kind_type_tags_are_exact() {
+        let cases = vec![
+            (
+                EventKind::Started {
+                    pid: 1,
+                    pgid: 1,
+                    mode: Mode::Pty,
+                },
+                "started",
+            ),
+            (
+                EventKind::Output {
+                    data: "aGk=".to_string(),
+                    stream: Stream::Pty,
+                },
+                "output",
+            ),
+            (
+                EventKind::OutputDropped {
+                    from_seq: 1,
+                    to_seq: 2,
+                },
+                "output_dropped",
+            ),
+            (
+                EventKind::WaitingInput {
+                    confidence: Confidence::Low,
+                    reason: "no_output".to_string(),
+                },
+                "waiting_input",
+            ),
+            (
+                EventKind::InteractiveChanged {
+                    active: true,
+                    pid: Some(1),
+                    pgid: Some(1),
+                    command: Some("sh".to_string()),
+                    confidence: Confidence::High,
+                },
+                "interactive_changed",
+            ),
+            (
+                EventKind::Attached {
+                    client_id: "c-1".to_string(),
+                },
+                "attached",
+            ),
+            (
+                EventKind::Detached {
+                    client_id: "c-1".to_string(),
+                    reason: "idle_timeout".to_string(),
+                },
+                "detached",
+            ),
+            (
+                EventKind::LeaseRevoked {
+                    client_id: "c-1".to_string(),
+                },
+                "lease_revoked",
+            ),
+            (EventKind::Exited { exit_code: 0 }, "exited"),
+            (
+                EventKind::Interrupted {
+                    signal: "SIGINT".to_string(),
+                    source: "control-c".to_string(),
+                },
+                "interrupted",
+            ),
+            (
+                EventKind::Error {
+                    code: ErrorCode::Internal,
+                    message: "x".to_string(),
+                    retryable: true,
+                },
+                "error",
+            ),
+            (
+                EventKind::Capabilities {
+                    helper: false,
+                    version: HELPER_PROTOCOL_VERSION.to_string(),
+                    best_effort: true,
+                },
+                "capabilities",
+            ),
+        ];
+        assert_eq!(cases.len(), 12, "EventKind 变体数量应为 12");
+
+        for (kind, expected) in cases {
+            let json: JsonValue =
+                serde_json::from_str(&to_json(&sample_event(kind)).expect("序列化失败"))
+                    .expect("JSON 解析失败");
+            assert_eq!(json["type"].as_str(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn missing_optional_fields_deserialize_to_none() {
+        let error: ProtocolError =
+            from_json(r#"{"code":"session_exists","message":"x","retryable":false}"#)
+                .expect("ProtocolError 反序列化失败");
+        assert_eq!(error.terminal_id, None);
+
+        let event: Event = from_json(
+            r#"{"type":"interactive_changed","terminal_id":"t","seq":1,
+                "ts":"2026-11-02T09:00:00.000Z","active":false,"confidence":"low"}"#,
+        )
+        .expect("Event 反序列化失败");
+        match event.kind {
+            EventKind::InteractiveChanged {
+                pid, pgid, command, ..
+            } => {
+                assert_eq!(pid, None);
+                assert_eq!(pgid, None);
+                assert_eq!(command, None);
+            }
+            other => panic!("期望 interactive_changed，实际 {other:?}"),
+        }
+    }
+}

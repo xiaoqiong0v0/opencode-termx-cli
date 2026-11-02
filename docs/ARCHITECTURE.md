@@ -89,6 +89,6 @@ started -> output* -> interactive_changed* -> waiting_input*
 ## 7. 依赖与质量门禁
 - 不引入 `node-pty`/`portable-pty` 作为终端实现；OS API 直接绑定。
 - 远端 helper 与主协议版本绑定；helper 缺失/失败回退，不阻塞。
-- `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test`。
+- `cargo fmt --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`。
 - 平台矩阵：Windows ConPTY、Linux PTY、macOS PTY（后续）。
 - 真机：exit/signal、Ctrl-C、子进程树、交互切换、detach/attach、service 重启、无孤儿。

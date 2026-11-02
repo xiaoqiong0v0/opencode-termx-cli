@@ -1,0 +1,6 @@
+[package]
+name = "termx-helper"
+description = "远端 sidecar：提供进程/退出状态增强（M0 占位）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

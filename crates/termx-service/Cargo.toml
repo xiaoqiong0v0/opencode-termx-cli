@@ -1,0 +1,6 @@
+[package]
+name = "termx-service"
+description = "termx daemon：传输、鉴权、RPC 与订阅（M0 占位）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

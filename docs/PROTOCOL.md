@@ -61,12 +61,12 @@
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
 | `hello` | `{ proto, token, client }` | `{ proto, server, capabilities }` |
-| `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action:"detach"\|"terminate"} }` | `{ terminal_id, cursor }` |
+| `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"} }` | `{ terminal_id, cursor }` |
 | `terminal.claim` | `{ terminal_id, force? }` | `{ owner, lease }` |
 | `terminal.release` | `{ terminal_id }` | `{ ok }` |
 | `terminal.attach` | `{ terminal_id, cursor? }` | `{ cursor, snapshot, reset? }` |
 | `terminal.detach` | `{ terminal_id }` | `{ ok }` |
-| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, pid, idle_timeout, last_activity, created_at }]` |
+| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, pid?, idle_timeout?, last_activity?, created_at }]` |
 | `terminal.status` | `{ terminal_id }` | `{ snapshot }` |
 | `terminal.read` | `{ terminal_id, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
 | `terminal.send` | `{ terminal_id, data(base64)?, text?, enter? }` | `{ ok }` |
@@ -79,10 +79,11 @@
 
 约束：
 - `pty` 必带 `cols/rows`（可默认）；`stdio` 忽略尺寸。
-- `idle_timeout` 省略或 `value=0` 表示**永不超时**；`value>0` 时 `action` 必填。默认 `0`。
+- `env?` 为 **JSON 对象 map**（如 `{"TERM":"xterm-256color"}`），不是元组/二元数组。
+- `idle_timeout` 省略或 `value=0` 表示**永不超时**；`action` 仅在 `value>0` 时必填，`value=0` 可缺省。默认 `0`。该规则由 `IdleTimeout::validate` 校验，`terminal.create`（M1）调用。
 - **会话键**为 `(root_session_id, name)`；`terminal_id` 为内部全局唯一标识。`name` 禁止 `/`、`\`、空串。
-- 同名处理：同一 `(root_session_id, name)` 已存在时，`create` 不带 `force` → `session_exists`（附旧 `terminal_id` 与说明）；`force=true` → 终止旧终端（落 `interrupted{source:"terminate"}`）后新建。
-- 除 `create` 外，方法定位终端接受 `terminal_id`，或 `{root_session_id, name}`；两者都给时以 `terminal_id` 为准。
+- 同名处理：同一 `(root_session_id, name)` 已存在时，`create` 不带 `force` → `session_exists`（错误载荷的 `terminal_id` 字段携带旧终端 ID，并附说明）；`force=true` → 终止旧终端（落 `interrupted{source:"terminate"}`）后新建。
+- 分阶段定位：v0/M0 除 `create` 外的方法参数以 `terminal_id` 为准；M1 起这些方法参数引入 `TerminalLocator`（支持 `{root_session_id, name}`；两者都给时以 `terminal_id` 为准），届时同步更新表内参数。
 - `terminal.create` 返回初始 `cursor`（创建时的事件序列位置）；客户端据此 `attach` 可回放 `started` 与首屏 output，避免 create→attach 空窗丢事件。
 - `terminal.send`：`data` 与 `text` 二选一（同传取 `data`）；`text` 按 UTF-8；`enter=true` 追加换行（`\r`，pty）/`\n`（stdio）。
 - `terminal.claim` 取得输入 lease；同一终端同一时刻只有一个 lease owner。`force=true` 抢占（旧 owner 收 `permission_denied`/`lease_revoked`）。未 claim 或非 owner 的 `send` 返回 `permission_denied`。
@@ -107,9 +108,11 @@
 | `capabilities` | `helper, version, bestEffort` | SSH/helper 能力与降级标识 |
 
 - 所有事件共用每终端单调 `seq`；`output_dropped` 也占用 `seq`，使缺口可检测。
+- `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
 - `interactive_changed.active=true` 表示前台进入交互对象；`active=false` 表示退回 shell/结束交互。
-- `waiting_input` 表示疑似等待输入，必须带 `confidence`（`low`/`medium`/`high`）与 `reason`（可枚举：`prompt`/`stdin_blocked`/`no_output`/`shell_integration`/`heuristic`）。
-- `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；`source`∈`control-c`/`signal`/`timeout`/`terminate`。
+- `waiting_input` 表示疑似等待输入，必须带 `confidence`（`low`/`medium`/`high`）与 `reason`（常见取值：`prompt`/`stdin_blocked`/`no_output`/`shell_integration`/`heuristic`）。
+- `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`。
+- `reason` 与 `source` 按字符串处理：未知取值**原样透传**（前向兼容），客户端不得因未识别值拒绝事件。
 - 快照 `snapshot` 结构：
   ```jsonc
   { "terminal_id": "...", "state": "running", "mode": "pty", "pid": 123, "pgid": 123,
