@@ -16,6 +16,14 @@ const TERMX_CONFIG_DIR_ENV: &str = "TERMX_CONFIG_DIR";
 const TERMX_TOKEN_ENV: &str = "TERMX_TOKEN";
 /// 覆盖空闲检查 ticker 周期的环境变量，单位为毫秒。
 const TERMX_IDLE_TICK_MS_ENV: &str = "TERMX_IDLE_TICK_MS";
+/// 覆盖交互识别 ticker 周期的环境变量，单位为毫秒。
+const TERMX_INTERACTION_TICK_MS_ENV: &str = "TERMX_INTERACTION_TICK_MS";
+/// 覆盖交互识别无输出阈值的环境变量，单位为毫秒。
+const TERMX_INTERACTION_NO_OUTPUT_MS_ENV: &str = "TERMX_INTERACTION_NO_OUTPUT_MS";
+/// 覆盖交互识别同一等待信号重复投递间隔的环境变量，单位为毫秒。
+const TERMX_INTERACTION_REPEAT_MS_ENV: &str = "TERMX_INTERACTION_REPEAT_MS";
+/// 关闭/开启交互识别的环境变量；`0`/`false`/`off`/`no` 视为关闭。
+const TERMX_INTERACTION_ENABLED_ENV: &str = "TERMX_INTERACTION_ENABLED";
 /// 覆盖运行中终端数量上限的环境变量；缺失或 0 表示不限制。
 const TERMX_MAX_TERMINALS_ENV: &str = "TERMX_MAX_TERMINALS";
 /// 覆盖 stdio 写队列容量的环境变量。
@@ -47,6 +55,13 @@ pub const DEFAULT_SUBSCRIBER_QUEUE_CAPACITY: usize = termx_core::DEFAULT_SUBSCRI
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// 空闲检查后台 ticker 的默认周期。
 pub const DEFAULT_IDLE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// 交互识别后台 ticker 的默认周期。
+pub const DEFAULT_INTERACTION_TICK_INTERVAL: Duration = Duration::from_millis(250);
+/// 交互识别默认无输出阈值（与 core 分析器共用同一来源）。
+pub const DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD: Duration =
+    termx_core::DEFAULT_NO_OUTPUT_THRESHOLD;
+/// 同一等待信号默认的最小重复投递间隔（与 core 分析器共用同一来源）。
+pub const DEFAULT_INTERACTION_REPEAT_INTERVAL: Duration = termx_core::DEFAULT_REPEAT_INTERVAL;
 /// stdio stdin 有界写队列默认容量。
 pub const DEFAULT_STDIO_WRITE_QUEUE_CAPACITY: usize =
     termx_proc::DEFAULT_STDIO_WRITE_QUEUE_CAPACITY;
@@ -79,6 +94,14 @@ pub struct ServiceConfig {
     pub max_frame_bytes: usize,
     /// 空闲检查 ticker 周期；缺省 [`DEFAULT_IDLE_TICK_INTERVAL`]。
     pub idle_tick_interval: Duration,
+    /// 交互识别 ticker 周期；缺省 [`DEFAULT_INTERACTION_TICK_INTERVAL`]。
+    pub interaction_tick_interval: Duration,
+    /// 交互识别无输出阈值；缺省 [`DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD`]。
+    pub interaction_no_output_threshold: Duration,
+    /// 同一等待信号的最小重复投递间隔；缺省 [`DEFAULT_INTERACTION_REPEAT_INTERVAL`]。
+    pub interaction_repeat_interval: Duration,
+    /// 是否启用交互识别。
+    pub interaction_enabled: bool,
     /// 运行中终端数量上限；`None` 表示不限制。
     pub max_terminals: Option<usize>,
     /// stdio stdin 有界写队列容量；缺省 [`DEFAULT_STDIO_WRITE_QUEUE_CAPACITY`]。
@@ -96,6 +119,10 @@ impl ServiceConfig {
             token_file: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             idle_tick_interval: DEFAULT_IDLE_TICK_INTERVAL,
+            interaction_tick_interval: DEFAULT_INTERACTION_TICK_INTERVAL,
+            interaction_no_output_threshold: DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD,
+            interaction_repeat_interval: DEFAULT_INTERACTION_REPEAT_INTERVAL,
+            interaction_enabled: true,
             max_terminals: None,
             stdio_write_queue_capacity: DEFAULT_STDIO_WRITE_QUEUE_CAPACITY,
         }
@@ -139,11 +166,35 @@ impl ServiceConfig {
     /// 覆盖空闲检查 ticker 周期；0 会抬到 1ms，避免 `tokio::time::interval` panic。
     #[must_use]
     pub fn with_idle_tick_interval(mut self, idle_tick_interval: Duration) -> Self {
-        self.idle_tick_interval = if idle_tick_interval.is_zero() {
-            Duration::from_millis(1)
-        } else {
-            idle_tick_interval
-        };
+        self.idle_tick_interval = clamp_non_zero(idle_tick_interval);
+        self
+    }
+
+    /// 覆盖交互识别 ticker 周期；0 会抬到 1ms。
+    #[must_use]
+    pub fn with_interaction_tick_interval(mut self, interval: Duration) -> Self {
+        self.interaction_tick_interval = clamp_non_zero(interval);
+        self
+    }
+
+    /// 覆盖交互识别无输出阈值；0 会抬到 1ms。
+    #[must_use]
+    pub fn with_interaction_no_output_threshold(mut self, threshold: Duration) -> Self {
+        self.interaction_no_output_threshold = clamp_non_zero(threshold);
+        self
+    }
+
+    /// 覆盖同一等待信号的重复投递间隔；0 会抬到 1ms。
+    #[must_use]
+    pub fn with_interaction_repeat_interval(mut self, interval: Duration) -> Self {
+        self.interaction_repeat_interval = clamp_non_zero(interval);
+        self
+    }
+
+    /// 开启/关闭交互识别。
+    #[must_use]
+    pub fn with_interaction_enabled(mut self, enabled: bool) -> Self {
+        self.interaction_enabled = enabled;
         self
     }
 
@@ -175,6 +226,25 @@ impl ServiceConfig {
         let config_dir = resolve_config_dir(Platform::CURRENT, |key: &str| std::env::var_os(key))?;
         let mut config = Self::new(config_dir);
         config.idle_tick_interval = idle_tick_interval_from_env(|key: &str| std::env::var_os(key));
+        config.interaction_tick_interval = duration_from_ms_env(
+            TERMX_INTERACTION_TICK_MS_ENV,
+            DEFAULT_INTERACTION_TICK_INTERVAL,
+            |key: &str| std::env::var_os(key),
+        );
+        config.interaction_no_output_threshold = duration_from_ms_env(
+            TERMX_INTERACTION_NO_OUTPUT_MS_ENV,
+            DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD,
+            |key: &str| std::env::var_os(key),
+        );
+        config.interaction_repeat_interval = duration_from_ms_env(
+            TERMX_INTERACTION_REPEAT_MS_ENV,
+            DEFAULT_INTERACTION_REPEAT_INTERVAL,
+            |key: &str| std::env::var_os(key),
+        );
+        config.interaction_enabled =
+            bool_from_env(TERMX_INTERACTION_ENABLED_ENV, true, |key: &str| {
+                std::env::var_os(key)
+            });
         config.max_terminals =
             positive_usize_from_env(TERMX_MAX_TERMINALS_ENV, |key: &str| std::env::var_os(key));
         config.stdio_write_queue_capacity =
@@ -255,13 +325,42 @@ fn idle_tick_interval_from_env<F>(env: F) -> Duration
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    let parsed = env(TERMX_IDLE_TICK_MS_ENV)
+    duration_from_ms_env(TERMX_IDLE_TICK_MS_ENV, DEFAULT_IDLE_TICK_INTERVAL, env)
+}
+
+/// 从环境读取毫秒周期；缺失、非法或 0 时回退默认值。
+fn duration_from_ms_env<F>(name: &str, default: Duration, env: F) -> Duration
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let parsed = env(name)
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|millis| *millis > 0);
-    match parsed {
-        Some(millis) => Duration::from_millis(millis),
-        None => DEFAULT_IDLE_TICK_INTERVAL,
+    parsed.map_or(default, Duration::from_millis)
+}
+
+/// 从环境读取布尔开关；无法识别时回退默认值。
+fn bool_from_env<F>(name: &str, default: bool, env: F) -> bool
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let Some(value) = env(name).and_then(|value| value.into_string().ok()) else {
+        return default;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => default,
+    }
+}
+
+/// 把 0 周期抬到 1ms，避免 `tokio::time::interval` panic。
+fn clamp_non_zero(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval
     }
 }
 
@@ -529,6 +628,101 @@ mod tests {
             });
             assert_eq!(fallback, DEFAULT_IDLE_TICK_INTERVAL, "非法值 {invalid:?}");
         }
+    }
+
+    #[test]
+    fn interaction_settings_read_env_with_defaults() {
+        let defaults = ServiceConfig::new(PathBuf::from("/tmp/termx"));
+        assert_eq!(
+            defaults.interaction_tick_interval,
+            DEFAULT_INTERACTION_TICK_INTERVAL
+        );
+        assert_eq!(
+            defaults.interaction_no_output_threshold,
+            DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD
+        );
+        assert_eq!(
+            defaults.interaction_repeat_interval,
+            DEFAULT_INTERACTION_REPEAT_INTERVAL
+        );
+        assert!(defaults.interaction_enabled);
+
+        let table = [
+            (TERMX_INTERACTION_TICK_MS_ENV, "40"),
+            (TERMX_INTERACTION_NO_OUTPUT_MS_ENV, "1500"),
+            (TERMX_INTERACTION_REPEAT_MS_ENV, "9000"),
+            (TERMX_INTERACTION_ENABLED_ENV, "off"),
+        ];
+        let env = |key: &str| {
+            table
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(*value))
+        };
+        assert_eq!(
+            duration_from_ms_env(
+                TERMX_INTERACTION_TICK_MS_ENV,
+                DEFAULT_INTERACTION_TICK_INTERVAL,
+                env,
+            ),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            duration_from_ms_env(
+                TERMX_INTERACTION_NO_OUTPUT_MS_ENV,
+                DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD,
+                env,
+            ),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            duration_from_ms_env(
+                TERMX_INTERACTION_REPEAT_MS_ENV,
+                DEFAULT_INTERACTION_REPEAT_INTERVAL,
+                env,
+            ),
+            Duration::from_millis(9000)
+        );
+        assert!(!bool_from_env(TERMX_INTERACTION_ENABLED_ENV, true, env));
+        assert!(bool_from_env("TERMX_UNKNOWN", true, env));
+        for invalid in ["0", "abc", "  "] {
+            assert_eq!(
+                duration_from_ms_env(
+                    TERMX_INTERACTION_TICK_MS_ENV,
+                    DEFAULT_INTERACTION_TICK_INTERVAL,
+                    |key| (key == TERMX_INTERACTION_TICK_MS_ENV).then(|| OsString::from(invalid)),
+                ),
+                DEFAULT_INTERACTION_TICK_INTERVAL,
+                "非法值 {invalid:?}"
+            );
+        }
+
+        let configured = defaults
+            .clone()
+            .with_interaction_tick_interval(Duration::from_millis(10))
+            .with_interaction_no_output_threshold(Duration::from_millis(20))
+            .with_interaction_repeat_interval(Duration::from_millis(30))
+            .with_interaction_enabled(false);
+        assert_eq!(
+            configured.interaction_tick_interval,
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            configured.interaction_no_output_threshold,
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            configured.interaction_repeat_interval,
+            Duration::from_millis(30)
+        );
+        assert!(!configured.interaction_enabled);
+        assert_eq!(
+            defaults
+                .clone()
+                .with_interaction_tick_interval(Duration::ZERO)
+                .interaction_tick_interval,
+            Duration::from_millis(1)
+        );
     }
 
     #[test]

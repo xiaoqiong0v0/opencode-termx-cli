@@ -124,7 +124,12 @@
 - `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
 - 区间只包含**实际被丢弃的 `output`**：状态事件永不丢弃；若被淘汰的 output 之间夹有状态事件，服务端按连续区间拆成多条 `output_dropped`，每条区间互不重叠且按 `from_seq` 升序。
 - `interactive_changed.active=true` 表示前台进入交互对象；`active=false` 表示退回 shell/结束交互。
+  - 置信度：前台进程组从根进程组变为子进程组、子进程组之间切换或回到根进程组，均为 `medium`；只在变化时推送，不随采样周期重复。
 - `waiting_input` 表示疑似等待输入，必须带 `confidence`（`low`/`medium`/`high`）与 `reason`（常见取值：`prompt`/`stdin_blocked`/`no_output`/`shell_integration`/`heuristic`）。
+  - `shell_integration`（OSC 133/633 prompt 开始/结束或命令结束）固定为 `high`；命令开始（`C`）会清除等待候选。
+  - `no_output` 由静默启发式产生：前台存在子进程时为 `medium`，仅 shell 静默时为 `low`；
+  - 同一 `(confidence, reason)` 默认按节流间隔重复投递；`waiting_input` **不是终态**，也不会清除历史提示，命令开始执行后不再产生新的等待事件。
+  - `stdin_blocked` 需要真实阻塞态证据（`wchan`/fd 等），当前版本不伪造该 reason，保留给具备阻塞态采集的平台实现。
 - `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`。
 - `reason` 与 `source` 按字符串处理：未知取值**原样透传**（前向兼容），客户端不得因未识别值拒绝事件。
 - 快照 `snapshot` 结构：

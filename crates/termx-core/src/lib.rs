@@ -6,11 +6,13 @@
 //! M2c1 接入 `termx-proc` 的真实 PTY/ConPTY 后端（`PtyFactory` / `PtyBackend`）；
 //! M2c2 增加输入写入、缩放、信号与两阶段终止（锁内校验、锁外调后端）；
 //! M3a 增加 stdio 管道后端（`StdioFactory` / `StdioBackend`）与按模式路由；
-//! M3b 增加 `terminal.read`、输出淘汰 `output_dropped` 与有界订阅队列背压。
+//! M3b 增加 `terminal.read`、输出淘汰 `output_dropped` 与有界订阅队列背压；
+//! M4b 增加交互识别状态机（OSC 133/633 + 前台进程组 + 无输出启发式）。
 
 mod backend;
 mod error;
 mod event;
+mod interaction;
 mod registry;
 mod terminal;
 
@@ -23,6 +25,10 @@ pub use error::CoreError;
 pub use event::{
     DEFAULT_EVENT_BUFFER_CAPACITY, EventBuffer, EventRecord, format_rfc3339, now_rfc3339,
     parse_rfc3339,
+};
+pub use interaction::{
+    DEFAULT_NO_OUTPUT_THRESHOLD, DEFAULT_REPEAT_INTERVAL, InteractionAnalyzer, InteractionConfig,
+    InteractionUpdate, InteractiveTarget, REASON_NO_OUTPUT, REASON_SHELL_INTEGRATION,
 };
 pub use registry::{
     DEFAULT_READ_MAX_BYTES, DEFAULT_SUBSCRIBER_QUEUE_CAPACITY, DETACH_REASON_DISCONNECT,

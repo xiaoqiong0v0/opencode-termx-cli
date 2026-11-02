@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use termx_core::{
-    CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, IDLE_DETACH_REASON, IdleAction, MockBackend,
-    MockFactory, Registry, TIMEOUT_SOURCE, TerminalBackend, TerminalId,
+    CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, IDLE_DETACH_REASON, IdleAction, InteractionConfig,
+    MockBackend, MockFactory, Registry, TIMEOUT_SOURCE, TerminalBackend, TerminalId,
 };
 use termx_protocol::{
     CreateParams, Event, EventKind, IdleTimeout, IdleTimeoutAction, IdleTimeoutUnit,
@@ -369,7 +369,7 @@ fn prune_basis_selects_created_at_or_last_activity() {
         )
         .expect("create 应成功");
     let old_created_id = TerminalId::new(old_created.terminal_id.clone());
-    // 创建时间改成很久以前；终态事件会把 last_activity 刷成当前时间。
+    // 创建时间改成很久以前；`last_activity` 仍由 `started` 初始化为当前时间。
     registry
         .get_mut(&old_created_id)
         .expect("终端应存在")
@@ -385,6 +385,9 @@ fn prune_basis_selects_created_at_or_last_activity() {
         )
         .expect("create 应成功");
     let recent_id = TerminalId::new(recent.terminal_id.clone());
+    // 把创建时间放到未来，保证基于 created_at 的清理只命中 old-created。
+    registry.get_mut(&recent_id).expect("终端应存在").created_at =
+        termx_core::format_rfc3339(OffsetDateTime::now_utc() + Duration::hours(1));
 
     // 以 created_at 为基准：只删除“创建时间很久以前”的终态终端。
     let result = registry.prune(PruneParams {
@@ -399,40 +402,142 @@ fn prune_basis_selects_created_at_or_last_activity() {
     assert!(registry.get(&old_created_id).is_none());
     assert!(registry.get(&recent_id).is_some());
 
-    // 以 last_activity 为基准：把 recent 的活动时间改旧后才能被清理。
-    registry
-        .get_mut(&recent_id)
-        .expect("终端应存在")
-        .last_activity = Some("2000-01-01T00:00:00Z".to_string());
+    // 以 last_activity 为基准：终态事件不再刷新它，显式设为未来时间后
+    // 不应被清理。
     registry
         .terminate(&by_id(&recent.terminal_id))
         .expect("terminate 应成功");
+    set_last_activity(
+        &mut registry,
+        &recent_id,
+        &termx_core::format_rfc3339(OffsetDateTime::now_utc() + Duration::hours(1)),
+    );
 
     let result = registry.prune(PruneParams {
         states: None,
         older_than: Some(TimeSpan {
             value: 1,
-            unit: IdleTimeoutUnit::Ms,
+            unit: IdleTimeoutUnit::S,
         }),
         basis: Some(PruneBasis::LastActivity),
     });
     assert!(
         result.removed.is_empty(),
-        "终态事件的 last_activity 是当前时间"
+        "last_activity 为未来时间时不应被清理"
     );
 
     // 把终态记录的 last_activity 改旧，验证 last_activity 基准确实生效。
-    registry
-        .get_mut(&recent_id)
-        .expect("终端应存在")
-        .last_activity = Some("2000-01-01T00:00:00Z".to_string());
+    set_last_activity(&mut registry, &recent_id, "2000-01-01T00:00:00Z");
     let result = registry.prune(PruneParams {
         states: None,
         older_than: Some(TimeSpan {
             value: 1,
-            unit: IdleTimeoutUnit::Ms,
+            unit: IdleTimeoutUnit::S,
         }),
         basis: Some(PruneBasis::LastActivity),
     });
     assert_eq!(result.removed, vec![recent.terminal_id]);
+}
+
+/// 把活动时间固定到过去，便于确定性地模拟空闲周期。
+fn set_last_activity(registry: &mut Registry, id: &TerminalId, value: &str) {
+    registry.get_mut(id).expect("终端应存在").last_activity = Some(value.to_string());
+}
+
+/// 周期性 `waiting_input` 不得刷新 `last_activity`，否则 `idle_timeout`
+/// 大于 no_output 阈值时永远不会到期（AC-7/8 回归）。
+#[test]
+fn waiting_input_repeats_do_not_block_idle_timeout() {
+    assert_waiting_input_does_not_block(IdleTimeoutAction::Detach);
+    assert_waiting_input_does_not_block(IdleTimeoutAction::Terminate);
+}
+
+/// 对指定到期动作验证一次“等待输入期间仍会空闲到期”。
+fn assert_waiting_input_does_not_block(action: IdleTimeoutAction) {
+    let mut registry = mock_registry();
+    // 静默阈值与重复间隔都取 10ms，确保连续两次采样都产出 waiting_input。
+    registry.set_interaction_config(InteractionConfig {
+        enabled: true,
+        no_output_threshold: std::time::Duration::from_millis(10),
+        repeat_interval: std::time::Duration::from_millis(10),
+    });
+
+    let created = registry
+        .create_with_backend(
+            params(
+                "ses-idle-waiting",
+                "waiting",
+                Some(idle(100, IdleTimeoutUnit::Ms, action)),
+            ),
+            Arc::new(MockBackend::new()),
+        )
+        .expect("create 应成功");
+    let id = TerminalId::new(created.terminal_id.clone());
+    let locator = by_id(&created.terminal_id);
+
+    let (tx, mut rx) = channel(64);
+    registry
+        .attach(&locator, "client-a", Some(0), tx)
+        .expect("attach 应成功");
+
+    // 固定活动时间到过去；后续交互事件若误刷新，到期判断会被推到未来。
+    let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("合法时间戳");
+    let base_text = termx_core::format_rfc3339(base);
+    set_last_activity(&mut registry, &id, &base_text);
+    drain(&mut rx);
+
+    // 用真实时钟触发静默启发式，连续产出多条 waiting_input。
+    let real_now = OffsetDateTime::now_utc();
+    for offset_secs in [1, 2] {
+        registry
+            .sample_interaction(&id, real_now + Duration::seconds(offset_secs), None, &[])
+            .expect("采样应成功");
+    }
+
+    let events = drain(&mut rx);
+    let waiting_count = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::WaitingInput { .. }))
+        .count();
+    assert!(waiting_count >= 2, "应重复投递 waiting_input: {events:?}");
+    assert_eq!(
+        registry
+            .get(&id)
+            .expect("终端应存在")
+            .last_activity
+            .as_deref(),
+        Some(base_text.as_str()),
+        "交互/状态事件不得刷新 last_activity"
+    );
+
+    // idle_timeout(100ms) 大于 no_output 阈值(10ms)，仍应正常到期。
+    let actions = registry.expire_idle(base + Duration::milliseconds(100));
+    assert_eq!(
+        actions.len(),
+        1,
+        "重复 waiting_input 不应阻止 idle_timeout 到期: {actions:?}"
+    );
+    let events = drain(&mut rx);
+    match action {
+        IdleTimeoutAction::Detach => {
+            assert!(matches!(actions[0], IdleAction::Detach { .. }));
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.kind,
+                    EventKind::Detached { reason, .. } if reason == IDLE_DETACH_REASON
+                )),
+                "应收到 idle_timeout detached: {events:?}"
+            );
+        }
+        IdleTimeoutAction::Terminate => {
+            assert!(matches!(actions[0], IdleAction::Terminate(_)));
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.kind,
+                    EventKind::Interrupted { source, .. } if source == TIMEOUT_SOURCE
+                )),
+                "应收到 timeout interrupted: {events:?}"
+            );
+        }
+    }
 }

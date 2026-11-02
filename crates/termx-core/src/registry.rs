@@ -18,8 +18,8 @@ use std::{
 use termx_protocol::{
     AttachResult, ClaimResult, Confidence, CreateParams, CreateResult, Event, EventKind,
     IdleTimeout, IdleTimeoutAction, IdleTimeoutUnit, InteractionState, LifecycleState, ListItem,
-    ListParams, Mode, PruneBasis, PruneParams, PruneResult, ReadChunk, ReadResult, ResetReason,
-    SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
+    ListParams, Mode, ProcNode, PruneBasis, PruneParams, PruneResult, ReadChunk, ReadResult,
+    ResetReason, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
 };
 use time::OffsetDateTime;
 use tokio::sync::{
@@ -29,8 +29,8 @@ use tokio::sync::{
 
 use crate::{
     BackendFactory, CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS,
-    EventBuffer, EventRecord, ModeFactory, PendingInterrupt, TerminalBackend, TerminalEntry,
-    TerminalId, now_rfc3339,
+    EventBuffer, EventRecord, InteractionAnalyzer, InteractionConfig, InteractionUpdate,
+    ModeFactory, PendingInterrupt, TerminalBackend, TerminalEntry, TerminalId, now_rfc3339,
 };
 
 /// 会话内名称最大长度（按 Unicode 字符计数）。
@@ -174,6 +174,8 @@ pub struct Registry {
     /// 新建终端的后端工厂；默认 [`ModeFactory`]（pty/stdio 分别路由），
     /// 测试可注入 [`crate::MockFactory`]。
     factory: Arc<dyn BackendFactory>,
+    /// 新建终端使用的交互识别配置。
+    interaction_config: InteractionConfig,
     /// 按 ID 索引。
     by_id: BTreeMap<TerminalId, TerminalEntry>,
     /// 按会话键索引。
@@ -217,6 +219,7 @@ impl Registry {
             subscriber_queue_capacity: subscriber_queue_capacity.max(1),
             max_terminals: None,
             factory,
+            interaction_config: InteractionConfig::default(),
             by_id: BTreeMap::new(),
             by_key: BTreeMap::new(),
             subscriptions: SubscriptionBook::default(),
@@ -231,6 +234,16 @@ impl Registry {
     /// 设置运行中终端数量上限；`None` 表示不限制。
     pub fn set_max_terminals(&mut self, max_terminals: Option<usize>) {
         self.max_terminals = max_terminals;
+    }
+
+    /// 设置新建终端使用的交互识别配置；只影响之后创建的终端。
+    pub fn set_interaction_config(&mut self, interaction_config: InteractionConfig) {
+        self.interaction_config = interaction_config;
+    }
+
+    /// 当前交互识别配置。
+    pub fn interaction_config(&self) -> InteractionConfig {
+        self.interaction_config
     }
 
     /// 当前运行中（非终态）终端数量。
@@ -416,6 +429,10 @@ impl Registry {
             idle_timeout: params.idle_timeout,
             lease: None,
             pending_interrupt: None,
+            analyzer: InteractionAnalyzer::with_start_time(
+                self.interaction_config,
+                OffsetDateTime::now_utc(),
+            ),
             backend,
         };
         let mode = entry.mode;
@@ -992,6 +1009,88 @@ impl Registry {
         }
 
         self.publish(id, kind)
+    }
+
+    /// 摄取一段终端输出到交互识别器，并在状态变化时广播事件。
+    ///
+    /// 锁内只做同步解析与 `report_event` 投递；不调用任何后端方法、不跨 `await`。
+    /// 返回最后写入的 `seq`（无事件时为当前 `seq`）。
+    pub fn observe_output(
+        &mut self,
+        id: &TerminalId,
+        bytes: &[u8],
+        now: OffsetDateTime,
+    ) -> Result<u64, CoreError> {
+        let (updates, state, confidence, current_seq) = {
+            let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+            if entry.state.is_terminal() {
+                return Ok(entry.seq);
+            }
+            let updates = entry.analyzer.observe_output(bytes, now);
+            (
+                updates,
+                entry.analyzer.state(),
+                entry.analyzer.confidence(),
+                entry.seq,
+            )
+        };
+        self.publish_interaction(id, updates, state, confidence, current_seq)
+    }
+
+    /// 用锁外采集的前台进程组与进程树采样一次交互状态。
+    ///
+    /// 调用方必须在 registry 锁内调用；`fg`/`tree` 由 service 在
+    /// `spawn_blocking` 中读取。返回最后写入的 `seq`。
+    pub fn sample_interaction(
+        &mut self,
+        id: &TerminalId,
+        now: OffsetDateTime,
+        fg: Option<u32>,
+        tree: &[ProcNode],
+    ) -> Result<u64, CoreError> {
+        let (updates, state, confidence, current_seq) = {
+            let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+            if entry.state.is_terminal() {
+                return Ok(entry.seq);
+            }
+            let root_pgid = entry.pgid.unwrap_or(0);
+            let updates = entry.analyzer.sample(now, fg, root_pgid, tree);
+            (
+                updates,
+                entry.analyzer.state(),
+                entry.analyzer.confidence(),
+                entry.seq,
+            )
+        };
+        self.publish_interaction(id, updates, state, confidence, current_seq)
+    }
+
+    /// 运行中终端的后端快照；service 交互 ticker 在锁内取句柄、锁外采集。
+    pub fn running_backends(&self) -> Vec<(TerminalId, Arc<dyn TerminalBackend>)> {
+        self.by_id
+            .iter()
+            .filter(|(_, entry)| entry.state == LifecycleState::Running)
+            .map(|(id, entry)| (id.clone(), Arc::clone(&entry.backend)))
+            .collect()
+    }
+
+    /// 同步快照字段并逐条广播交互更新。
+    fn publish_interaction(
+        &mut self,
+        id: &TerminalId,
+        updates: Vec<InteractionUpdate>,
+        state: InteractionState,
+        confidence: Confidence,
+        mut seq: u64,
+    ) -> Result<u64, CoreError> {
+        if let Some(entry) = self.by_id.get_mut(id) {
+            entry.interaction = state;
+            entry.confidence = confidence;
+        }
+        for update in updates {
+            seq = self.publish(id, update.into_event())?;
+        }
+        Ok(seq)
     }
 
     /// 结算进程退出：结合 `pending_interrupt` 决定发 `interrupted` 还是 `exited`。

@@ -1,7 +1,17 @@
-//! 自研 VT/ANSI 终端模型（M0 占位）。
+//! 自研 VT/ANSI 终端模型与 shell integration 信号解析。
 //!
-//! 计划在 M2+ 实现 VT/ANSI 解析、屏幕与滚动缓冲、光标/模式与键盘编码。
-//! 本阶段只提供最小类型占位，不含解析实现，也不引入任何 OS 依赖。
+//! 当前提供：
+//! - [`OscScanner`]：OSC 133/633 增量扫描，识别 `A`/`B`/`C`/`D` 四个命令；
+//! - [`TerminalModel`]：屏幕模型占位，后续里程碑补齐 VT/ANSI 解析与缓冲。
+//!
+//! [`OscScanner`] **不做完整 VT 解析**：只处理以 `ESC ]` 起始的 OSC 字符串，
+//! 终止符仅支持 `BEL (0x07)` 与 `ST (ESC \)`（不支持 C1 `0x9C`），其他 OSC、
+//! CSI 与普通文本全部忽略。未终止的 OSC 载荷有固定上限，超限后丢弃并恢复
+//! 普通解析，避免缓冲区无限增长。
+
+mod osc;
+
+pub use osc::{OscEvent, OscScanner, OscSource};
 
 /// 终端屏幕尺寸（列 × 行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

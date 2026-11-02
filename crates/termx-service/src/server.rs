@@ -11,8 +11,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
 use termx_core::{
-    BackendFactory, CoreError, DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction, ModeFactory,
-    Registry, SpawnedBackend, TerminalBackend, TerminalId,
+    BackendFactory, CoreError, DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction,
+    InteractionConfig, ModeFactory, Registry, SpawnedBackend, TerminalBackend, TerminalId,
 };
 use termx_proc::{OutputStream, ProcEvent};
 use termx_protocol::{
@@ -50,6 +50,11 @@ use crate::config::{ServiceConfig, load_or_create_token, write_port_file};
 const SERVER_ID: &str = concat!("termx-service/", env!("CARGO_PKG_VERSION"));
 /// 等待首条 `hello` 的超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单终端交互采样（`foreground_pgrp` + `tree`）的超时上限。
+///
+/// 每个终端独立任务并带超时：任一后端的 `tree()` 卡住只影响自身，不会拖住
+/// 其它终端的采集，也不会阻塞 ticker 响应停止信号。
+const INTERACTION_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 鉴权头名。
 const AUTHORIZATION_HEADER: &str = "authorization";
 /// Bearer 鉴权方案前缀。
@@ -124,6 +129,11 @@ impl Service {
             factory,
         );
         registry.set_max_terminals(config.max_terminals);
+        registry.set_interaction_config(InteractionConfig {
+            enabled: config.interaction_enabled,
+            no_output_threshold: config.interaction_no_output_threshold,
+            repeat_interval: config.interaction_repeat_interval,
+        });
         let registry = Arc::new(Mutex::new(registry));
 
         tracing::info!(
@@ -174,12 +184,18 @@ impl Service {
     {
         tokio::pin!(shutdown);
 
-        // 空闲检查 ticker 与 accept 循环同生命周期：shutdown 时先发停止信号，
-        // 再等待 ticker 退出，避免后台任务悬挂。
+        // 空闲检查与交互识别 ticker 与 accept 循环同生命周期：shutdown 时先发
+        // 停止信号，再等待两个 ticker 退出，避免后台任务悬挂。
         let (stop_tx, stop_rx) = watch::channel(false);
-        let ticker = tokio::spawn(run_idle_ticker(
+        let idle_ticker = tokio::spawn(run_idle_ticker(
             Arc::clone(&self.registry),
             self.config.idle_tick_interval,
+            stop_rx.clone(),
+        ));
+        let interaction_ticker = tokio::spawn(run_interaction_ticker(
+            Arc::clone(&self.registry),
+            self.config.interaction_tick_interval,
+            self.config.interaction_enabled,
             stop_rx,
         ));
 
@@ -221,7 +237,8 @@ impl Service {
         };
 
         let _ = stop_tx.send(true);
-        let _ = ticker.await;
+        let _ = idle_ticker.await;
+        let _ = interaction_ticker.await;
 
         // shutdown：先停止 ticker 与新连接，再在锁外 best-effort 终止所有后端，
         // 确保 stdio/PTY 子进程不会随 service 退出而残留。
@@ -289,6 +306,112 @@ async fn run_idle_ticker(
                     }
                 }
             }
+        }
+    }
+}
+
+/// 后台交互识别：周期采集运行中终端的前台进程组/进程树并采样。
+///
+/// 锁纪律：先在锁内取后端 `Arc` 快照，再在 `spawn_blocking` 中采集
+/// `foreground_pgrp` / `tree`（可能读 `/proc` 或系统调用），最后重新取锁调用
+/// `sample_interaction`。每个终端由独立任务负责，采集带超时且与其它终端并行；
+/// 等待采样结果时同时监听停止信号，保证单个卡住的 `tree()` 不会拖死其它终端
+/// 或 `run_until` 停机。
+async fn run_interaction_ticker(
+    registry: Arc<Mutex<Registry>>,
+    period: Duration,
+    enabled: bool,
+    mut stop: watch::Receiver<bool>,
+) {
+    if !enabled {
+        // 关闭时直接等待停止信号，不产生任何后端调用。
+        let _ = stop.changed().await;
+        return;
+    }
+
+    let period = period.max(Duration::from_millis(1));
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 跳过 interval 的首次立即触发，启动后按周期采样。
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let targets = {
+                    let registry = lock_registry(&registry);
+                    registry.running_backends()
+                };
+                let mut samples = Vec::with_capacity(targets.len());
+                for (terminal_id, backend) in targets {
+                    samples.push(tokio::spawn(sample_terminal_interaction(
+                        Arc::clone(&registry),
+                        terminal_id,
+                        backend,
+                    )));
+                }
+                // 采样阶段同样可被停止信号打断；卡住的任务不等待、不阻塞停机。
+                let mut stopping = false;
+                for sample in samples {
+                    tokio::select! {
+                        changed = stop.changed() => {
+                            if changed.is_err() || *stop.borrow() {
+                                stopping = true;
+                                break;
+                            }
+                        }
+                        _ = sample => {}
+                    }
+                }
+                if stopping {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 单个终端的交互采样任务：锁外采集前台进程组/进程树，再回锁内提交。
+///
+/// 采集放在 `spawn_blocking` 并加 [`INTERACTION_SAMPLE_TIMEOUT`]：超时只放弃
+/// 本轮采样，不阻塞 ticker 或其它终端。提交阶段只做同步短操作。
+async fn sample_terminal_interaction(
+    registry: Arc<Mutex<Registry>>,
+    terminal_id: TerminalId,
+    backend: Arc<dyn TerminalBackend>,
+) {
+    let collected = tokio::task::spawn_blocking(move || {
+        let fg = backend.foreground_pgrp();
+        let tree = backend.tree();
+        (fg, tree)
+    });
+    let (fg, tree) = match timeout(INTERACTION_SAMPLE_TIMEOUT, collected).await {
+        Ok(Ok(sample)) => sample,
+        Ok(Err(error)) => {
+            tracing::debug!(terminal_id = %terminal_id, %error, "交互采样任务失败");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(terminal_id = %terminal_id, "交互采样超时，跳过本轮");
+            return;
+        }
+    };
+
+    let result = {
+        let mut registry = lock_registry(&registry);
+        registry.sample_interaction(&terminal_id, OffsetDateTime::now_utc(), fg, &tree)
+    };
+    match result {
+        Ok(_) => {}
+        // 终端在采样期间退出/被清理：跳过即可。
+        Err(CoreError::NotFound) => {}
+        Err(error) => {
+            tracing::debug!(%error, terminal_id = %terminal_id, "交互采样失败");
         }
     }
 }
@@ -1289,24 +1412,36 @@ async fn ingest_proc_events(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match event {
-                ProcEvent::Output { data, stream } => (
-                    registry.report_event(
+                ProcEvent::Output { data, stream } => {
+                    let now = OffsetDateTime::now_utc();
+                    let reported = registry.report_event(
                         &terminal_id,
                         EventKind::Output {
-                            data: BASE64_STANDARD.encode(data),
+                            data: BASE64_STANDARD.encode(&data),
                             stream: protocol_stream(stream),
                         },
-                    ),
-                    false,
-                ),
+                    );
+                    // 同一把锁内顺手喂给交互识别器；OSC 等待事件排在 output 之后。
+                    let result = match reported {
+                        Ok(_) => registry
+                            .observe_output(&terminal_id, &data, now)
+                            .map(|_| ()),
+                        Err(error) => Err(error),
+                    };
+                    (result, false)
+                }
                 // 退出结果统一交给 report_exit：由 registry 结合 pending 决定
                 // 发 interrupted（Ctrl-C / terminate / signal）还是 exited。
                 ProcEvent::Exited(exit_code) => (
-                    registry.report_exit(&terminal_id, ExitOutcome::Code(exit_code)),
+                    registry
+                        .report_exit(&terminal_id, ExitOutcome::Code(exit_code))
+                        .map(|_| ()),
                     true,
                 ),
                 ProcEvent::Signaled(signal) => (
-                    registry.report_exit(&terminal_id, ExitOutcome::Signal(signal)),
+                    registry
+                        .report_exit(&terminal_id, ExitOutcome::Signal(signal))
+                        .map(|_| ()),
                     true,
                 ),
             }

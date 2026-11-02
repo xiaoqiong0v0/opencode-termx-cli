@@ -9,6 +9,8 @@ rust-version.workspace = true
 termx-protocol = { path = "../termx-protocol" }
 # 依赖方向：proc 不依赖 core；core 依赖 proc 以接入真实 PTY 后端。
 termx-proc = { path = "../termx-proc" }
+# 交互识别复用 terminal 的 OSC 133/633 增量扫描器。
+termx-terminal = { path = "../termx-terminal" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

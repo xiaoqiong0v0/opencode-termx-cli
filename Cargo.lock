@@ -590,6 +590,7 @@ dependencies = [
  "serde_json",
  "termx-proc",
  "termx-protocol",
+ "termx-terminal",
  "thiserror",
  "time",
  "tokio",

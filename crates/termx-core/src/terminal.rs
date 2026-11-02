@@ -8,7 +8,7 @@ use termx_protocol::{
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::{EventBuffer, EventRecord, TerminalBackend};
+use crate::{EventBuffer, EventRecord, InteractionAnalyzer, TerminalBackend};
 
 /// 终端内部全局唯一标识；使用 26 字符 ULID 表示。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -58,8 +58,9 @@ pub struct PendingInterrupt {
 
 /// 单个终端的运行时条目。
 ///
-/// F2 由 [`crate::Registry`] 持有；`seq` 与 `events.last_seq()` 保持同步，
-/// `last_activity` 随每次事件更新。
+/// F2 由 [`crate::Registry`] 持有；`seq` 与 `events.last_seq()` 保持同步。
+/// `last_activity` 只随会重置空闲计时的活动事件刷新（见
+/// [`TerminalEntry::emit_with_drops`] 与 [`TerminalEntry::touch`]）。
 pub struct TerminalEntry {
     /// 全局唯一 ID。
     pub id: TerminalId,
@@ -101,12 +102,14 @@ pub struct TerminalEntry {
     pub lease: Option<String>,
     /// 已发出但尚未在退出事件中结算的中断意图。
     pub pending_interrupt: Option<PendingInterrupt>,
+    /// 每终端一份的交互识别状态机。
+    pub(crate) analyzer: InteractionAnalyzer,
     /// 后端进程句柄。
     pub backend: Arc<dyn TerminalBackend>,
 }
 
 impl TerminalEntry {
-    /// 写入一条事件，并同步 `seq` / `last_activity`。
+    /// 写入一条事件并同步 `seq`；活动事件同时刷新 `last_activity`。
     ///
     /// 返回值是本次事件的 `seq`；若伴随输出淘汰，registry 还需调用
     /// [`TerminalEntry::emit_with_drops`] 拿到 `output_dropped` marker 并投递。
@@ -118,11 +121,18 @@ impl TerminalEntry {
     ///
     /// 返回 `(本次事件记录, output_dropped 记录列表)`。`self.seq` 取最后一条
     /// 记录（通常是最新 marker）的 `seq`，保证快照游标始终是最后 seq。
+    ///
+    /// `last_activity` 只在**活动事件**（`started` / `output` / `attached`）时
+    /// 刷新：交互、状态与终态事件不刷新，否则周期性 `waiting_input` 会让
+    /// `idle_timeout` 永不触发（对齐 `docs/PROTOCOL.md` §6）。
     pub fn emit_with_drops(&mut self, kind: EventKind) -> (EventRecord, Vec<EventRecord>) {
+        let refreshes_activity = refreshes_activity(&kind);
         let record = self.events.emit(kind);
         let markers = self.events.take_drop_markers();
         self.seq = markers.last().map_or(record.seq, |marker| marker.seq);
-        self.last_activity = self.events.latest_ts().map(str::to_string);
+        if refreshes_activity {
+            self.last_activity = Some(record.ts.clone());
+        }
         (record, markers)
     }
 
@@ -168,9 +178,22 @@ impl TerminalEntry {
     }
 }
 
+/// 判断事件是否刷新 `last_activity`。
+///
+/// 对齐 `docs/PROTOCOL.md` §6：`started` 初始化，`output` 与 `attached` 刷新；
+/// `send` / `resize` 由 [`TerminalEntry::touch`] 显式续期。交互、订阅状态与
+/// 终态事件不刷新，避免周期性 `waiting_input` 让 `idle_timeout` 永不触发。
+fn refreshes_activity(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Started { .. } | EventKind::Output { .. } | EventKind::Attached { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use termx_protocol::Stream;
 
     #[test]
     fn generated_terminal_ids_are_26_char_ulids_and_unique() {
@@ -183,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_emit_updates_seq_and_last_activity() {
+    fn entry_emit_updates_seq_and_only_activity_events_refresh_last_activity() {
         let mut entry = TerminalEntry {
             id: TerminalId::generate(),
             root_session_id: "ses-1".to_string(),
@@ -205,15 +228,42 @@ mod tests {
             idle_timeout: None,
             lease: None,
             pending_interrupt: None,
+            analyzer: InteractionAnalyzer::with_start_time(
+                crate::InteractionConfig::default(),
+                OffsetDateTime::now_utc(),
+            ),
             backend: Arc::new(crate::MockBackend::new()),
         };
 
+        // 终态与交互事件不刷新 last_activity。
         assert_eq!(entry.emit(EventKind::Exited { exit_code: 0 }), 1);
         assert_eq!(entry.seq, 1);
-        assert!(entry.last_activity.is_some());
+        assert!(entry.last_activity.is_none(), "终态事件不应刷新活动时间");
+
+        assert_eq!(
+            entry.emit(EventKind::WaitingInput {
+                confidence: Confidence::High,
+                reason: "shell_integration".to_string(),
+            }),
+            2
+        );
+        assert!(
+            entry.last_activity.is_none(),
+            "交互事件不应刷新活动时间，否则 idle_timeout 永不触发"
+        );
+
+        // 输出事件刷新活动时间。
+        assert_eq!(
+            entry.emit(EventKind::Output {
+                data: "aGk=".to_string(),
+                stream: Stream::Pty,
+            }),
+            3
+        );
+        assert!(entry.last_activity.is_some(), "output 应刷新活动时间");
 
         let snapshot = entry.snapshot();
-        assert_eq!(snapshot.cursor, 1);
+        assert_eq!(snapshot.cursor, 3);
         // 快照必须能直接序列化为协议 JSON（service 层据此回包）。
         let json = serde_json::to_value(&snapshot).expect("快照应可序列化");
         assert_eq!(json["terminal_id"], snapshot.terminal_id);
