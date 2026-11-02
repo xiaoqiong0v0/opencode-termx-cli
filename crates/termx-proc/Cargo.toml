@@ -1,6 +1,33 @@
 [package]
 name = "termx-proc"
-description = "PTY/ConPTY、进程组/树、wait/exit/signal（M0 占位）"
+description = "PTY/ConPTY、进程组/树、wait/exit/signal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+termx-protocol = { path = "../termx-protocol" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Unix/Linux 直接使用 OS PTY（openpty/fork/setsid/termios/ioctl/wait/kill）。
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["term", "process", "signal", "fs", "ioctl"] }
+# 直接调用 TIOCSCTTY / TIOCSWINSZ / dup2 / execve 等系统调用。
+libc = "0.2"
+
+# Windows 直接绑定 Win32 ConPTY / Job Object；不使用 node-pty 等封装。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

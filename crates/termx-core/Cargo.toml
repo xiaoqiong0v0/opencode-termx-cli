@@ -7,8 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 termx-protocol = { path = "../termx-protocol" }
+# 依赖方向：proc 不依赖 core；core 依赖 proc 以接入真实 PTY 后端。
+termx-proc = { path = "../termx-proc" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 ulid = { workspace = true }

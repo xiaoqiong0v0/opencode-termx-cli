@@ -123,7 +123,7 @@
 | AC-11 | 事件顺序与背压 | 顺序正确；输出可截断，状态/终态不丢；seq 单调 |
 | AC-12 | 重连 cursor | 空基线合法；服务端按缓冲回放，超出则 `reset`，不误判无会话 |
 | AC-13 | 两客户端输入冲突 | 未持有 lease 的 `send` 返回 `permission_denied`；`claim(force)` 抢占后旧 owner 收 `lease_revoked` |
-| AC-14 | `prune` 清理 | 仅清理终态/孤儿；按 `last_activity` 或 `created_at` 生效，返回 `removed` 计数 |
+| AC-14 | `prune` 清理 | 仅清理终态/孤儿；按 `last_activity` 或 `created_at` 生效，返回被删除的 `terminal_id` 列表（数量 = 其长度） |
 | AC-15 | 错误 token 握手 | 返回 `auth_failed` 并断开；不建立会话 |
 | AC-16 | 超资源上限 | 新建/缓冲/队列超限返回 `limit_exceeded`（`retryable=true`），不崩溃 |
 | AC-17 | 同名会话重复创建 | 无 `--force` 返回 `session_exists` + 说明（含旧 `terminal_id`）；带 `--force` 旧终端终止、新终端 `started` |

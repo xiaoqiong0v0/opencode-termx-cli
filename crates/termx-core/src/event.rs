@@ -86,11 +86,20 @@ impl Default for EventBuffer {
     }
 }
 
+/// 把 UTC 时间格式化为 RFC3339 字符串。
+pub fn format_rfc3339(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
 /// 生成 RFC3339 UTC 时间戳。
 pub fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    format_rfc3339(OffsetDateTime::now_utc())
+}
+
+/// 解析 RFC3339 时间戳；格式非法时返回 `None`。
+pub fn parse_rfc3339(ts: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(ts, &Rfc3339).ok()
 }
 
 #[cfg(test)]

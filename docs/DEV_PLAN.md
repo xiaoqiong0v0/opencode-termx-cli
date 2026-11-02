@@ -53,8 +53,8 @@ termx/
 - 门禁：AC-10（service_lost）/AC-12（cursor 回放）/AC-15（鉴权）/AC-17（同名冲突）；多客户端 attach/detach/重连；空基线合法；非环回拒绝；seq 单调、终态唯一由事件缓冲测试覆盖。
 
 ### M2 本地 PTY（核心）
-- 交付：`pty` 模式创建、`started/output`、真实 `exited/interrupted`、`status` 见 pid/pgid/foreground/树、`send`/`resize`/Ctrl-C、`terminate` 杀进程组、关闭无孤儿。
-- 门禁：AC-1/2/3/7/8/13/14；无孤儿/zombie；后台读线程与写解耦。
+- 交付：`pty` 模式创建、`started/output`、真实 `exited/interrupted`、`status` 见 pid/pgid/foreground/树、`send`/`resize`/Ctrl-C、`terminate` 杀进程组、关闭无孤儿；`idle_timeout`（detach/terminate）后台 ticker 与 `terminal.prune`。
+- 门禁：AC-1/2/3/7/8/13/14（含 AC-7/8/14 的空闲超时与清理）；无孤儿/zombie；后台读线程与写解耦。
 
 ### M3 stdio + 流控
 - 交付：`stdio` 模式、`terminal.read`、背压/丢弃/`output_dropped`、每客户端队列上限。

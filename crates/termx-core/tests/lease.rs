@@ -1,6 +1,8 @@
 //! F4 定位与输入 lease 测试：resolve、claim/release、ensure_input_allowed 与断连清理。
 
-use termx_core::{CoreError, Registry, TerminalId};
+use std::sync::Arc;
+
+use termx_core::{CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, MockFactory, Registry, TerminalId};
 use termx_protocol::{CreateParams, Event, EventKind, Mode, TerminalLocator};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -58,7 +60,7 @@ fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
 
 #[test]
 fn resolve_prefers_terminal_id_then_session_key() {
-    let mut registry = Registry::default();
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let expected = TerminalId::new(terminal_id.clone());
 
@@ -103,7 +105,7 @@ fn resolve_prefers_terminal_id_then_session_key() {
 
 #[test]
 fn claim_grants_idle_lease_and_is_idempotent_for_same_owner() {
-    let mut registry = Registry::default();
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let locator = by_id(&terminal_id);
 
@@ -122,7 +124,7 @@ fn claim_grants_idle_lease_and_is_idempotent_for_same_owner() {
 
 #[test]
 fn claim_conflict_requires_force_and_emits_revoke_to_old_owner() {
-    let mut registry = Registry::default();
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let locator = by_id(&terminal_id);
 
@@ -173,7 +175,7 @@ fn claim_conflict_requires_force_and_emits_revoke_to_old_owner() {
 
 #[test]
 fn release_only_succeeds_for_current_owner() {
-    let mut registry = Registry::default();
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let locator = by_id(&terminal_id);
 
@@ -221,7 +223,7 @@ fn release_only_succeeds_for_current_owner() {
 
 #[test]
 fn terminal_state_clears_lease_and_rejects_input() {
-    let mut registry = Registry::default();
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let locator = by_id(&terminal_id);
     let id = TerminalId::new(terminal_id);
@@ -275,7 +277,7 @@ fn terminal_state_clears_lease_and_rejects_input() {
 
 #[test]
 fn ensure_input_allowed_requires_active_lease_owner() {
-    let mut registry = Registry::default();
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let locator = by_key("ses-1", "build");
     assert_eq!(
@@ -306,10 +308,20 @@ fn ensure_input_allowed_requires_active_lease_owner() {
 }
 
 #[test]
-fn release_all_clears_only_leases_owned_by_the_client() {
-    let mut registry = Registry::default();
+fn release_all_clears_only_leases_owned_by_the_client_and_emits_revoked() {
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let first = create_terminal(&mut registry, "first");
     let second = create_terminal(&mut registry, "second");
+
+    // 观察者订阅两个终端，用于确认断连清理也会广播 lease_revoked。
+    let (observer_tx, mut observer_rx) = unbounded_channel();
+    registry
+        .subscribe(&by_id(&first), "observer", None, observer_tx.clone())
+        .expect("observer 订阅 first 应成功");
+    registry
+        .subscribe(&by_id(&second), "observer", None, observer_tx)
+        .expect("observer 订阅 second 应成功");
+    drain(&mut observer_rx);
 
     registry
         .claim(&by_id(&first), "client-a", false)
@@ -319,6 +331,14 @@ fn release_all_clears_only_leases_owned_by_the_client() {
         .expect("second claim 应成功");
 
     registry.release_all("client-a");
+
+    let events = drain(&mut observer_rx);
+    assert_eq!(events.len(), 1, "断连清理应只对 client-a 的 lease 广播一次");
+    assert_eq!(events[0].terminal_id, first);
+    assert!(matches!(
+        events[0].kind,
+        EventKind::LeaseRevoked { ref client_id } if client_id == "client-a"
+    ));
 
     assert_eq!(
         registry.ensure_input_allowed(&by_id(&first), "client-a"),

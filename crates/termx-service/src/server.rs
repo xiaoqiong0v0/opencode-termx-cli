@@ -8,19 +8,30 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
-use termx_core::{CoreError, DETACH_REASON_DISCONNECT, Registry, TerminalId};
+use termx_core::{
+    BackendFactory, CoreError, DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction, PtyFactory,
+    Registry, SpawnedBackend, TerminalBackend, TerminalId,
+};
+use termx_proc::ProcEvent;
 use termx_protocol::{
     AttachParams, Capabilities, ClaimParams, CreateParams, DetachParams, ErrorCode, Event,
-    HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListParams, PROTOCOL_VERSION, ProtocolError,
-    ReleaseParams, Request, Response, SimpleResult, StatusParams, StatusResult, SubscribeParams,
-    SubscribeResult, SubscriptionCursor, TerminalLocator, UnsubscribeParams, from_json, to_json,
+    EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListParams, PROTOCOL_VERSION,
+    ProtocolError, PruneParams, ReleaseParams, Request, ResizeParams, Response, SendParams,
+    SignalParams, SimpleResult, StatusParams, StatusResult, Stream, SubscribeParams,
+    SubscribeResult, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TerminateParams,
+    UnsubscribeParams, from_json, to_json,
 };
+use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-    time::timeout,
+    sync::{
+        mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel},
+        watch,
+    },
+    time::{MissedTickBehavior, timeout},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async,
@@ -80,8 +91,17 @@ pub struct Service {
 impl Service {
     /// 绑定 [`ServiceConfig::bind_addr`] 并写出实际端口。
     ///
-    /// 仅允许环回监听；配置目录、token 文件会在绑定前准备好。
+    /// 仅允许环回监听；配置目录、token 文件会在绑定前准备好。默认使用
+    /// [`PtyFactory`] 创建真实 PTY 后端。
     pub async fn bind(config: ServiceConfig) -> Result<Self, ServiceError> {
+        Self::bind_with_factory(config, Arc::new(PtyFactory)).await
+    }
+
+    /// 使用指定后端工厂绑定服务；测试可注入 mock 工厂以避免创建真实进程。
+    pub async fn bind_with_factory(
+        config: ServiceConfig,
+        factory: Arc<dyn BackendFactory>,
+    ) -> Result<Self, ServiceError> {
         if !is_loopback(config.bind_addr) {
             return Err(ServiceError::NonLoopbackBind(config.bind_addr));
         }
@@ -92,7 +112,10 @@ impl Service {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         write_port_file(&config, local_addr.port())?;
-        let registry = Arc::new(Mutex::new(Registry::new(config.event_buffer_capacity)));
+        let registry = Arc::new(Mutex::new(Registry::with_factory(
+            config.event_buffer_capacity,
+            factory,
+        )));
 
         tracing::info!(
             addr = %local_addr,
@@ -142,14 +165,26 @@ impl Service {
     {
         tokio::pin!(shutdown);
 
-        loop {
+        // 空闲检查 ticker 与 accept 循环同生命周期：shutdown 时先发停止信号，
+        // 再等待 ticker 退出，避免后台任务悬挂。
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let ticker = tokio::spawn(run_idle_ticker(
+            Arc::clone(&self.registry),
+            self.config.idle_tick_interval,
+            stop_rx,
+        ));
+
+        let result = loop {
             tokio::select! {
                 () = &mut shutdown => {
                     tracing::info!(addr = %self.local_addr, "termx-service 停止接收新连接");
-                    return Ok(());
+                    break Ok(());
                 }
                 accepted = self.listener.accept() => {
-                    let (stream, peer_addr) = accepted?;
+                    let (stream, peer_addr) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(ServiceError::Io(error)),
+                    };
                     if !is_loopback(peer_addr) {
                         tracing::warn!(peer = %peer_addr, "拒绝非环回连接");
                         continue;
@@ -165,6 +200,67 @@ impl Service {
                             tracing::debug!(peer = %peer_addr, %error, "连接处理结束");
                         }
                     });
+                }
+            }
+        };
+
+        let _ = stop_tx.send(true);
+        let _ = ticker.await;
+        result
+    }
+}
+
+/// 后台空闲检查：周期调用 [`Registry::expire_idle`]。
+///
+/// 锁纪律：只在同步块内取 registry 锁调用 `expire_idle`（事件投递为非阻塞
+/// send），`Terminate` 返回的后端在锁外通过阻塞线程池终止。
+async fn run_idle_ticker(
+    registry: Arc<Mutex<Registry>>,
+    period: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
+    let period = period.max(Duration::from_millis(1));
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 跳过 interval 的首次立即触发，启动后按周期扫描。
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                // 发送端被 drop 或收到停止信号都退出。
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let actions = {
+                    let mut registry = lock_registry(&registry);
+                    registry.expire_idle(OffsetDateTime::now_utc())
+                };
+                // 每个待终止后端独立 spawn 一个任务：多个终端同时到期时并行执行，
+                // 避免一个慢后端串行拖住整轮扫描，也缩短 shutdown 等待。
+                let mut terminations = Vec::new();
+                for action in actions {
+                    match action {
+                        IdleAction::Detach { terminal_id, clients } => {
+                            // registry 已在锁内把 detached{idle_timeout} 投递给订阅者。
+                            tracing::debug!(
+                                terminal_id = %terminal_id,
+                                clients = clients.len(),
+                                "空闲超时：已断开订阅，终端继续运行"
+                            );
+                        }
+                        IdleAction::Terminate(backend) => {
+                            tracing::info!(pid = backend.pid(), "空闲超时：终止终端");
+                            terminations.push(tokio::spawn(terminate_backend(backend)));
+                        }
+                    }
+                }
+                for handle in terminations {
+                    if let Err(error) = handle.await {
+                        tracing::debug!(%error, "空闲终止任务失败");
+                    }
                 }
             }
         }
@@ -414,7 +510,7 @@ async fn read_loop<S>(
     stream: &mut SplitStream<WebSocketStream<S>>,
     peer_addr: Option<SocketAddr>,
     client_id: &str,
-    registry: &Mutex<Registry>,
+    registry: &Arc<Mutex<Registry>>,
     out_tx: &UnboundedSender<Message>,
     event_tx: &UnboundedSender<Event>,
     max_frame_bytes: usize,
@@ -441,7 +537,7 @@ where
 
         match message {
             Message::Text(text) => {
-                handle_rpc_text(text.as_str(), client_id, registry, out_tx, event_tx)?
+                handle_rpc_text(text.as_str(), client_id, registry, out_tx, event_tx).await?
             }
             Message::Close(_) => break,
             _ => {}
@@ -451,15 +547,15 @@ where
 }
 
 /// 解析请求并分发；非法 JSON 回 `protocol_error`。
-fn handle_rpc_text(
+async fn handle_rpc_text(
     text: &str,
     client_id: &str,
-    registry: &Mutex<Registry>,
+    registry: &Arc<Mutex<Registry>>,
     out_tx: &UnboundedSender<Message>,
     event_tx: &UnboundedSender<Event>,
 ) -> Result<(), ServiceError> {
     let response = match from_json::<Request>(text) {
-        Ok(request) => dispatch_request(request, client_id, registry, event_tx)?,
+        Ok(request) => dispatch_request(request, client_id, registry, event_tx).await?,
         Err(_) => error_response(String::new(), ErrorCode::ProtocolError, "请求 JSON 非法"),
     };
 
@@ -470,11 +566,12 @@ fn handle_rpc_text(
 
 /// 分发 `terminal.*` RPC；attach/subscribe 使用连接级 `client_id` 与事件通道。
 ///
-/// 锁内只做 registry 读写（事件投递为非阻塞 send），不跨 `await` 持有锁。
-fn dispatch_request(
+/// 锁内只做 registry 读写（事件投递为非阻塞 send），不跨 `await` 持有锁；
+/// `terminal.create` 的 spawn/terminate 都在 `spawn_blocking` 中于锁外执行。
+async fn dispatch_request(
     request: Request,
     client_id: &str,
-    registry: &Mutex<Registry>,
+    registry: &Arc<Mutex<Registry>>,
     event_tx: &UnboundedSender<Event>,
 ) -> Result<Response, ServiceError> {
     let Request { id, method, params } = request;
@@ -491,15 +588,7 @@ fn dispatch_request(
                     ));
                 }
             };
-
-            let mut registry = lock_registry(registry);
-            match registry.create(params) {
-                Ok(result) => {
-                    let value = serde_json::to_value(result)?;
-                    Ok(ok_response(id, value))
-                }
-                Err(error) => Ok(response_from_core_error(id, error)),
-            }
+            handle_create(id, params, registry).await
         }
         "terminal.list" => {
             let params: ListParams = match serde_json::from_value(params) {
@@ -529,14 +618,31 @@ fn dispatch_request(
                 }
             };
 
-            let registry = lock_registry(registry);
-            match registry.status(&params.locator) {
-                Ok(snapshot) => {
-                    let value = serde_json::to_value(StatusResult { snapshot })?;
-                    Ok(ok_response(id, value))
+            let (snapshot, backend) = {
+                let registry = lock_registry(registry);
+                match registry.status_parts(&params.locator) {
+                    Ok(parts) => parts,
+                    Err(error) => return Ok(response_from_core_error(id, error)),
                 }
-                Err(error) => Ok(response_from_core_error(id, error)),
-            }
+            };
+            // 后端查询放在锁外，并与其它后端操作一致放进阻塞线程池：
+            // `foreground_pgrp` / `tree` 都可能阻塞或读 /proc。
+            let snapshot = match tokio::task::spawn_blocking(move || {
+                fill_runtime_info(snapshot, backend.as_deref())
+            })
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::Internal,
+                        format!("status 任务失败: {error}"),
+                    ));
+                }
+            };
+            let value = serde_json::to_value(StatusResult { snapshot })?;
+            Ok(ok_response(id, value))
         }
         "terminal.attach" => {
             let params: AttachParams = match serde_json::from_value(params) {
@@ -615,6 +721,75 @@ fn dispatch_request(
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
         }
+        "terminal.send" => {
+            let params: SendParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.send 参数非法: {error}"),
+                    ));
+                }
+            };
+            handle_send(id, params, client_id, registry).await
+        }
+        "terminal.resize" => {
+            let params: ResizeParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.resize 参数非法: {error}"),
+                    ));
+                }
+            };
+            handle_resize(id, params, registry).await
+        }
+        "terminal.signal" => {
+            let params: SignalParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.signal 参数非法: {error}"),
+                    ));
+                }
+            };
+            handle_signal(id, params, registry).await
+        }
+        "terminal.terminate" => {
+            let params: TerminateParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.terminate 参数非法: {error}"),
+                    ));
+                }
+            };
+            handle_terminate(id, params, registry).await
+        }
+        "terminal.prune" => {
+            let params: PruneParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.prune 参数非法: {error}"),
+                    ));
+                }
+            };
+            let result = {
+                let mut registry = lock_registry(registry);
+                registry.prune(&params)
+            };
+            Ok(ok_response(id, serde_json::to_value(result)?))
+        }
         "terminal.subscribe" | "subscribe" => {
             let params: SubscribeParams = match serde_json::from_value(params) {
                 Ok(params) => params,
@@ -669,6 +844,288 @@ fn dispatch_request(
             ErrorCode::BadRequest,
             format!("方法尚未实现: {method}"),
         )),
+    }
+}
+
+/// 创建终端：预检 → 锁外终止旧后端 → 锁外 spawn → 锁内注册 → 启动事件摄取。
+///
+/// 并发契约：registry 的 `std::sync::Mutex` 只在同步短操作中持有；
+/// `spawn` / `terminate` / `foreground_pgrp` 全部放到 `spawn_blocking`，
+/// 且不在持锁期间等待。
+async fn handle_create(
+    id: String,
+    params: CreateParams,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<Response, ServiceError> {
+    // 只做参数/冲突预检，不提前终止旧后端：否则旧进程退出的 `exited` 可能
+    // 抢在 `register_create` 落 `interrupted` 之前。置换统一在锁内完成。
+    let factory = {
+        let registry = lock_registry(registry);
+        if let Err(error) = registry.prepare_create(&params) {
+            return Ok(response_from_core_error(id, error));
+        }
+        registry.backend_factory()
+    };
+
+    let (backend, events) = match spawn_backend(factory, params.clone()).await {
+        Ok(spawned) => spawned,
+        Err(error) => return Ok(response_from_core_error(id, error)),
+    };
+    let foreground_pgrp = read_foreground_pgrp(Arc::clone(&backend)).await;
+
+    let registered = {
+        let mut registry = lock_registry(registry);
+        registry.register_create(params, Arc::clone(&backend), foreground_pgrp)
+    };
+    let (result, displaced) = match registered {
+        Ok(registered) => registered,
+        Err(error) => {
+            // 竞态导致注册失败：回收刚启动的进程，避免孤儿。
+            terminate_backend(backend).await;
+            return Ok(response_from_core_error(id, error));
+        }
+    };
+    if let Some(displaced) = displaced {
+        terminate_backend(displaced).await;
+    }
+
+    tokio::spawn(ingest_proc_events(
+        Arc::clone(registry),
+        TerminalId::new(result.terminal_id.clone()),
+        events,
+    ));
+    Ok(ok_response(id, serde_json::to_value(result)?))
+}
+
+/// 处理 `terminal.send`：锁内做 lease 门禁取后端，锁外阻塞写。
+async fn handle_send(
+    id: String,
+    params: SendParams,
+    client_id: &str,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<Response, ServiceError> {
+    let payload = match send_payload(&params) {
+        Ok(payload) => payload,
+        Err(error) => return Ok(response_from_core_error(id, error)),
+    };
+
+    let backend = {
+        let mut registry = lock_registry(registry);
+        match registry.prepare_send(&params.locator, client_id) {
+            Ok(backend) => backend,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || backend.write(&payload)).await {
+        Ok(Ok(())) => Ok(ok_response(
+            id,
+            serde_json::to_value(SimpleResult { ok: true })?,
+        )),
+        Ok(Err(error)) => Ok(response_from_core_error(id, error)),
+        Err(error) => Ok(error_response(
+            id,
+            ErrorCode::Internal,
+            format!("send 任务失败: {error}"),
+        )),
+    }
+}
+
+/// 处理 `terminal.resize`：锁内校验并记录尺寸，锁外调用后端。
+async fn handle_resize(
+    id: String,
+    params: ResizeParams,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<Response, ServiceError> {
+    let (cols, rows) = (params.cols, params.rows);
+    let backend = {
+        let mut registry = lock_registry(registry);
+        match registry.prepare_resize(&params.locator, cols, rows) {
+            Ok(backend) => backend,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || backend.resize(cols, rows)).await {
+        Ok(Ok(())) => Ok(ok_response(
+            id,
+            serde_json::to_value(SimpleResult { ok: true })?,
+        )),
+        Ok(Err(error)) => Ok(response_from_core_error(id, error)),
+        Err(error) => Ok(error_response(
+            id,
+            ErrorCode::Internal,
+            format!("resize 任务失败: {error}"),
+        )),
+    }
+}
+
+/// 处理 `terminal.signal`：锁内校验非终态，锁外发送信号。
+async fn handle_signal(
+    id: String,
+    params: SignalParams,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<Response, ServiceError> {
+    let prepared = {
+        let mut registry = lock_registry(registry);
+        match registry.prepare_signal(&params.locator, &params.signal) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        }
+    };
+
+    // SIGINT 的 Ctrl-C 字节写入与其它信号发送都在锁外阻塞执行；
+    // pending 已在锁内记录。
+    match tokio::task::spawn_blocking(move || prepared.execute()).await {
+        Ok(Ok(())) => Ok(ok_response(
+            id,
+            serde_json::to_value(SimpleResult { ok: true })?,
+        )),
+        Ok(Err(error)) => Ok(response_from_core_error(id, error)),
+        Err(error) => Ok(error_response(
+            id,
+            ErrorCode::Internal,
+            format!("signal 任务失败: {error}"),
+        )),
+    }
+}
+
+/// 处理 `terminal.terminate`：锁内落终态并广播，锁外终止后端。
+///
+/// 重复 terminate 幂等返回 `ok:true`；终态事件只由
+/// [`Registry::prepare_terminate`] 发出一次。
+async fn handle_terminate(
+    id: String,
+    params: TerminateParams,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<Response, ServiceError> {
+    let backend = {
+        let mut registry = lock_registry(registry);
+        match registry.prepare_terminate(&params.locator) {
+            Ok(backend) => backend,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        }
+    };
+    if let Some(backend) = backend {
+        terminate_backend(backend).await;
+    }
+
+    Ok(ok_response(
+        id,
+        serde_json::to_value(SimpleResult { ok: true })?,
+    ))
+}
+
+/// 组装 `terminal.send` 的输入字节。
+///
+/// `data` 优先于 `text`（对齐 PROTOCOL §6）；两者都缺省或 base64 非法时返回
+/// `bad_request`。`enter=true` 在末尾追加 `\r`（PTY 回车）。
+fn send_payload(params: &SendParams) -> Result<Vec<u8>, CoreError> {
+    let mut payload = if let Some(data) = &params.data {
+        BASE64_STANDARD
+            .decode(data)
+            .map_err(|error| CoreError::BadRequest(format!("terminal.send.data 非法: {error}")))?
+    } else if let Some(text) = &params.text {
+        text.as_bytes().to_vec()
+    } else {
+        return Err(CoreError::BadRequest(
+            "terminal.send 需要 data 或 text".to_string(),
+        ));
+    };
+
+    if params.enter {
+        payload.push(b'\r');
+    }
+    Ok(payload)
+}
+
+/// 在阻塞线程池中调用后端 `spawn`，避免占用 async worker。
+async fn spawn_backend(
+    factory: Arc<dyn BackendFactory>,
+    params: CreateParams,
+) -> Result<SpawnedBackend, CoreError> {
+    match tokio::task::spawn_blocking(move || factory.spawn(&params)).await {
+        Ok(result) => result,
+        Err(error) => Err(CoreError::SpawnFailed {
+            message: format!("spawn 任务失败: {error}"),
+        }),
+    }
+}
+
+/// 在阻塞线程池中调用后端 `terminate`；清理失败只记录。
+async fn terminate_backend(backend: Arc<dyn TerminalBackend>) {
+    let terminated = tokio::task::spawn_blocking(move || backend.terminate()).await;
+    if let Err(error) = terminated {
+        tracing::debug!(%error, "终止后端任务失败");
+    }
+}
+
+/// 在阻塞线程池中读取前台进程组；失败时返回 `None`。
+async fn read_foreground_pgrp(backend: Arc<dyn TerminalBackend>) -> Option<u32> {
+    tokio::task::spawn_blocking(move || backend.foreground_pgrp())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 把后端运行信息合入 status 快照；终态时后端为 `None`，保留最后快照。
+fn fill_runtime_info(
+    mut snapshot: TerminalSnapshot,
+    backend: Option<&dyn TerminalBackend>,
+) -> TerminalSnapshot {
+    if let Some(backend) = backend {
+        snapshot.foreground_pgrp = backend.foreground_pgrp();
+        snapshot.tree = backend.tree();
+    }
+    snapshot
+}
+
+/// 事件摄取任务：把 `termx-proc` 事件翻译为协议事件并写入 registry。
+///
+/// 每次只在同步块内取 registry 锁；收到终态事件后退出，避免后台任务泄漏。
+async fn ingest_proc_events(
+    registry: Arc<Mutex<Registry>>,
+    terminal_id: TerminalId,
+    mut events: Receiver<ProcEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        let (result, terminal) = {
+            let mut registry = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match event {
+                ProcEvent::Output(bytes) => (
+                    registry.report_event(
+                        &terminal_id,
+                        EventKind::Output {
+                            data: BASE64_STANDARD.encode(bytes),
+                            stream: Stream::Pty,
+                        },
+                    ),
+                    false,
+                ),
+                // 退出结果统一交给 report_exit：由 registry 结合 pending 决定
+                // 发 interrupted（Ctrl-C / terminate / signal）还是 exited。
+                ProcEvent::Exited(exit_code) => (
+                    registry.report_exit(&terminal_id, ExitOutcome::Code(exit_code)),
+                    true,
+                ),
+                ProcEvent::Signaled(signal) => (
+                    registry.report_exit(&terminal_id, ExitOutcome::Signal(signal)),
+                    true,
+                ),
+            }
+        };
+        match result {
+            Ok(_) => {}
+            // 终端被 force 替换后索引已不存在：结束摄取。
+            Err(CoreError::NotFound) => break,
+            Err(error) => tracing::debug!(%error, terminal_id = %terminal_id, "事件写入失败"),
+        }
+
+        if terminal {
+            break;
+        }
     }
 }
 
@@ -760,7 +1217,7 @@ fn unsubscribe_terminals(
 }
 
 /// 获取 registry 锁；锁中毒时取回内部值继续（registry 不持有跨调用状态）。
-fn lock_registry(registry: &Mutex<Registry>) -> MutexGuard<'_, Registry> {
+fn lock_registry(registry: &Arc<Mutex<Registry>>) -> MutexGuard<'_, Registry> {
     registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -796,6 +1253,9 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         CoreError::NotFound => ErrorCode::NotFound,
         CoreError::AlreadyTerminal => ErrorCode::AlreadyTerminal,
         CoreError::PermissionDenied => ErrorCode::PermissionDenied,
+        CoreError::SpawnFailed { .. } => ErrorCode::SpawnFailed,
+        CoreError::UnsupportedSignal(_) => ErrorCode::BadRequest,
+        CoreError::BackendFailed(_) => ErrorCode::Internal,
     };
     let terminal_id = match &error {
         CoreError::SessionExists { terminal_id } => Some(terminal_id.clone()),
@@ -1016,5 +1476,41 @@ mod tests {
     fn log_values_strip_control_characters() {
         assert_eq!(sanitize_log_value("a\nb\r\tc"), "a?b??c");
         assert_eq!(sanitize_log_value("normal-client"), "normal-client");
+    }
+
+    /// 构造只带载荷的 send 参数。
+    fn send_params(data: Option<&str>, text: Option<&str>, enter: bool) -> SendParams {
+        SendParams {
+            locator: TerminalLocator {
+                terminal_id: Some("01JABCDEF".to_string()),
+                root_session_id: None,
+                name: None,
+            },
+            data: data.map(str::to_string),
+            text: text.map(str::to_string),
+            enter,
+        }
+    }
+
+    #[test]
+    fn send_payload_prefers_data_and_appends_carriage_return() {
+        let payload =
+            send_payload(&send_params(Some("aGk="), Some("ignored"), true)).expect("data 应优先");
+        assert_eq!(payload, b"hi\r");
+
+        let payload = send_payload(&send_params(None, Some("echo"), false)).expect("text 应可用");
+        assert_eq!(payload, b"echo");
+    }
+
+    #[test]
+    fn send_payload_rejects_missing_and_invalid_data() {
+        assert!(matches!(
+            send_payload(&send_params(None, None, false)),
+            Err(CoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            send_payload(&send_params(Some("not-base64!"), None, false)),
+            Err(CoreError::BadRequest(_))
+        ));
     }
 }

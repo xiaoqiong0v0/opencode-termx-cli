@@ -7,12 +7,15 @@ use std::{
     ffi::OsString,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 /// 覆盖配置目录的环境变量。
 const TERMX_CONFIG_DIR_ENV: &str = "TERMX_CONFIG_DIR";
 /// 直接提供 token 的环境变量；优先于默认 token 文件。
 const TERMX_TOKEN_ENV: &str = "TERMX_TOKEN";
+/// 覆盖空闲检查 ticker 周期的环境变量，单位为毫秒。
+const TERMX_IDLE_TICK_MS_ENV: &str = "TERMX_IDLE_TICK_MS";
 /// Linux/macOS 的 XDG 配置根目录环境变量。
 const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 /// Unix 用户主目录环境变量。
@@ -36,6 +39,8 @@ pub const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::L
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = termx_core::DEFAULT_EVENT_BUFFER_CAPACITY;
 /// 入站单帧默认上限（1 MiB）。
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// 空闲检查后台 ticker 的默认周期。
+pub const DEFAULT_IDLE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 配置解析失败原因。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -61,6 +66,8 @@ pub struct ServiceConfig {
     pub token_file: Option<PathBuf>,
     /// 入站单帧字节上限；缺省 [`DEFAULT_MAX_FRAME_BYTES`]。
     pub max_frame_bytes: usize,
+    /// 空闲检查 ticker 周期；缺省 [`DEFAULT_IDLE_TICK_INTERVAL`]。
+    pub idle_tick_interval: Duration,
 }
 
 impl ServiceConfig {
@@ -72,6 +79,7 @@ impl ServiceConfig {
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
             token_file: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            idle_tick_interval: DEFAULT_IDLE_TICK_INTERVAL,
         }
     }
 
@@ -103,14 +111,30 @@ impl ServiceConfig {
         self
     }
 
+    /// 覆盖空闲检查 ticker 周期；0 会抬到 1ms，避免 `tokio::time::interval` panic。
+    #[must_use]
+    pub fn with_idle_tick_interval(mut self, idle_tick_interval: Duration) -> Self {
+        self.idle_tick_interval = if idle_tick_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            idle_tick_interval
+        };
+        self
+    }
+
     /// 从进程环境解析配置。
     ///
     /// 配置目录优先 `TERMX_CONFIG_DIR`，否则按平台默认：
     /// - Linux/macOS：`$XDG_CONFIG_HOME/termx` 或 `~/.config/termx`
     /// - Windows：`%APPDATA%\termx`
+    ///
+    /// 空闲检查周期可由 `TERMX_IDLE_TICK_MS`（毫秒）覆盖；缺省为
+    /// [`DEFAULT_IDLE_TICK_INTERVAL`]，非法或 0 值回退默认。
     pub fn from_env() -> Result<Self, ConfigError> {
         let config_dir = resolve_config_dir(Platform::CURRENT, |key: &str| std::env::var_os(key))?;
-        Ok(Self::new(config_dir))
+        let mut config = Self::new(config_dir);
+        config.idle_tick_interval = idle_tick_interval_from_env(|key: &str| std::env::var_os(key));
+        Ok(config)
     }
 
     /// token 文件路径；存在 `--token-file` 覆盖时使用覆盖值。
@@ -172,6 +196,24 @@ where
                 .ok_or(ConfigError::MissingEnv { name: HOME_ENV })?;
             Ok(base.join(TERMX_DIR_NAME))
         }
+    }
+}
+
+/// 从环境读取空闲检查 ticker 周期。
+///
+/// `TERMX_IDLE_TICK_MS` 为毫秒整数；缺失、非法或 0 时回退
+/// [`DEFAULT_IDLE_TICK_INTERVAL`]，避免 `tokio::time::interval` 收到 0 周期。
+fn idle_tick_interval_from_env<F>(env: F) -> Duration
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let parsed = env(TERMX_IDLE_TICK_MS_ENV)
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0);
+    match parsed {
+        Some(millis) => Duration::from_millis(millis),
+        None => DEFAULT_IDLE_TICK_INTERVAL,
     }
 }
 
@@ -412,6 +454,25 @@ mod tests {
     }
 
     #[test]
+    fn idle_tick_interval_reads_env_with_default_fallback() {
+        let default = idle_tick_interval_from_env(|_| None);
+        assert_eq!(default, DEFAULT_IDLE_TICK_INTERVAL);
+
+        let custom = idle_tick_interval_from_env(|key| {
+            (key == TERMX_IDLE_TICK_MS_ENV).then(|| OsString::from("25"))
+        });
+        assert_eq!(custom, Duration::from_millis(25));
+
+        // 0 / 非法值 / 空白一律回退默认，避免 0 周期让 interval panic。
+        for invalid in ["0", "abc", "  "] {
+            let fallback = idle_tick_interval_from_env(|key| {
+                (key == TERMX_IDLE_TICK_MS_ENV).then(|| OsString::from(invalid))
+            });
+            assert_eq!(fallback, DEFAULT_IDLE_TICK_INTERVAL, "非法值 {invalid:?}");
+        }
+    }
+
+    #[test]
     fn default_config_uses_ephemeral_loopback_address() {
         let config = ServiceConfig::new(PathBuf::from("/tmp/termx"));
         assert_eq!(config.bind_addr, DEFAULT_BIND_ADDR);
@@ -439,6 +500,22 @@ mod tests {
             config.clone().with_max_frame_bytes(0).max_frame_bytes,
             1,
             "帧上限至少为 1"
+        );
+        assert_eq!(config.idle_tick_interval, DEFAULT_IDLE_TICK_INTERVAL);
+        assert_eq!(
+            config
+                .clone()
+                .with_idle_tick_interval(Duration::from_millis(50))
+                .idle_tick_interval,
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            config
+                .clone()
+                .with_idle_tick_interval(Duration::ZERO)
+                .idle_tick_interval,
+            Duration::from_millis(1),
+            "0 周期应抬到 1ms"
         );
 
         let custom = PathBuf::from("/tmp/custom-token");

@@ -5,6 +5,7 @@ use std::{fmt, sync::Arc};
 use termx_protocol::{
     Confidence, EventKind, IdleTimeout, InteractionState, LifecycleState, Mode, TerminalSnapshot,
 };
+use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::{EventBuffer, TerminalBackend};
@@ -42,6 +43,19 @@ impl From<String> for TerminalId {
     }
 }
 
+/// 已发出、尚未随进程退出结算的中断意图。
+///
+/// `signal` 是协议信号名（如 `SIGINT`），`source` 是协议来源
+/// （`control-c` / `terminate`）；进程退出时由 registry 转成
+/// [`termx_protocol::EventKind::Interrupted`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterrupt {
+    /// 信号名。
+    pub signal: String,
+    /// 事件来源。
+    pub source: String,
+}
+
 /// 单个终端的运行时条目。
 ///
 /// F2 由 [`crate::Registry`] 持有；`seq` 与 `events.last_seq()` 保持同步，
@@ -61,7 +75,7 @@ pub struct TerminalEntry {
     pub interaction: InteractionState,
     /// 交互推断置信度。
     pub confidence: Confidence,
-    /// 主进程 ID；mock 后端在创建时即有值。
+    /// 主进程 ID；真实后端在创建时即有值。
     pub pid: Option<u32>,
     /// 进程组 ID。
     pub pgid: Option<u32>,
@@ -85,6 +99,8 @@ pub struct TerminalEntry {
     pub idle_timeout: Option<IdleTimeout>,
     /// 输入 lease 的持有者（连接级 `client_id`）；`None` 表示空闲。
     pub lease: Option<String>,
+    /// 已发出但尚未在退出事件中结算的中断意图。
+    pub pending_interrupt: Option<PendingInterrupt>,
     /// 后端进程句柄。
     pub backend: Arc<dyn TerminalBackend>,
 }
@@ -98,7 +114,29 @@ impl TerminalEntry {
         seq
     }
 
-    /// 生成协议快照；F2 的进程树暂为空。
+    /// 把最后活动时间刷新为 `at`（RFC3339 UTC）。
+    ///
+    /// `send` / `resize` 等不产生事件的输入路径用它显式续期，避免被
+    /// `idle_timeout` 误判为空闲。
+    pub fn touch(&mut self, at: OffsetDateTime) {
+        self.last_activity = Some(crate::format_rfc3339(at));
+    }
+
+    /// 最后活动时间；缺失或格式非法时回退到创建时间。
+    ///
+    /// 创建时一定会写入 `started` 事件，因此正常路径总有 `last_activity`；
+    /// 回退仅用于容错（例如测试手工构造的条目）。
+    pub fn activity_time(&self) -> Option<OffsetDateTime> {
+        self.last_activity
+            .as_deref()
+            .and_then(crate::parse_rfc3339)
+            .or_else(|| crate::parse_rfc3339(&self.created_at))
+    }
+
+    /// 生成协议快照。
+    ///
+    /// 基础快照不查询后端；`terminal.status` 由 registry 在锁外补入
+    /// `foreground_pgrp` 与 `tree`，终态时保持最后快照。
     pub fn snapshot(&self) -> TerminalSnapshot {
         TerminalSnapshot {
             terminal_id: self.id.0.clone(),
@@ -154,6 +192,7 @@ mod tests {
             events: EventBuffer::default(),
             idle_timeout: None,
             lease: None,
+            pending_interrupt: None,
             backend: Arc::new(crate::MockBackend::new()),
         };
 

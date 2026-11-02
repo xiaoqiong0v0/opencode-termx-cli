@@ -29,4 +29,16 @@ pub enum CoreError {
     /// 参数缺失或不完整。
     #[error("请求参数非法: {0}")]
     BadRequest(String),
+    /// 后端进程创建失败（含 PTY/ConPTY 初始化失败）。
+    #[error("进程创建失败: {message}")]
+    SpawnFailed {
+        /// 可读的失败原因。
+        message: String,
+    },
+    /// 后端操作（写/缩放/信号/终止）失败。
+    #[error("后端操作失败: {0}")]
+    BackendFailed(String),
+    /// 不支持的信号名。
+    #[error("不支持的信号: {0}")]
+    UnsupportedSignal(String),
 }

@@ -10,7 +10,7 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use tempfile::tempdir;
-use termx_core::{Registry, TerminalId};
+use termx_core::{MockFactory, Registry, TerminalId};
 use termx_protocol::{
     AttachResult, ClaimResult, CreateResult, ErrorCode, Event, EventKind, HELPER_PROTOCOL_VERSION,
     HelloResult, LifecycleState, ListItem, Mode, PROTOCOL_VERSION, Response, StatusResult, Stream,
@@ -44,9 +44,11 @@ impl TestService {
         Self::start_with_config(ServiceConfig::new(config_dir.to_path_buf())).await
     }
 
-    /// 用给定配置启动服务并读出 token。
+    /// 用给定配置启动服务并读出 token；注入 mock 工厂避免创建真实进程。
     async fn start_with_config(config: ServiceConfig) -> Self {
-        let service = Service::bind(config).await.expect("服务绑定失败");
+        let service = Service::bind_with_factory(config, Arc::new(MockFactory))
+            .await
+            .expect("服务绑定失败");
         let addr = service.local_addr();
         let token = fs::read_to_string(service.config().token_path())
             .expect("token 文件缺失")

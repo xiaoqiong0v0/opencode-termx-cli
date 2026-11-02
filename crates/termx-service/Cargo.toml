@@ -16,10 +16,14 @@ path = "src/main.rs"
 [dependencies]
 termx-protocol = { path = "../termx-protocol" }
 termx-core = { path = "../termx-core" }
+# 事件摄取任务直接消费 termx-proc 的 `ProcEvent` 流。
+termx-proc = { path = "../termx-proc" }
+base64 = { workspace = true }
 futures-util = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
@@ -28,3 +32,5 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 集成测试直接注入事件/读取 registry 状态，验证订阅与 prune 语义。
+termx-core = { path = "../termx-core" }

@@ -33,4 +33,7 @@ rand = "0.10"
 
 # M1/F2 终端 registry 所需：全局唯一 ID 与 RFC3339 时间戳。
 ulid = "3"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+# M2c1：PTY 输出按协议要求以 base64 承载。
+base64 = "0.22"
