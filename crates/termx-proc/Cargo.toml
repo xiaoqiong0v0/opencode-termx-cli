@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+# 仅集成测试使用的探针进程：验证 stdio 的 cwd/env/参数直传与后代清理。
+[[bin]]
+name = "termx-stdio-probe"
+path = "tests/support/stdio_probe.rs"
+
 [dependencies]
 termx-protocol = { path = "../termx-protocol" }
 thiserror = { workspace = true }

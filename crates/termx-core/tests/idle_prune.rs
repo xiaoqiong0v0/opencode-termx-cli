@@ -11,7 +11,7 @@ use termx_protocol::{
     LifecycleState, ListParams, Mode, PruneBasis, PruneParams, TerminalLocator, TimeSpan,
 };
 use time::{Duration, OffsetDateTime};
-use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, channel, error::TryRecvError};
 
 /// 使用 mock 工厂的 registry。
 fn mock_registry() -> Registry {
@@ -54,7 +54,7 @@ fn by_id(terminal_id: &str) -> TerminalLocator {
 }
 
 /// 取出当前已缓冲的全部事件。
-fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
+fn drain(rx: &mut Receiver<Event>) -> Vec<Event> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -136,7 +136,7 @@ fn detach_action_emits_detached_and_terminal_stays_running() {
     let id = TerminalId::new(created.terminal_id.clone());
     let locator = by_id(&created.terminal_id);
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator, "client-a", Some(0), tx)
         .expect("attach 应成功");
@@ -195,7 +195,7 @@ fn terminate_action_emits_timeout_interrupted_and_keeps_backend_for_caller() {
     let id = TerminalId::new(created.terminal_id.clone());
     let locator = by_id(&created.terminal_id);
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator, "client-a", Some(0), tx)
         .expect("attach 应成功");
@@ -265,7 +265,7 @@ fn prune_removes_only_terminal_terminals_and_reports_ids() {
     let running_id = TerminalId::new(running.terminal_id.clone());
 
     // 预置两类可清理状态：终端级订阅与全局订阅排除项。
-    let (terminal_tx, mut terminal_rx) = unbounded_channel();
+    let (terminal_tx, mut terminal_rx) = channel(64);
     registry
         .attach(
             &by_id(&terminated.terminal_id),
@@ -276,7 +276,7 @@ fn prune_removes_only_terminal_terminals_and_reports_ids() {
         .expect("attach 应成功");
     drain(&mut terminal_rx);
 
-    let (global_tx, _global_rx) = unbounded_channel();
+    let (global_tx, _global_rx) = channel(64);
     registry.subscribe_all("client-excl", global_tx);
     registry
         .unsubscribe(&terminated_id, "client-excl")

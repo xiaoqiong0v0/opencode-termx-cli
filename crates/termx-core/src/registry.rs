@@ -18,16 +18,19 @@ use std::{
 use termx_protocol::{
     AttachResult, ClaimResult, Confidence, CreateParams, CreateResult, Event, EventKind,
     IdleTimeout, IdleTimeoutAction, IdleTimeoutUnit, InteractionState, LifecycleState, ListItem,
-    ListParams, Mode, PruneBasis, PruneParams, PruneResult, ResetReason, SubscriptionCursor,
-    TerminalLocator, TerminalSnapshot, TimeSpan,
+    ListParams, Mode, PruneBasis, PruneParams, PruneResult, ReadChunk, ReadResult, ResetReason,
+    SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
 };
 use time::OffsetDateTime;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{
+    mpsc::{Sender, error::TrySendError},
+    watch,
+};
 
 use crate::{
     BackendFactory, CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS,
-    EventBuffer, PendingInterrupt, PtyFactory, TerminalBackend, TerminalEntry, TerminalId,
-    now_rfc3339,
+    EventBuffer, EventRecord, ModeFactory, PendingInterrupt, TerminalBackend, TerminalEntry,
+    TerminalId, now_rfc3339,
 };
 
 /// 会话内名称最大长度（按 Unicode 字符计数）。
@@ -36,12 +39,10 @@ const NAME_MAX_LEN: usize = 64;
 const TERMINATE_SIGNAL: &str = "SIGTERM";
 /// force 终止旧终端时写入事件的来源。
 const TERMINATE_SOURCE: &str = "terminate";
-/// `terminal.signal(SIGINT)` 写入了中断来源。
+/// `terminal.signal(SIGINT)` 成功后记录的中断来源。
 const CONTROL_C_SOURCE: &str = "control-c";
-/// 进程被信号终止、无显式中断意图时的事件来源。
+/// 其它信号成功送达后记录的中断来源。
 const SIGNAL_SOURCE: &str = "signal";
-/// Ctrl-C 在 PTY 中的输入字节（`terminal.signal(SIGINT)` 使用）。
-const CTRL_C_BYTE: u8 = 0x03;
 /// 客户端主动 `terminal.detach` 时写入的断开原因。
 const DETACH_REASON: &str = "detach";
 /// 连接断开、服务端清理订阅时写入的断开原因。
@@ -52,6 +53,10 @@ pub const IDLE_DETACH_REASON: &str = "idle_timeout";
 pub const TIMEOUT_SOURCE: &str = "timeout";
 /// `terminal.create` 返回的初始游标：`started`（seq=1）之前的位置。
 pub const INITIAL_CURSOR: u64 = 0;
+/// 订阅者事件队列的默认容量（条）。
+pub const DEFAULT_SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
+/// `terminal.read` 未指定 `max_bytes`（或给 0）时的默认字节上限。
+pub const DEFAULT_READ_MAX_BYTES: u64 = 64 * 1024;
 
 /// 进程退出结果：区分正常退出码与信号终止。
 ///
@@ -63,15 +68,6 @@ pub enum ExitOutcome {
     Code(i32),
     /// 被信号终止（Unix `WTERMSIG` 原值）。
     Signal(i32),
-}
-
-/// `terminal.signal` 在锁外需要执行的后端动作。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignalAction {
-    /// 向 PTY 写入 Ctrl-C（`0x03`）。
-    WriteCtrlC,
-    /// 向后端发送指定信号名。
-    Send(String),
 }
 
 /// `idle_timeout` 到期后由 registry 锁内判定、锁外执行的动作。
@@ -106,30 +102,31 @@ impl fmt::Debug for IdleAction {
     }
 }
 
-/// `terminal.signal` 的锁内准备结果：后端句柄与锁外动作。
-#[derive(Clone)]
+/// `terminal.signal` 的锁内准备结果：目标终端、后端句柄与信号名。
+///
+/// 锁内不记录 `pending_interrupt`：只有后端 `signal` 成功返回后，service 才在
+/// 下一把 registry 锁内调用 [`Registry::confirm_signal`] 记录中断意图。
 pub struct PreparedSignal {
+    /// 目标终端。
+    pub terminal_id: TerminalId,
     /// 目标后端。
     pub backend: Arc<dyn TerminalBackend>,
-    /// 锁外需要执行的动作。
-    pub action: SignalAction,
+    /// 已校验格式的信号名，原样交给后端。
+    pub signal: String,
 }
 
 impl PreparedSignal {
-    /// 执行锁内已决定的后端动作；调用方必须在 registry 锁外调用。
+    /// 执行后端信号发送；调用方必须在 registry 锁外调用。
     pub fn execute(&self) -> Result<(), CoreError> {
-        match &self.action {
-            SignalAction::WriteCtrlC => self.backend.write(&[CTRL_C_BYTE]),
-            SignalAction::Send(name) => self.backend.signal(name),
-        }
+        self.backend.signal(&self.signal)
     }
 }
 
-/// 每终端订阅发送端；F3 先使用无界通道。
+/// 每终端订阅发送端：有界通道，容量由 [`Registry::subscriber_queue_capacity`] 决定。
 ///
-/// M3 引入有界队列与 `output_dropped` 背压后，会替换为有界发送端并增加
-/// 每客户端队列上限；当前 `UnboundedSender` 只保证不因慢读者阻塞事件写入。
-type EventSender = UnboundedSender<Event>;
+/// 投递一律 `try_send`，绝不阻塞事件写入；队满（任何事件）时移除订阅者并
+/// 通知 service 断开，见 [`Registry::deliver_event`]。
+type EventSender = Sender<Event>;
 /// 同一终端下 `client_id -> 发送端`。
 type TerminalSubscribers = BTreeMap<String, EventSender>;
 
@@ -148,6 +145,19 @@ struct SubscriptionBook {
     /// 客户端对某终端 `detach`/`unsubscribe` 后写入，`attach`/`subscribe`
     /// 该终端时移除；投递全局订阅事件时跳过被排除的终端。
     excluded: BTreeMap<String, BTreeSet<TerminalId>>,
+    /// 连接级限流通知：任何事件无法投递时置 `true`，由 service 断开连接。
+    throttle: BTreeMap<String, watch::Sender<bool>>,
+}
+
+/// 单次投递结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// 已投递。
+    Kept,
+    /// 接收端已关闭，订阅应清理。
+    Closed,
+    /// 队列已满：必须移除订阅者并通知 service 断开。
+    Throttled,
 }
 
 /// 终端注册表。
@@ -157,7 +167,12 @@ struct SubscriptionBook {
 pub struct Registry {
     /// 新建终端使用的事件缓冲容量。
     event_buffer_capacity: usize,
-    /// 新建终端的后端工厂；默认 [`PtyFactory`]，测试可注入 [`crate::MockFactory`]。
+    /// 每个订阅者的有界事件队列容量。
+    subscriber_queue_capacity: usize,
+    /// 运行中终端数量上限；`None` 表示不限制。
+    max_terminals: Option<usize>,
+    /// 新建终端的后端工厂；默认 [`ModeFactory`]（pty/stdio 分别路由），
+    /// 测试可注入 [`crate::MockFactory`]。
     factory: Arc<dyn BackendFactory>,
     /// 按 ID 索引。
     by_id: BTreeMap<TerminalId, TerminalEntry>,
@@ -176,20 +191,75 @@ impl Default for Registry {
 impl Registry {
     /// 以给定事件缓冲容量创建空 registry；容量为 0 时按 1 处理。
     ///
-    /// 默认工厂为 [`PtyFactory`]；`mode=pty` 会创建真实进程。
+    /// 默认工厂为 [`ModeFactory`]：`mode=pty` 走 ConPTY/PTY，`mode=stdio`
+    /// 走独立管道，两者都会创建真实进程。
     pub fn new(event_buffer_capacity: usize) -> Self {
-        Self::with_factory(event_buffer_capacity, Arc::new(PtyFactory))
+        Self::with_factory(event_buffer_capacity, Arc::new(ModeFactory::default()))
     }
 
-    /// 使用指定后端工厂创建空 registry；测试可注入 [`crate::MockFactory`]。
+    /// 使用指定后端工厂创建空 registry；订阅队列取默认容量。
     pub fn with_factory(event_buffer_capacity: usize, factory: Arc<dyn BackendFactory>) -> Self {
+        Self::with_config(
+            event_buffer_capacity,
+            DEFAULT_SUBSCRIBER_QUEUE_CAPACITY,
+            factory,
+        )
+    }
+
+    /// 同时指定事件缓冲容量与订阅队列容量；测试用。
+    pub fn with_config(
+        event_buffer_capacity: usize,
+        subscriber_queue_capacity: usize,
+        factory: Arc<dyn BackendFactory>,
+    ) -> Self {
         Self {
             event_buffer_capacity: event_buffer_capacity.max(1),
+            subscriber_queue_capacity: subscriber_queue_capacity.max(1),
+            max_terminals: None,
             factory,
             by_id: BTreeMap::new(),
             by_key: BTreeMap::new(),
             subscriptions: SubscriptionBook::default(),
         }
+    }
+
+    /// 每个订阅者的有界队列容量。
+    pub fn subscriber_queue_capacity(&self) -> usize {
+        self.subscriber_queue_capacity
+    }
+
+    /// 设置运行中终端数量上限；`None` 表示不限制。
+    pub fn set_max_terminals(&mut self, max_terminals: Option<usize>) {
+        self.max_terminals = max_terminals;
+    }
+
+    /// 当前运行中（非终态）终端数量。
+    pub fn running_count(&self) -> usize {
+        self.by_id
+            .values()
+            .filter(|entry| !entry.state.is_terminal())
+            .count()
+    }
+
+    /// 是否已达运行中终端上限。
+    fn at_terminal_limit(&self) -> bool {
+        self.max_terminals
+            .is_some_and(|max| self.running_count() >= max)
+    }
+
+    /// 登记连接级限流通知通道；状态事件无法投递时向该通道发送 `true`。
+    ///
+    /// service 在 `hello` 后登记、连接收尾时 `unregister_client`；registry
+    /// 自身不创建该 watch，避免把连接生命周期耦合进 core。
+    pub fn register_client(&mut self, client_id: &str, throttle: watch::Sender<bool>) {
+        self.subscriptions
+            .throttle
+            .insert(client_id.to_string(), throttle);
+    }
+
+    /// 注销连接级限流通知通道。
+    pub fn unregister_client(&mut self, client_id: &str) {
+        self.subscriptions.throttle.remove(client_id);
     }
 
     /// 克隆后端工厂句柄；service 在锁外调用 `spawn` 时使用。
@@ -210,7 +280,15 @@ impl Registry {
         // 同步入口无人消费事件；丢弃接收端让 proc 读线程尽快结束。
         drop(events);
         let foreground_pgrp = backend.foreground_pgrp();
-        let (result, displaced) = self.register_create(params, backend, foreground_pgrp)?;
+        let registered = self.register_create(params, Arc::clone(&backend), foreground_pgrp);
+        let (result, displaced) = match registered {
+            Ok(registered) => registered,
+            Err(error) => {
+                // 竞态/上限导致注册失败：回收刚启动的后端，避免孤儿。
+                backend.terminate();
+                return Err(error);
+            }
+        };
         if let Some(old) = displaced {
             old.terminate();
         }
@@ -247,6 +325,12 @@ impl Registry {
 
         let key = (params.root_session_id.clone(), params.name.clone());
         let Some(old_id) = self.by_key.get(&key) else {
+            if self.at_terminal_limit() {
+                return Err(CoreError::LimitExceeded(format!(
+                    "运行中终端数量已达上限 {}",
+                    self.max_terminals.unwrap_or_default()
+                )));
+            }
             return Ok(());
         };
         if !params.force {
@@ -289,6 +373,14 @@ impl Registry {
             for excluded in self.subscriptions.excluded.values_mut() {
                 excluded.remove(&old_id);
             }
+        }
+
+        // 预检后仍可能被并发 create 抢先占用名额；锁内再校验一次。
+        if self.at_terminal_limit() {
+            return Err(CoreError::LimitExceeded(format!(
+                "运行中终端数量已达上限 {}",
+                self.max_terminals.unwrap_or_default()
+            )));
         }
 
         let (cols, rows) = match params.mode {
@@ -394,6 +486,27 @@ impl Registry {
         }
     }
 
+    /// 按游标只读回放输出：只返回 `Output` 事件，按 `seq` 升序。
+    ///
+    /// - 不创建/修改订阅，也不推进任何消费状态；可重复调用。
+    /// - 返回的 `cursor` 是本次扫描到的最后 `seq`（含被跳过的非 Output 事件），
+    ///   便于客户端继续增量读取。
+    /// - `cursor` 早于 ring 下界，或所需区间的输出已被背压淘汰时，返回
+    ///   `reset: too_old`、空 `chunks` 与基线游标（当前最后 `seq`）。
+    /// - `max_bytes` 为本次累计 `data` 解码后字节上限；`None`/`0` 用
+    ///   [`DEFAULT_READ_MAX_BYTES`]。单条输出本身超过上限时仍返回该条并前进
+    ///   游标，避免空结果导致活锁。
+    pub fn read(
+        &self,
+        locator: &TerminalLocator,
+        cursor: u64,
+        max_bytes: Option<u64>,
+    ) -> Result<ReadResult, CoreError> {
+        let id = self.resolve(locator)?;
+        let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
+        Ok(read_after(entry, cursor, max_bytes))
+    }
+
     /// 终止终端：落 `interrupted` 终态并调用后端；已终态时幂等返回 `Ok`。
     ///
     /// 同步便捷入口。service 应先调用 [`Registry::prepare_terminate`] 取后端
@@ -494,6 +607,15 @@ impl Registry {
         Ok(())
     }
 
+    /// 返回终端创建模式；`terminal.send` 据此决定 `enter` 追加 `\r` 还是 `\n`。
+    pub fn mode(&self, locator: &TerminalLocator) -> Result<Mode, CoreError> {
+        let id = self.resolve(locator)?;
+        self.by_id
+            .get(&id)
+            .map(|entry| entry.mode)
+            .ok_or(CoreError::NotFound)
+    }
+
     /// 校验客户端是否可向该终端写入输入（供 M2 `terminal.send` 使用）。
     ///
     /// 终态终端返回 `already_terminal`；无 lease 或非 owner 返回
@@ -581,13 +703,11 @@ impl Registry {
         self.prepare_resize(locator, cols, rows)?.resize(cols, rows)
     }
 
-    /// 发送信号前的锁内阶段：校验非终态、记录中断意图并返回锁外动作。
+    /// 发送信号前的锁内阶段：校验非终态并返回锁外执行所需信息。
     ///
-    /// `SIGINT` 按 Ctrl-C 处理：写入 `0x03` 并记录
-    /// `pending_interrupt=(SIGINT, control-c)`；其它受支持信号记录
-    /// `pending_interrupt=(<信号名>, signal)` 后交给后端。进程随后退出时由
-    /// [`Registry::report_exit`] 映射为 `interrupted`（Windows 无 Signaled
-    /// 事件，也靠该 pending 统一语义）。
+    /// 本阶段**不**记录 `pending_interrupt`。后端 `signal` 成功返回后，调用方
+    /// 必须再调用 [`Registry::confirm_signal`]；失败（未知信号、进程已退出等）
+    /// 不落 pending，避免把随后的正常退出误报为 `interrupted`。
     ///
     /// 终态返回 `already_terminal`；不要求输入 lease（与 `claim` 一致，
     /// 信号属于进程控制而非输入）。
@@ -597,40 +717,51 @@ impl Registry {
         name: &str,
     ) -> Result<PreparedSignal, CoreError> {
         let id = self.resolve(locator)?;
-        let entry = self.by_id.get_mut(&id).ok_or(CoreError::NotFound)?;
+        let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
         if entry.state.is_terminal() {
             return Err(CoreError::AlreadyTerminal);
         }
 
-        let backend = Arc::clone(&entry.backend);
-        let action = match canonical_signal(name) {
-            // Ctrl-C 走终端字节；pending 让随后退出落成 control-c 来源。
-            Some("SIGINT") => {
-                entry.pending_interrupt = Some(PendingInterrupt {
-                    signal: "SIGINT".to_string(),
-                    source: CONTROL_C_SOURCE.to_string(),
-                });
-                SignalAction::WriteCtrlC
-            }
-            // 其它受支持信号记录 pending：Windows 无 Signaled 事件，靠它把
-            // 强制终止映射为 interrupted{source:"signal"}。
-            Some(canonical) => {
-                entry.pending_interrupt = Some(PendingInterrupt {
-                    signal: canonical.to_string(),
-                    source: SIGNAL_SOURCE.to_string(),
-                });
-                SignalAction::Send(name.to_string())
-            }
-            None => SignalAction::Send(name.to_string()),
+        Ok(PreparedSignal {
+            terminal_id: id,
+            backend: Arc::clone(&entry.backend),
+            signal: name.to_string(),
+        })
+    }
+
+    /// 后端信号成功送达后记录中断意图；终端已终态时忽略。
+    ///
+    /// `SIGINT` 记为 `source:"control-c"`，其它受支持信号记为 `source:"signal"`；
+    /// 未知信号不记录。进程随后退出时由 [`Registry::report_exit`] 映射为
+    /// `interrupted`（Windows 无 `Signaled` 事件，也靠该 pending 统一语义）。
+    pub fn confirm_signal(&mut self, id: &TerminalId, name: &str) -> Result<(), CoreError> {
+        let Some(canonical) = canonical_signal(name) else {
+            return Ok(());
         };
-        Ok(PreparedSignal { backend, action })
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        if entry.state.is_terminal() {
+            return Ok(());
+        }
+        let source = if canonical == "SIGINT" {
+            CONTROL_C_SOURCE
+        } else {
+            SIGNAL_SOURCE
+        };
+        entry.pending_interrupt = Some(PendingInterrupt {
+            signal: canonical.to_string(),
+            source: source.to_string(),
+        });
+        Ok(())
     }
 
     /// 向终端发送信号（同步便捷入口）。
     ///
-    /// 持有 registry 锁的调用方应改用 [`Registry::prepare_signal`] + 锁外执行。
+    /// 持有 registry 锁的调用方应改用 [`Registry::prepare_signal`] +
+    /// [`Registry::confirm_signal`]，并在两阶段之间释放锁调用后端。
     pub fn signal(&mut self, locator: &TerminalLocator, name: &str) -> Result<(), CoreError> {
-        self.prepare_signal(locator, name)?.execute()
+        let prepared = self.prepare_signal(locator, name)?;
+        prepared.execute()?;
+        self.confirm_signal(&prepared.terminal_id, name)
     }
 
     /// 释放该客户端持有的全部 lease；供连接断开时兜底，避免终端永久锁死。
@@ -815,6 +946,14 @@ impl Registry {
             .is_some_and(|excluded| excluded.contains(id))
     }
 
+    /// 收集全部终端后端句柄；service shutdown 时在锁外逐个 best-effort 终止。
+    pub fn collect_backends(&self) -> Vec<Arc<dyn TerminalBackend>> {
+        self.by_id
+            .values()
+            .map(|entry| Arc::clone(&entry.backend))
+            .collect()
+    }
+
     /// 按 ID 取只读条目。
     pub fn get(&self, id: &TerminalId) -> Option<&TerminalEntry> {
         self.by_id.get(id)
@@ -907,8 +1046,9 @@ impl Registry {
         // 先注册再回放：与 report_event 同受 registry 锁保护，不会出现空窗或重复。
         self.subscribe_terminal(&id, client_id, tx.clone());
         self.clear_exclusion(&id, client_id);
-        for event in replay {
-            let _ = tx.send(event);
+        let delivery = self.deliver_replay(&tx, replay);
+        if delivery == Delivery::Throttled {
+            self.throttle_client(client_id);
         }
         self.publish(
             &id,
@@ -941,8 +1081,9 @@ impl Registry {
 
         self.subscribe_terminal(&id, client_id, tx.clone());
         self.clear_exclusion(&id, client_id);
-        for event in replay {
-            let _ = tx.send(event);
+        let delivery = self.deliver_replay(&tx, replay);
+        if delivery == Delivery::Throttled {
+            self.throttle_client(client_id);
         }
 
         Ok(SubscriptionCursor {
@@ -1092,7 +1233,7 @@ impl Registry {
         clients
     }
 
-    /// 注册或替换终端级订阅。
+    /// 注册或替换终端级订阅；同时清掉该订阅者在此终端上的陈旧滞后区间。
     fn subscribe_terminal(&mut self, id: &TerminalId, client_id: &str, tx: EventSender) {
         self.subscriptions
             .by_terminal
@@ -1126,73 +1267,121 @@ impl Registry {
     }
 
     /// 写入事件并把完整事件投递给终端级与全局订阅者。
+    ///
+    /// 若写入过程淘汰了输出，`output_dropped` marker 已在 ring 内且各自占用
+    /// 独立 `seq`；这里按 `seq` 升序依次投递（先本次事件，再各条 marker）。
     fn publish(&mut self, id: &TerminalId, kind: EventKind) -> Result<u64, CoreError> {
-        let (seq, event) = {
+        let (seq, event, markers) = {
             let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
-            let seq = entry.emit(kind);
-            let record = entry
-                .events
-                .records()
-                .back()
-                .expect("刚写入的事件必然存在于 ring");
-            (
-                seq,
-                Event {
-                    terminal_id: id.0.clone(),
-                    seq,
-                    ts: record.ts.clone(),
-                    kind: record.kind.clone(),
-                },
-            )
+            let (record, markers) = entry.emit_with_drops(kind);
+            let seq = record.seq;
+            (seq, event_from_record(id, &record), markers)
         };
 
         self.deliver_event(id, &event);
+        for marker in markers {
+            self.deliver_event(id, &event_from_record(id, &marker));
+        }
         Ok(seq)
     }
 
     /// 投递事件；同一客户端同时有终端级与全局订阅时只投递一次。
     ///
-    /// 接收端已关闭时顺手移除失效订阅，避免长期泄漏。
+    /// 有界队列投递规则（任何事件一视同仁）：
+    /// - 队满：移除该订阅者并触发 `throttle` 通知，由 service 发
+    ///   `limit_exceeded` 后断开；不在订阅者侧复用 `seq` 补 marker。
+    /// - 接收端已关闭：顺手移除失效订阅，避免长期泄漏。
+    /// - `seq` 始终取事件自身的单调值，绝不回退。
     fn deliver_event(&mut self, id: &TerminalId, event: &Event) {
-        let mut delivered = BTreeSet::new();
-        let mut stale_terminal = Vec::new();
+        let mut handled = BTreeSet::new();
+        let mut remove_terminal = Vec::new();
+        let mut remove_all = Vec::new();
+        let mut throttled = Vec::new();
 
-        if let Some(clients) = self.subscriptions.by_terminal.get(id) {
-            for (client_id, tx) in clients {
-                if tx.send(event.clone()).is_ok() {
-                    delivered.insert(client_id.clone());
-                } else {
-                    stale_terminal.push(client_id.clone());
+        let terminal_targets: Vec<(String, EventSender)> = self
+            .subscriptions
+            .by_terminal
+            .get(id)
+            .map(|clients| {
+                clients
+                    .iter()
+                    .map(|(client_id, tx)| (client_id.clone(), tx.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (client_id, tx) in terminal_targets {
+            handled.insert(client_id.clone());
+            match try_deliver(&tx, event) {
+                Delivery::Kept => {}
+                Delivery::Closed => remove_terminal.push(client_id),
+                Delivery::Throttled => {
+                    remove_terminal.push(client_id.clone());
+                    throttled.push(client_id);
                 }
             }
         }
 
-        let mut stale_all = Vec::new();
-        for (client_id, tx) in &self.subscriptions.all {
-            if delivered.contains(client_id) {
-                continue;
-            }
-            if self
-                .subscriptions
-                .excluded
-                .get(client_id)
-                .is_some_and(|excluded| excluded.contains(id))
-            {
-                continue;
-            }
-            if tx.send(event.clone()).is_err() {
-                stale_all.push(client_id.clone());
+        let global_targets: Vec<(String, EventSender)> = self
+            .subscriptions
+            .all
+            .iter()
+            .filter(|(client_id, _)| !handled.contains(*client_id))
+            .filter(|(client_id, _)| {
+                !self
+                    .subscriptions
+                    .excluded
+                    .get(*client_id)
+                    .is_some_and(|excluded| excluded.contains(id))
+            })
+            .map(|(client_id, tx)| (client_id.clone(), tx.clone()))
+            .collect();
+        for (client_id, tx) in global_targets {
+            match try_deliver(&tx, event) {
+                Delivery::Kept => {}
+                Delivery::Closed => remove_all.push(client_id),
+                Delivery::Throttled => {
+                    remove_all.push(client_id.clone());
+                    throttled.push(client_id);
+                }
             }
         }
 
         if let Some(clients) = self.subscriptions.by_terminal.get_mut(id) {
-            for client_id in stale_terminal {
+            for client_id in remove_terminal {
                 clients.remove(&client_id);
             }
         }
-        for client_id in stale_all {
+        for client_id in remove_all {
             self.subscriptions.all.remove(&client_id);
         }
+        for client_id in throttled {
+            self.throttle_client(&client_id);
+        }
+    }
+
+    /// 把历史回放投递给单个订阅者；规则与实时投递一致（含队满即断开）。
+    fn deliver_replay(&mut self, tx: &EventSender, replay: Vec<Event>) -> Delivery {
+        for event in replay {
+            match try_deliver(tx, &event) {
+                Delivery::Kept => {}
+                other => return other,
+            }
+        }
+        Delivery::Kept
+    }
+
+    /// 移除客户端全部订阅并通知 service 断开（队列无法继续投递时）。
+    fn throttle_client(&mut self, client_id: &str) {
+        if let Some(tx) = self.subscriptions.throttle.get(client_id) {
+            if let Err(error) = tx.send(true) {
+                tracing::debug!(%error, %client_id, "发送订阅限流通知失败");
+            }
+        }
+
+        for clients in self.subscriptions.by_terminal.values_mut() {
+            clients.remove(client_id);
+        }
+        self.subscriptions.all.remove(client_id);
     }
 
     /// 把终端置为 `interrupted` 终态、清 lease 并广播事件。
@@ -1325,16 +1514,14 @@ fn terminal_state_for(kind: &EventKind) -> Option<LifecycleState> {
     }
 }
 
-/// 按游标从 ring 取出可回放事件；游标早于下界时返回 `too_old`。
+/// 按游标从 ring 取出可回放事件；游标所需历史不可用时返回 `too_old`。
 fn replay_after(entry: &TerminalEntry, cursor: Option<u64>) -> (Option<ResetReason>, Vec<Event>) {
     let Some(cursor) = cursor else {
         return (None, Vec::new());
     };
 
-    if let Some(oldest) = entry.events.records().front().map(|record| record.seq) {
-        if cursor.saturating_add(1) < oldest {
-            return (Some(ResetReason::TooOld), Vec::new());
-        }
+    if output_history_missing(entry, cursor) {
+        return (Some(ResetReason::TooOld), Vec::new());
     }
 
     let events = entry
@@ -1342,24 +1529,125 @@ fn replay_after(entry: &TerminalEntry, cursor: Option<u64>) -> (Option<ResetReas
         .records()
         .iter()
         .filter(|record| record.seq > cursor)
-        .map(|record| Event {
-            terminal_id: entry.id.as_str().to_string(),
-            seq: record.seq,
-            ts: record.ts.clone(),
-            kind: record.kind.clone(),
-        })
+        .map(|record| event_from_record(&entry.id, record))
         .collect();
     (None, events)
 }
 
-/// 校验创建参数：名称 → 模式 → `idle_timeout`。
+/// `terminal.read` 的只读扫描实现。
+fn read_after(entry: &TerminalEntry, cursor: u64, max_bytes: Option<u64>) -> ReadResult {
+    let limit = match max_bytes {
+        Some(value) if value > 0 => value,
+        _ => DEFAULT_READ_MAX_BYTES,
+    };
+
+    if output_history_missing(entry, cursor) {
+        return ReadResult {
+            chunks: Vec::new(),
+            cursor: entry.seq,
+            reset: Some(ResetReason::TooOld),
+        };
+    }
+
+    let mut chunks = Vec::new();
+    let mut scanned = cursor;
+    let mut total = 0_u64;
+    for record in entry.events.records() {
+        if record.seq <= cursor {
+            continue;
+        }
+        if let EventKind::Output { data, .. } = &record.kind {
+            let bytes = base64_decoded_len(data);
+            if total.saturating_add(bytes) > limit && !chunks.is_empty() {
+                // 不跨过未返回的记录，保证下一次 read 能从这里继续。
+                break;
+            }
+            // 单条输出本身超过 max_bytes 时仍返回该条并前进游标，避免客户端
+            // 反复拿到空结果形成活锁。
+            total = total.saturating_add(bytes);
+            chunks.push(ReadChunk {
+                seq: record.seq,
+                ts: record.ts.clone(),
+                data: data.clone(),
+            });
+        }
+        // 非 Output 事件不返回，但游标要越过它们。
+        scanned = record.seq;
+    }
+
+    ReadResult {
+        chunks,
+        cursor: scanned,
+        reset: None,
+    }
+}
+
+/// 游标所需的历史是否已不可用。
+///
+/// 两种情形：
+/// - `cursor + 1` 早于 ring 中最小 `seq`（整段历史已回绕）；
+/// - 游标落在输出背压已丢弃的区间内（`cursor < 曾丢弃的最大 to_seq`）。
+///
+/// 丢弃高水位由 [`EventBuffer::dropped_through`] 独立维护：`output_dropped`
+/// marker 自身也可能被后续淘汰，只扫描 ring 内 marker 会在该窗口得到
+/// `lost_to = 0`，把已丢区间当成连续可读而静默跳过输出。
+fn output_history_missing(entry: &TerminalEntry, cursor: u64) -> bool {
+    if entry
+        .events
+        .oldest_seq()
+        .is_some_and(|oldest| cursor.saturating_add(1) < oldest)
+    {
+        return true;
+    }
+
+    let mut lost_to = entry.events.dropped_through();
+    for record in entry.events.records() {
+        if let EventKind::OutputDropped { to_seq, .. } = &record.kind {
+            lost_to = lost_to.max(*to_seq);
+        }
+    }
+    if let Some(to_seq) = entry.events.pending_drop_through() {
+        lost_to = lost_to.max(to_seq);
+    }
+    cursor < lost_to
+}
+
+/// 记录 → 协议事件。
+fn event_from_record(id: &TerminalId, record: &EventRecord) -> Event {
+    Event {
+        terminal_id: id.0.clone(),
+        seq: record.seq,
+        ts: record.ts.clone(),
+        kind: record.kind.clone(),
+    }
+}
+
+/// 向单个订阅者投递一条事件；队满或通道关闭立即返回对应结果。
+///
+/// `seq` 直接使用事件自身的单调值，绝不为了补 marker 而复用旧 `seq`。
+fn try_deliver(tx: &EventSender, event: &Event) -> Delivery {
+    match tx.try_send(event.clone()) {
+        Ok(()) => Delivery::Kept,
+        Err(TrySendError::Full(_)) => Delivery::Throttled,
+        Err(TrySendError::Closed(_)) => Delivery::Closed,
+    }
+}
+
+/// base64 文本解码后的字节数（不实际解码）。
+///
+/// 事件里的 `data` 均由标准 base64 编码生成；按 4 字符 3 字节换算并扣除
+/// 末尾 `=` 填充即可，避免为统计字节数引入额外解码开销。
+fn base64_decoded_len(data: &str) -> u64 {
+    let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count();
+    let bytes = (data.len() / 4).saturating_mul(3);
+    bytes.saturating_sub(padding) as u64
+}
+
+/// 校验创建参数：名称 → `idle_timeout`。
+///
+/// `mode` 由默认 [`ModeFactory`] 路由；pty/stdio 都是合法模式。
 fn validate_create(params: &CreateParams) -> Result<(), CoreError> {
     validate_name(&params.name)?;
-    if params.mode != Mode::Pty {
-        return Err(CoreError::BadRequest(
-            "stdio 模式将在 M3 支持，当前请使用 pty".to_string(),
-        ));
-    }
     if let Some(idle_timeout) = &params.idle_timeout {
         idle_timeout
             .validate()

@@ -41,4 +41,7 @@ pub enum CoreError {
     /// 不支持的信号名。
     #[error("不支持的信号: {0}")]
     UnsupportedSignal(String),
+    /// 超过资源上限（终端数量、stdio 写队列等），对应 `limit_exceeded`。
+    #[error("超过资源上限: {0}")]
+    LimitExceeded(String),
 }

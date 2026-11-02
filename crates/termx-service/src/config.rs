@@ -16,6 +16,10 @@ const TERMX_CONFIG_DIR_ENV: &str = "TERMX_CONFIG_DIR";
 const TERMX_TOKEN_ENV: &str = "TERMX_TOKEN";
 /// 覆盖空闲检查 ticker 周期的环境变量，单位为毫秒。
 const TERMX_IDLE_TICK_MS_ENV: &str = "TERMX_IDLE_TICK_MS";
+/// 覆盖运行中终端数量上限的环境变量；缺失或 0 表示不限制。
+const TERMX_MAX_TERMINALS_ENV: &str = "TERMX_MAX_TERMINALS";
+/// 覆盖 stdio 写队列容量的环境变量。
+const TERMX_STDIO_WRITE_QUEUE_ENV: &str = "TERMX_STDIO_WRITE_QUEUE";
 /// Linux/macOS 的 XDG 配置根目录环境变量。
 const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 /// Unix 用户主目录环境变量。
@@ -37,10 +41,15 @@ pub const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::L
 
 /// 每个终端的事件缓冲默认容量。
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = termx_core::DEFAULT_EVENT_BUFFER_CAPACITY;
+/// 每个订阅者的有界事件队列默认容量。
+pub const DEFAULT_SUBSCRIBER_QUEUE_CAPACITY: usize = termx_core::DEFAULT_SUBSCRIBER_QUEUE_CAPACITY;
 /// 入站单帧默认上限（1 MiB）。
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// 空闲检查后台 ticker 的默认周期。
 pub const DEFAULT_IDLE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// stdio stdin 有界写队列默认容量。
+pub const DEFAULT_STDIO_WRITE_QUEUE_CAPACITY: usize =
+    termx_proc::DEFAULT_STDIO_WRITE_QUEUE_CAPACITY;
 
 /// 配置解析失败原因。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -62,12 +71,18 @@ pub struct ServiceConfig {
     pub bind_addr: SocketAddr,
     /// 每个终端的事件缓冲容量；缺省 4096。
     pub event_buffer_capacity: usize,
+    /// 每个订阅者的有界事件队列容量；缺省 1024。
+    pub subscriber_queue_capacity: usize,
     /// 自定义 token 文件路径；`Some` 时优先于 `TERMX_TOKEN` 与默认文件。
     pub token_file: Option<PathBuf>,
     /// 入站单帧字节上限；缺省 [`DEFAULT_MAX_FRAME_BYTES`]。
     pub max_frame_bytes: usize,
     /// 空闲检查 ticker 周期；缺省 [`DEFAULT_IDLE_TICK_INTERVAL`]。
     pub idle_tick_interval: Duration,
+    /// 运行中终端数量上限；`None` 表示不限制。
+    pub max_terminals: Option<usize>,
+    /// stdio stdin 有界写队列容量；缺省 [`DEFAULT_STDIO_WRITE_QUEUE_CAPACITY`]。
+    pub stdio_write_queue_capacity: usize,
 }
 
 impl ServiceConfig {
@@ -77,9 +92,12 @@ impl ServiceConfig {
             config_dir,
             bind_addr: DEFAULT_BIND_ADDR,
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
+            subscriber_queue_capacity: DEFAULT_SUBSCRIBER_QUEUE_CAPACITY,
             token_file: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             idle_tick_interval: DEFAULT_IDLE_TICK_INTERVAL,
+            max_terminals: None,
+            stdio_write_queue_capacity: DEFAULT_STDIO_WRITE_QUEUE_CAPACITY,
         }
     }
 
@@ -94,6 +112,13 @@ impl ServiceConfig {
     #[must_use]
     pub fn with_event_buffer_capacity(mut self, event_buffer_capacity: usize) -> Self {
         self.event_buffer_capacity = event_buffer_capacity;
+        self
+    }
+
+    /// 覆盖每个订阅者的有界事件队列容量；0 会抬到 1。
+    #[must_use]
+    pub fn with_subscriber_queue_capacity(mut self, subscriber_queue_capacity: usize) -> Self {
+        self.subscriber_queue_capacity = subscriber_queue_capacity.max(1);
         self
     }
 
@@ -122,6 +147,20 @@ impl ServiceConfig {
         self
     }
 
+    /// 覆盖运行中终端数量上限；`None` 表示不限制。
+    #[must_use]
+    pub fn with_max_terminals(mut self, max_terminals: Option<usize>) -> Self {
+        self.max_terminals = max_terminals;
+        self
+    }
+
+    /// 覆盖 stdio stdin 写队列容量；0 会抬到 1。
+    #[must_use]
+    pub fn with_stdio_write_queue_capacity(mut self, capacity: usize) -> Self {
+        self.stdio_write_queue_capacity = capacity.max(1);
+        self
+    }
+
     /// 从进程环境解析配置。
     ///
     /// 配置目录优先 `TERMX_CONFIG_DIR`，否则按平台默认：
@@ -130,10 +169,19 @@ impl ServiceConfig {
     ///
     /// 空闲检查周期可由 `TERMX_IDLE_TICK_MS`（毫秒）覆盖；缺省为
     /// [`DEFAULT_IDLE_TICK_INTERVAL`]，非法或 0 值回退默认。
+    /// `TERMX_MAX_TERMINALS`（0 或缺失 = 不限制）与
+    /// `TERMX_STDIO_WRITE_QUEUE`（0 或缺失 = 默认容量）同理。
     pub fn from_env() -> Result<Self, ConfigError> {
         let config_dir = resolve_config_dir(Platform::CURRENT, |key: &str| std::env::var_os(key))?;
         let mut config = Self::new(config_dir);
         config.idle_tick_interval = idle_tick_interval_from_env(|key: &str| std::env::var_os(key));
+        config.max_terminals =
+            positive_usize_from_env(TERMX_MAX_TERMINALS_ENV, |key: &str| std::env::var_os(key));
+        config.stdio_write_queue_capacity =
+            positive_usize_from_env(TERMX_STDIO_WRITE_QUEUE_ENV, |key: &str| {
+                std::env::var_os(key)
+            })
+            .unwrap_or(DEFAULT_STDIO_WRITE_QUEUE_CAPACITY);
         Ok(config)
     }
 
@@ -215,6 +263,17 @@ where
         Some(millis) => Duration::from_millis(millis),
         None => DEFAULT_IDLE_TICK_INTERVAL,
     }
+}
+
+/// 读取正整数值的环境变量；缺失、非法或 0 返回 `None`。
+fn positive_usize_from_env<F>(name: &str, env: F) -> Option<usize>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env(name)
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 /// 读取已有 token；不存在或为空时生成新 token 并写盘。
@@ -493,6 +552,25 @@ mod tests {
                 .with_event_buffer_capacity(8)
                 .event_buffer_capacity,
             8
+        );
+        assert_eq!(
+            config.subscriber_queue_capacity,
+            DEFAULT_SUBSCRIBER_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            config
+                .clone()
+                .with_subscriber_queue_capacity(2)
+                .subscriber_queue_capacity,
+            2
+        );
+        assert_eq!(
+            config
+                .clone()
+                .with_subscriber_queue_capacity(0)
+                .subscriber_queue_capacity,
+            1,
+            "订阅队列容量至少为 1"
         );
         assert!(config.token_file.is_none());
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);

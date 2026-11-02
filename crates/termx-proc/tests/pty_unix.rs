@@ -45,7 +45,7 @@ async fn wait_terminal(rx: &mut Receiver<ProcEvent>) -> (Vec<u8>, Terminal) {
     let terminal = timeout(TEST_TIMEOUT, async {
         loop {
             match rx.recv().await {
-                Some(ProcEvent::Output(chunk)) => output.extend_from_slice(&chunk),
+                Some(ProcEvent::Output { data, .. }) => output.extend_from_slice(&data),
                 Some(ProcEvent::Exited(code)) => return Terminal::Exited(code),
                 Some(ProcEvent::Signaled(signal)) => return Terminal::Signaled(signal),
                 None => panic!("事件通道在收到终态事件前关闭"),

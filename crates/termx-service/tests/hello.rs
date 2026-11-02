@@ -12,9 +12,9 @@ use futures_util::{SinkExt, StreamExt};
 use tempfile::tempdir;
 use termx_core::{MockFactory, Registry, TerminalId};
 use termx_protocol::{
-    AttachResult, ClaimResult, CreateResult, ErrorCode, Event, EventKind, HELPER_PROTOCOL_VERSION,
-    HelloResult, LifecycleState, ListItem, Mode, PROTOCOL_VERSION, Response, StatusResult, Stream,
-    SubscribeResult, from_json,
+    AttachResult, ClaimResult, Confidence, CreateResult, ErrorCode, Event, EventKind,
+    HELPER_PROTOCOL_VERSION, HelloResult, LifecycleState, ListItem, Mode, PROTOCOL_VERSION,
+    Response, StatusResult, Stream, SubscribeResult, from_json,
 };
 use termx_service::{PORT_FILE_NAME, Service, ServiceConfig, ServiceError, TOKEN_FILE_NAME};
 use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
@@ -1394,4 +1394,134 @@ async fn subscribe_and_unsubscribe_are_atomic_on_invalid_target() {
     })
     .await;
     assert_eq!(output.terminal_id, created.terminal_id);
+}
+
+/// M3b：慢订阅者状态事件队列满时，服务端回 `limit_exceeded` 并断开，
+/// 而不是静默丢弃状态事件。
+#[tokio::test]
+async fn slow_subscriber_state_overflow_disconnects_with_limit_exceeded() {
+    let dir = tempdir().expect("创建临时目录失败");
+    let service = TestService::start_with_config(
+        ServiceConfig::new(dir.path().to_path_buf()).with_subscriber_queue_capacity(1),
+    )
+    .await;
+    let mut client = connect(&service).await;
+    handshake(&mut client, &service.token).await;
+
+    let created_response = call(
+        &mut client,
+        "c-1501",
+        "terminal.create",
+        create_params("ses-limit", "slow", false),
+    )
+    .await;
+    assert!(created_response.ok, "create 应成功: {created_response:?}");
+    let created: CreateResult =
+        serde_json::from_value(created_response.result.expect("缺少 create result"))
+            .expect("CreateResult 解析失败");
+
+    let (attach_response, _) = call_collect(
+        &mut client,
+        "c-1502",
+        "terminal.attach",
+        serde_json::json!({ "terminal_id": created.terminal_id }),
+    )
+    .await;
+    assert!(attach_response.ok, "attach 应成功: {attach_response:?}");
+
+    // 同一把 registry 锁内连续注入状态事件：队列容量 1，第二次必然投递失败。
+    let terminal_id = created.terminal_id.clone();
+    {
+        let mut registry = service.registry.lock().expect("registry 锁被污染");
+        for _ in 0..8 {
+            registry
+                .report_event(
+                    &TerminalId::new(terminal_id.clone()),
+                    EventKind::WaitingInput {
+                        confidence: Confidence::Low,
+                        reason: "no_output".to_string(),
+                    },
+                )
+                .expect("状态事件应写入 ring");
+        }
+    }
+
+    let mut saw_limit = false;
+    let outcome = timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let value: serde_json::Value = from_json(text.as_str()).expect("帧 JSON 非法");
+                    if value.get("type").is_some() {
+                        continue;
+                    }
+                    let response: Response =
+                        serde_json::from_value(value).expect("Response 解析失败");
+                    if let Some(error) = &response.error {
+                        // PROTOCOL §4：无法归属到具体请求的错误帧 id 必须为空。
+                        assert!(
+                            response.id.is_empty(),
+                            "连接级错误帧 id 必须为空: {response:?}"
+                        );
+                        assert_eq!(error.code, ErrorCode::LimitExceeded);
+                        assert!(error.retryable);
+                        saw_limit = true;
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(outcome.is_ok(), "应在超时内收到 limit_exceeded 或断开");
+    assert!(
+        saw_limit,
+        "应收到 limit_exceeded 错误帧，而不是静默丢状态事件"
+    );
+    expect_closed(&mut client).await;
+}
+
+/// AC-16：运行中终端数量达到 `max_terminals` 上限后，create 返回
+/// `limit_exceeded`（可重试）。
+#[tokio::test]
+async fn max_terminals_returns_limit_exceeded() {
+    let dir = tempdir().expect("创建临时目录失败");
+    let config = ServiceConfig::new(dir.path().to_path_buf()).with_max_terminals(Some(1));
+    let service = TestService::start_with_config(config).await;
+    let mut client = connect(&service).await;
+    handshake(&mut client, &service.token).await;
+
+    let first = call(
+        &mut client,
+        "c-1601",
+        "terminal.create",
+        create_params("ses-limit", "first", false),
+    )
+    .await;
+    assert!(first.ok, "首个 create 应成功: {first:?}");
+
+    let second = call(
+        &mut client,
+        "c-1602",
+        "terminal.create",
+        create_params("ses-limit", "second", false),
+    )
+    .await;
+    assert!(!second.ok, "超过上限的 create 应失败: {second:?}");
+    let error = second.error.expect("缺少 error");
+    assert_eq!(error.code, ErrorCode::LimitExceeded);
+    assert!(error.retryable, "limit_exceeded 应可重试");
+
+    // 上限只约束运行中终端：force 替换同名终端仍允许。
+    let forced = call(
+        &mut client,
+        "c-1603",
+        "terminal.create",
+        create_params("ses-limit", "first", true),
+    )
+    .await;
+    assert!(forced.ok, "force 替换不应被上限拒绝: {forced:?}");
 }

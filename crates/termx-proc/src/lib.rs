@@ -12,7 +12,7 @@ use thiserror::Error;
 #[cfg(not(any(windows, unix)))]
 mod unsupported;
 #[cfg(not(any(windows, unix)))]
-pub use unsupported::PtySession;
+pub use unsupported::{PtySession, StdioSession};
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -21,6 +21,12 @@ pub use unix::PtySession;
 mod windows;
 #[cfg(windows)]
 pub use windows::PtySession;
+
+/// 跨平台管道 stdio 后端；非 Windows/Unix 平台由 `unsupported` 提供同名占位。
+#[cfg(any(windows, unix))]
+mod stdio;
+#[cfg(any(windows, unix))]
+pub use stdio::StdioSession;
 
 /// `termx-proc` 的统一错误类型。
 #[derive(Debug, Error)]
@@ -55,7 +61,13 @@ pub enum ProcError {
     /// 不支持的信号名。
     #[error("不支持的信号: {0}")]
     UnsupportedSignal(String),
+    /// stdio 写入队列已满；调用方应映射为 `limit_exceeded`。
+    #[error("stdio 写入队列已满")]
+    WriteQueueFull,
 }
+
+/// stdio stdin 有界写队列的默认容量（条）。
+pub const DEFAULT_STDIO_WRITE_QUEUE_CAPACITY: usize = 64;
 
 /// 把外部信号名规范化为 `SIGINT` / `SIGTERM` / `SIGKILL`。
 ///
@@ -104,11 +116,27 @@ impl Default for PtyConfig {
     }
 }
 
-/// PTY 会话产生的事件。
+/// 输出流来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputStream {
+    /// PTY 合并流（stdout/stderr 已由终端合并）。
+    Pty,
+    /// 独立 stdout 管道。
+    Stdout,
+    /// 独立 stderr 管道。
+    Stderr,
+}
+
+/// 本地进程会话（PTY / stdio）产生的事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcEvent {
-    /// 一段终端输出字节（已按读取缓冲切分，不保证 UTF-8 边界）。
-    Output(Vec<u8>),
+    /// 一段输出字节（已按读取缓冲切分，不保证 UTF-8 边界）。
+    Output {
+        /// 输出字节。
+        data: Vec<u8>,
+        /// 输出来源流。
+        stream: OutputStream,
+    },
     /// 子进程退出；承载进程退出码（原样按 `i32` 解释低 32 位）。
     ///
     /// Windows 上被强制终止也走该事件，不会产生 [`ProcEvent::Signaled`]。

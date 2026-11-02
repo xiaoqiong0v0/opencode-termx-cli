@@ -8,7 +8,7 @@ use termx_core::{
     TerminalId,
 };
 use termx_protocol::{CreateParams, Event, EventKind, LifecycleState, Mode, TerminalLocator};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, channel};
 
 /// 构造 pty 创建参数。
 fn params(root_session_id: &str, name: &str) -> CreateParams {
@@ -37,7 +37,7 @@ fn by_id(terminal_id: &str) -> TerminalLocator {
 }
 
 /// 取出当前已缓冲的全部事件。
-fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
+fn drain(rx: &mut Receiver<Event>) -> Vec<Event> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -106,7 +106,7 @@ fn terminate_is_idempotent_and_emits_single_terminal_event() {
         .expect("create 应成功");
     let locator = by_id(&created.terminal_id);
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator, "client-a", Some(0), tx)
         .expect("attach 应成功");
@@ -150,14 +150,15 @@ fn resize_and_signal_reach_backend_and_update_snapshot() {
     let snapshot = registry.status(&locator).expect("运行中可读");
     assert_eq!((snapshot.cols, snapshot.rows), (120, 40));
 
-    // SIGINT 按 Ctrl-C 写成 0x03，不再直接给后端发信号。
+    // 所有受支持信号都交给后端 decision（由后端决定 killpg / Job / ConPTY 写法），
+    // registry 不再把 SIGINT 改写成 Ctrl-C 字节。
     registry.signal(&locator, "SIGINT").expect("signal 应成功");
-    assert_eq!(backend.writes(), vec![vec![0x03]]);
-    assert!(backend.signals().is_empty());
-
-    // 其它信号仍原样交给后端。
     registry.signal(&locator, "SIGTERM").expect("signal 应成功");
-    assert_eq!(backend.signals(), vec!["SIGTERM".to_string()]);
+    assert_eq!(
+        backend.signals(),
+        vec!["SIGINT".to_string(), "SIGTERM".to_string()]
+    );
+    assert!(backend.writes().is_empty(), "信号不应被改写成输入字节");
 }
 
 #[test]
@@ -173,14 +174,14 @@ fn sigint_sets_pending_and_next_exit_becomes_interrupted() {
     let locator = by_id(&created.terminal_id);
     let id = TerminalId::new(created.terminal_id.clone());
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator, "client-a", None, tx)
         .expect("attach 应成功");
     drain(&mut rx);
 
     registry.signal(&locator, "SIGINT").expect("Ctrl-C 应成功");
-    assert_eq!(backend.writes(), vec![vec![0x03]]);
+    assert_eq!(backend.signals(), vec!["SIGINT".to_string()]);
     assert_eq!(
         registry
             .get(&id)
@@ -235,4 +236,47 @@ fn signal_exit_without_pending_maps_to_interrupted_signal_source() {
         EventKind::Interrupted { ref signal, ref source }
             if signal == "SIGTERM" && source == "signal"
     ));
+}
+
+/// 复核项：后端 `signal` 失败时不得记录 `pending_interrupt`，避免把随后的
+/// 正常退出误报为 `interrupted`。
+#[test]
+fn failed_signal_does_not_record_pending_interrupt() {
+    let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
+    let backend = Arc::new(MockBackend::new());
+    let created = registry
+        .create_with_backend(
+            params("ses-1", "build"),
+            Arc::clone(&backend) as Arc<dyn termx_core::TerminalBackend>,
+        )
+        .expect("create 应成功");
+    let locator = by_id(&created.terminal_id);
+    let id = TerminalId::new(created.terminal_id.clone());
+
+    let error = registry
+        .signal(&locator, "SIGHUP")
+        .expect_err("未知信号应失败");
+    assert_eq!(error, CoreError::UnsupportedSignal("SIGHUP".to_string()));
+    assert!(backend.signals().is_empty(), "失败时后端不应记录信号");
+    assert!(
+        registry
+            .get(&id)
+            .expect("终端应存在")
+            .pending_interrupt
+            .is_none(),
+        "失败不得记录 pending_interrupt"
+    );
+
+    // 随后正常退出仍落 exited，而不是 interrupted。
+    registry
+        .report_exit(&id, ExitOutcome::Code(0))
+        .expect("退出结算应成功");
+    let record = registry
+        .get(&id)
+        .expect("终端应存在")
+        .events
+        .records()
+        .back()
+        .expect("应有终态事件");
+    assert!(matches!(record.kind, EventKind::Exited { exit_code: 0 }));
 }

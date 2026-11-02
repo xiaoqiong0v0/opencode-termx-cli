@@ -45,6 +45,7 @@
 - 事件无 `id`；以 `terminal_id` + `seq` 定位。
 - 时间戳 `ts` 为 RFC3339 UTC。
 - 每个 WebSocket text frame 一个 JSON；不使用长连接分帧拼接。
+- **连接级错误帧**：服务端在无法归属到具体请求时发送 `{ "id": "", "ok": false, "error": {...} }`。客户端以 `id` 是否为空区分「连接级错误」与「请求响应」。当前用于订阅事件队列溢出：先发 `id:""`、`code:"limit_exceeded"`、`retryable:true` 的错误帧，随后关闭连接；客户端应视为连接级失败，重连后按 `cursor` 补齐。未来新增连接级错误同样复用该形状（`id` 留空），不引入独立 close reason。
 
 ## 5. 生命周期与状态
 ### 5.1 三个正交维度
@@ -94,7 +95,10 @@
 - `terminal.create` 返回初始 `cursor`，固定为 `0`（`started` 的 seq=1 之前的位置）；客户端据此 `attach(cursor=0)` 可回放 `started` 与首屏 output，避免 create→attach 空窗丢事件。
 - `terminal.send`：`data` 与 `text` 二选一（同传取 `data`）；`text` 按 UTF-8；`enter=true` 追加换行（`\r`，pty）/`\n`（stdio）。
 - `terminal.claim` 取得输入 lease；同一终端同一时刻只有一个 lease owner。`force=true` 抢占时向订阅者广播 `lease_revoked{old_client_id}`，随后授予新 owner。未 claim 或非 owner 的 `send` 返回 `permission_denied`。
-- `terminal.read`：`cursor` 早于缓冲下界时返回 `reset` + 基线 `cursor`，客户端清空本地 output 视图后继续。
+- `terminal.read`：**只回放 `output` 事件**，不返回 `started`/状态/终态事件；状态与终态由 `attach`/`subscribe` 回放。返回的 `cursor` 为本次扫描到的最后 `seq`（会越过被跳过的状态事件），客户端以它继续增量读取。
+  - `cursor` 早于缓冲下界（或所需输出已被背压淘汰）时返回 `reset` + 基线 `cursor`，客户端清空本地 output 视图后继续。
+  - `max_bytes` 为本次累计 `data` **解码后**字节上限；`null`/缺省/`0` 取服务端默认。按 `seq` 升序累加，达到上限即在下一条前停止；**单条 output 解码后超过上限时仍返回该条并前进游标**，避免反复拿到空结果形成活锁。
+  - `read` 是只读操作：不注册/修改订阅，也不推进任何消费状态，可重复调用。
 - `attach` 不带 `cursor`：返回当前 `snapshot` + 当前基线 `cursor`（不补发历史 output，仅快照）。
 - `attach` 到终态终端：允许只读（返回 `snapshot` 与剩余 output）。
 - `subscribe` 的 `terminals` 与 `all` 同时给出时，结果按 `terminal_id` 去重；任一目标解析失败则整体失败，不注册任何订阅、不回放事件。
@@ -116,8 +120,9 @@
 | `error` | `code, message, retryable` | **终态**（含 `service_lost`） |
 | `capabilities` | `helper, version, bestEffort` | SSH/helper 能力与降级标识 |
 
-- 所有事件共用每终端单调 `seq`；`output_dropped` 也占用 `seq`，使缺口可检测。
+- 所有事件共用每终端单调 `seq`；`output_dropped` 作为**新事件**分配自己的单调 `seq`（不复用被丢输出的 `seq`），使缺口可检测。
 - `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
+- 区间只包含**实际被丢弃的 `output`**：状态事件永不丢弃；若被淘汰的 output 之间夹有状态事件，服务端按连续区间拆成多条 `output_dropped`，每条区间互不重叠且按 `from_seq` 升序。
 - `interactive_changed.active=true` 表示前台进入交互对象；`active=false` 表示退回 shell/结束交互。
 - `waiting_input` 表示疑似等待输入，必须带 `confidence`（`low`/`medium`/`high`）与 `reason`（常见取值：`prompt`/`stdin_blocked`/`no_output`/`shell_integration`/`heuristic`）。
 - `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`。
@@ -133,16 +138,16 @@
 ## 8. 序号、游标与重连（责任划分）
 - **服务端**维护每终端事件缓冲与单调 `seq`（从 1 开始），并负责按游标回放。
 - **客户端**只需在本地记录「最后已处理 seq」作为 `cursor`，重连时上报；不依赖客户端重建状态。
-- `attach`/`subscribe`/`read` 带 `cursor`：
-  - 可回放：服务端按缓冲补发并返回新 `cursor`。
-  - 不可回放（超出缓冲）：返回 `reset:{reason}` + 基线 `cursor`；客户端清空本地视图后继续。
+- `attach`/`subscribe` 带 `cursor`：回放**全部**事件（`output` + 状态/终态），并按缓冲返回新 `cursor`。
+- `read` 带 `cursor`：**只回放 `output`**；状态/终态不通过 `read` 返回。返回的 `cursor` 是本次扫描到的最后 `seq`（可能跳过区间内的状态事件），下一次从该 `cursor` 继续。
+- 不可回放（超出缓冲）：`read`/`attach`/`subscribe` 返回 `reset:{reason}` + 基线 `cursor`；客户端清空本地视图后继续。
 - **空基线合法**：无历史 ≠ 无会话；禁止用「data 为空」推断会话不存在。
-- 终态后 `exited/interrupted/error` 可通过 `read` 回放，但不再重复推送。
+- 终态事件（`exited`/`interrupted`/`error`）对同一在线订阅者只推送一次；新 `attach`/`subscribe` 仍可按 `cursor` 回放该事件（`read` 不返回）。
 
 ## 9. 背压与流控
-- 终端有界输出缓冲；对端慢消费时丢弃**最旧 output**，并发出 `output_dropped{from_seq,to_seq}`；`started/interactive*/waiting_input/attached/detached/lease_revoked/exited/interrupted/error/capabilities` 永不丢弃。
-- 每客户端独立发送队列与上限；超限断连并标 `error`（`limit_exceeded`）或 `detached` + 原因。
-- 读写解耦：PTY 写入不被慢读者阻塞；写入队列有上限，超限拒绝 `send`（`limit_exceeded`）。
+- 终端有界输出缓冲；对端慢消费时丢弃**最旧 output**，并发出 `output_dropped{from_seq,to_seq}`（marker 使用新的单调 `seq`，闭区间只含实际被丢 output）；`started/interactive*/waiting_input/attached/detached/lease_revoked/exited/interrupted/error/capabilities` 永不丢弃。
+- 每客户端独立发送队列与上限；**任何**事件投递时队满，服务端立即移除该订阅者、发送连接级 `error{code:"limit_exceeded",retryable:true}`（`id:""`）后断开；`seq` 不回退，也不在订阅者侧补发合成 marker。
+- 读写解耦：PTY 与 stdio 的写入都不被慢读者阻塞。stdio stdin 由有界写队列 + 专用 writer 线程承载，`write` 只做非阻塞入队；队满时 `terminal.send` 返回 `limit_exceeded`。
 
 ## 10. 错误码
 | code | 场景 | retryable |

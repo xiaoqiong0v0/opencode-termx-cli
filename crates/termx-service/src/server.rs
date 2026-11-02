@@ -11,24 +11,24 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
 use termx_core::{
-    BackendFactory, CoreError, DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction, PtyFactory,
+    BackendFactory, CoreError, DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction, ModeFactory,
     Registry, SpawnedBackend, TerminalBackend, TerminalId,
 };
-use termx_proc::ProcEvent;
+use termx_proc::{OutputStream, ProcEvent};
 use termx_protocol::{
     AttachParams, Capabilities, ClaimParams, CreateParams, DetachParams, ErrorCode, Event,
-    EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListParams, PROTOCOL_VERSION,
-    ProtocolError, PruneParams, ReleaseParams, Request, ResizeParams, Response, SendParams,
-    SignalParams, SimpleResult, StatusParams, StatusResult, Stream, SubscribeParams,
-    SubscribeResult, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TerminateParams,
-    UnsubscribeParams, from_json, to_json,
+    EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListParams, Mode,
+    PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, ReleaseParams, Request, ResizeParams,
+    Response, SendParams, SignalParams, SimpleResult, StatusParams, StatusResult, Stream,
+    SubscribeParams, SubscribeResult, SubscriptionCursor, TerminalLocator, TerminalSnapshot,
+    TerminateParams, UnsubscribeParams, from_json, to_json,
 };
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     sync::{
-        mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel},
+        mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel},
         watch,
     },
     time::{MissedTickBehavior, timeout},
@@ -54,6 +54,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORIZATION_HEADER: &str = "authorization";
 /// Bearer 鉴权方案前缀。
 const BEARER_PREFIX: &str = "bearer";
+/// 订阅队列溢出、状态事件无法投递时发给客户端的说明。
+const LIMIT_EXCEEDED_MESSAGE: &str =
+    "订阅事件队列已满，状态事件无法保证投递；连接将断开，请重连后按 cursor 补齐";
 
 /// 服务启动或运行期错误。
 #[derive(Debug, thiserror::Error)]
@@ -92,9 +95,12 @@ impl Service {
     /// 绑定 [`ServiceConfig::bind_addr`] 并写出实际端口。
     ///
     /// 仅允许环回监听；配置目录、token 文件会在绑定前准备好。默认使用
-    /// [`PtyFactory`] 创建真实 PTY 后端。
+    /// [`ModeFactory`] 按 `mode` 创建真实 PTY / stdio 后端。
     pub async fn bind(config: ServiceConfig) -> Result<Self, ServiceError> {
-        Self::bind_with_factory(config, Arc::new(PtyFactory)).await
+        let factory = Arc::new(ModeFactory::with_stdio_write_queue_capacity(
+            config.stdio_write_queue_capacity,
+        ));
+        Self::bind_with_factory(config, factory).await
     }
 
     /// 使用指定后端工厂绑定服务；测试可注入 mock 工厂以避免创建真实进程。
@@ -112,10 +118,13 @@ impl Service {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         write_port_file(&config, local_addr.port())?;
-        let registry = Arc::new(Mutex::new(Registry::with_factory(
+        let mut registry = Registry::with_config(
             config.event_buffer_capacity,
+            config.subscriber_queue_capacity,
             factory,
-        )));
+        );
+        registry.set_max_terminals(config.max_terminals);
+        let registry = Arc::new(Mutex::new(registry));
 
         tracing::info!(
             addr = %local_addr,
@@ -193,9 +202,16 @@ impl Service {
                     let token = Arc::clone(&self.token);
                     let registry = Arc::clone(&self.registry);
                     let max_frame_bytes = self.config.max_frame_bytes;
+                    let subscriber_queue_capacity = self.config.subscriber_queue_capacity;
                     tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_connection(stream, token, registry, max_frame_bytes).await
+                        if let Err(error) = handle_connection(
+                            stream,
+                            token,
+                            registry,
+                            max_frame_bytes,
+                            subscriber_queue_capacity,
+                        )
+                        .await
                         {
                             tracing::debug!(peer = %peer_addr, %error, "连接处理结束");
                         }
@@ -206,6 +222,16 @@ impl Service {
 
         let _ = stop_tx.send(true);
         let _ = ticker.await;
+
+        // shutdown：先停止 ticker 与新连接，再在锁外 best-effort 终止所有后端，
+        // 确保 stdio/PTY 子进程不会随 service 退出而残留。
+        let backends = {
+            let registry = lock_registry(&self.registry);
+            registry.collect_backends()
+        };
+        for backend in backends {
+            terminate_backend(backend).await;
+        }
         result
     }
 }
@@ -273,6 +299,7 @@ async fn handle_connection(
     token: Arc<str>,
     registry: Arc<Mutex<Registry>>,
     max_frame_bytes: usize,
+    subscriber_queue_capacity: usize,
 ) -> Result<(), ServiceError> {
     let peer_addr = stream.peer_addr().ok();
     let (mut ws, auth_header) = accept_with_auth_header(stream).await?;
@@ -290,7 +317,16 @@ async fn handle_connection(
 
     match evaluate_handshake(&first, &token, auth_header.as_deref()) {
         Handshake::Accepted { id, client } => {
-            handle_accepted(ws, peer_addr, id, client, registry, max_frame_bytes).await
+            handle_accepted(
+                ws,
+                peer_addr,
+                id,
+                client,
+                registry,
+                max_frame_bytes,
+                subscriber_queue_capacity,
+            )
+            .await
         }
         Handshake::Rejected { id, code, message } => {
             handle_rejected(&mut ws, peer_addr, id, code, message).await
@@ -371,6 +407,7 @@ async fn handle_accepted<S>(
     client: String,
     registry: Arc<Mutex<Registry>>,
     max_frame_bytes: usize,
+    subscriber_queue_capacity: usize,
 ) -> Result<(), ServiceError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -386,7 +423,15 @@ where
     );
     let response = hello_response(id)?;
     send_response(&mut ws, &response).await?;
-    serve_connection(ws, peer_addr, client_id, registry, max_frame_bytes).await
+    serve_connection(
+        ws,
+        peer_addr,
+        client_id,
+        registry,
+        max_frame_bytes,
+        subscriber_queue_capacity,
+    )
+    .await
 }
 
 /// 鉴权失败：回错误响应后主动关闭连接。
@@ -437,6 +482,7 @@ async fn serve_connection<S>(
     client_id: String,
     registry: Arc<Mutex<Registry>>,
     max_frame_bytes: usize,
+    subscriber_queue_capacity: usize,
 ) -> Result<(), ServiceError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -445,28 +491,43 @@ where
     let (out_tx, out_rx) = unbounded_channel::<Message>();
     let mut writer = tokio::spawn(write_loop(sink, out_rx));
 
-    let (event_tx, event_rx) = unbounded_channel::<Event>();
-    let forwarder = tokio::spawn(forward_events(event_rx, out_tx.clone()));
+    // 订阅事件走有界队列；队列满时的分流规则由 registry 负责（见 ASYNC.md）。
+    let (event_tx, event_rx) = channel::<Event>(subscriber_queue_capacity.max(1));
+    // registry 无法投递状态事件时通过该 watch 通知 service 断开连接。
+    let (throttle_tx, throttle_rx) = watch::channel(false);
+    // forwarder 因限流决定断开时，用该 watch 停止读循环。
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    {
+        let mut registry = lock_registry(&registry);
+        registry.register_client(&client_id, throttle_tx);
+    }
+    let forwarder = tokio::spawn(forward_events(
+        event_rx,
+        out_tx.clone(),
+        throttle_rx,
+        shutdown_tx,
+    ));
 
-    let result = read_loop(
-        &mut stream,
+    let mut context = ReadContext {
         peer_addr,
-        &client_id,
-        &registry,
-        &out_tx,
-        &event_tx,
+        client_id: &client_id,
+        registry: &registry,
+        out_tx: &out_tx,
+        event_tx: &event_tx,
+        shutdown: &mut shutdown_rx,
         max_frame_bytes,
-    )
-    .await;
+    };
+    let result = read_loop(&mut stream, &mut context).await;
 
     // 连接结束：先释放该连接持有的 lease（避免终端被永久锁死），再清理订阅，
-    // 防止 registry 持有失效 sender。
+    // 防止 registry 持有失效 sender；最后注销限流通知。
     {
         let mut registry = lock_registry(&registry);
         registry.release_all(&client_id);
         if let Err(error) = registry.detach_all(&client_id, DETACH_REASON_DISCONNECT) {
             tracing::debug!(?peer_addr, %error, "清理订阅失败");
         }
+        registry.unregister_client(&client_id);
     }
     drop(event_tx);
     let _ = out_tx.send(Message::Close(None));
@@ -492,52 +553,137 @@ where
 }
 
 /// forward task：core 事件 → 协议 JSON → out 队列。
-async fn forward_events(mut event_rx: UnboundedReceiver<Event>, out_tx: UnboundedSender<Message>) {
-    while let Some(event) = event_rx.recv().await {
-        match to_json(&event) {
-            Ok(text) => {
-                if out_tx.send(Message::Text(text.into())).is_err() {
-                    break;
+///
+/// 同时监听连接级限流信号：registry 无法投递状态类事件时置 `true`，这里先回
+/// `error{code:"limit_exceeded",retryable:true}`，再通知读循环收尾并关闭连接。
+/// 选择「错误帧 + 断开」而不是 `detached`：状态事件已无法保证送达，必须让
+/// 客户端明确重连并按 cursor 补齐，不能伪装成正常 detach。
+async fn forward_events(
+    mut event_rx: Receiver<Event>,
+    out_tx: UnboundedSender<Message>,
+    mut throttle: watch::Receiver<bool>,
+    shutdown: watch::Sender<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = throttle.changed() => {
+                let throttled = *throttle.borrow();
+                match (changed, throttled) {
+                    // 正常连接收尾时 registry 会 drop 发送端：此时不应误报限流。
+                    (Err(_), false) => break,
+                    (Ok(()), true) | (Err(_), true) => {
+                        send_limit_exceeded(&out_tx);
+                        let _ = shutdown.send(true);
+                        break;
+                    }
+                    (Ok(()), false) => {}
                 }
             }
-            Err(error) => tracing::warn!(%error, "事件序列化失败"),
+            event = event_rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                match to_json(&event) {
+                    Ok(text) => {
+                        if out_tx.send(Message::Text(text.into())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "事件序列化失败"),
+                }
+            }
         }
     }
 }
 
+/// 发送订阅队列溢出的错误帧；无 `id` 表示连接级错误而非请求响应。
+fn send_limit_exceeded(out_tx: &UnboundedSender<Message>) {
+    let response = Response {
+        id: String::new(),
+        ok: false,
+        result: None,
+        error: Some(ProtocolError {
+            code: ErrorCode::LimitExceeded,
+            message: LIMIT_EXCEEDED_MESSAGE.to_string(),
+            retryable: true,
+            terminal_id: None,
+        }),
+    };
+    match to_json(&response) {
+        Ok(text) => {
+            let _ = out_tx.send(Message::Text(text.into()));
+        }
+        Err(error) => tracing::warn!(%error, "limit_exceeded 帧序列化失败"),
+    }
+}
+
 /// 读循环：处理请求并交给同一 out 队列写回响应。
+/// 读循环所需的连接级上下文，避免参数列表过长。
+struct ReadContext<'a> {
+    /// 对端地址（仅日志）。
+    peer_addr: Option<SocketAddr>,
+    /// 连接级客户端 ID。
+    client_id: &'a str,
+    /// 共享 registry。
+    registry: &'a Arc<Mutex<Registry>>,
+    /// 连接出站队列。
+    out_tx: &'a UnboundedSender<Message>,
+    /// 订阅事件发送端。
+    event_tx: &'a Sender<Event>,
+    /// forwarder 触发的连接关闭信号。
+    shutdown: &'a mut watch::Receiver<bool>,
+    /// 入站帧上限。
+    max_frame_bytes: usize,
+}
+
 async fn read_loop<S>(
     stream: &mut SplitStream<WebSocketStream<S>>,
-    peer_addr: Option<SocketAddr>,
-    client_id: &str,
-    registry: &Arc<Mutex<Registry>>,
-    out_tx: &UnboundedSender<Message>,
-    event_tx: &UnboundedSender<Event>,
-    max_frame_bytes: usize,
+    context: &mut ReadContext<'_>,
 ) -> Result<(), ServiceError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    while let Some(message) = stream.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::debug!(?peer_addr, %error, "连接读取失败");
-                return Ok(());
+    loop {
+        let message = tokio::select! {
+            // forwarder 因订阅队列溢出决定断开：停止读取，交由收尾流程关闭连接。
+            changed = context.shutdown.changed() => {
+                if changed.is_err() || *context.shutdown.borrow() {
+                    break;
+                }
+                continue;
             }
+            message = stream.next() => match message {
+                Some(Ok(message)) => message,
+                Some(Err(error)) => {
+                    tracing::debug!(peer_addr = ?context.peer_addr, %error, "连接读取失败");
+                    return Ok(());
+                }
+                None => break,
+            },
         };
 
-        if frame_len(&message) > max_frame_bytes {
-            tracing::warn!(?peer_addr, %max_frame_bytes, "入站帧超过上限，断开连接");
+        if frame_len(&message) > context.max_frame_bytes {
+            tracing::warn!(
+                peer_addr = ?context.peer_addr,
+                max_frame_bytes = context.max_frame_bytes,
+                "入站帧超过上限，断开连接"
+            );
             let response = error_response(String::new(), ErrorCode::BadRequest, "帧超过上限");
             let text = to_json(&response)?;
-            let _ = out_tx.send(Message::Text(text.into()));
+            let _ = context.out_tx.send(Message::Text(text.into()));
             return Ok(());
         }
 
         match message {
             Message::Text(text) => {
-                handle_rpc_text(text.as_str(), client_id, registry, out_tx, event_tx).await?
+                handle_rpc_text(
+                    text.as_str(),
+                    context.client_id,
+                    context.registry,
+                    context.out_tx,
+                    context.event_tx,
+                )
+                .await?
             }
             Message::Close(_) => break,
             _ => {}
@@ -552,7 +698,7 @@ async fn handle_rpc_text(
     client_id: &str,
     registry: &Arc<Mutex<Registry>>,
     out_tx: &UnboundedSender<Message>,
-    event_tx: &UnboundedSender<Event>,
+    event_tx: &Sender<Event>,
 ) -> Result<(), ServiceError> {
     let response = match from_json::<Request>(text) {
         Ok(request) => dispatch_request(request, client_id, registry, event_tx).await?,
@@ -572,7 +718,7 @@ async fn dispatch_request(
     request: Request,
     client_id: &str,
     registry: &Arc<Mutex<Registry>>,
-    event_tx: &UnboundedSender<Event>,
+    event_tx: &Sender<Event>,
 ) -> Result<Response, ServiceError> {
     let Request { id, method, params } = request;
 
@@ -718,6 +864,25 @@ async fn dispatch_request(
                     id,
                     serde_json::to_value(SimpleResult { ok: true })?,
                 )),
+                Err(error) => Ok(response_from_core_error(id, error)),
+            }
+        }
+        "terminal.read" => {
+            let params: ReadParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.read 参数非法: {error}"),
+                    ));
+                }
+            };
+
+            // 只读扫描 ring：不注册订阅、不推进消费状态，持锁时间与回放长度成正比。
+            let registry = lock_registry(registry);
+            match registry.read(&params.locator, params.cursor, params.max_bytes) {
+                Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
         }
@@ -904,18 +1069,28 @@ async fn handle_send(
     client_id: &str,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<Response, ServiceError> {
-    let payload = match send_payload(&params) {
+    // 先在无锁阶段解码载荷（保留原有错误优先级），拿到终端模式后再追加换行。
+    let mut payload = match send_payload(&params) {
         Ok(payload) => payload,
         Err(error) => return Ok(response_from_core_error(id, error)),
     };
 
-    let backend = {
+    let (backend, mode) = {
         let mut registry = lock_registry(registry);
-        match registry.prepare_send(&params.locator, client_id) {
+        let backend = match registry.prepare_send(&params.locator, client_id) {
             Ok(backend) => backend,
             Err(error) => return Ok(response_from_core_error(id, error)),
-        }
+        };
+        let mode = match registry.mode(&params.locator) {
+            Ok(mode) => mode,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        };
+        (backend, mode)
     };
+    if params.enter {
+        // 协议 §6：pty 回车为 `\r`，stdio 为 `\n`。
+        payload.push(enter_byte(mode));
+    }
 
     match tokio::task::spawn_blocking(move || backend.write(&payload)).await {
         Ok(Ok(())) => Ok(ok_response(
@@ -974,13 +1149,21 @@ async fn handle_signal(
         }
     };
 
-    // SIGINT 的 Ctrl-C 字节写入与其它信号发送都在锁外阻塞执行；
-    // pending 已在锁内记录。
+    let terminal_id = prepared.terminal_id.clone();
+    let signal = prepared.signal.clone();
+    // 信号发送在锁外阻塞执行；只有成功返回后才记录 pending_interrupt，
+    // 失败（未知信号、进程已退出等）不得把随后的正常退出误报为 interrupted。
     match tokio::task::spawn_blocking(move || prepared.execute()).await {
-        Ok(Ok(())) => Ok(ok_response(
-            id,
-            serde_json::to_value(SimpleResult { ok: true })?,
-        )),
+        Ok(Ok(())) => {
+            let mut registry = lock_registry(registry);
+            if let Err(error) = registry.confirm_signal(&terminal_id, &signal) {
+                tracing::debug!(terminal_id = %terminal_id, %error, "记录信号中断意图失败");
+            }
+            Ok(ok_response(
+                id,
+                serde_json::to_value(SimpleResult { ok: true })?,
+            ))
+        }
         Ok(Err(error)) => Ok(response_from_core_error(id, error)),
         Err(error) => Ok(error_response(
             id,
@@ -1016,27 +1199,30 @@ async fn handle_terminate(
     ))
 }
 
-/// 组装 `terminal.send` 的输入字节。
+/// 解码 `terminal.send` 的输入字节（不含 `enter` 换行）。
 ///
 /// `data` 优先于 `text`（对齐 PROTOCOL §6）；两者都缺省或 base64 非法时返回
-/// `bad_request`。`enter=true` 在末尾追加 `\r`（PTY 回车）。
+/// `bad_request`。
 fn send_payload(params: &SendParams) -> Result<Vec<u8>, CoreError> {
-    let mut payload = if let Some(data) = &params.data {
+    if let Some(data) = &params.data {
         BASE64_STANDARD
             .decode(data)
-            .map_err(|error| CoreError::BadRequest(format!("terminal.send.data 非法: {error}")))?
+            .map_err(|error| CoreError::BadRequest(format!("terminal.send.data 非法: {error}")))
     } else if let Some(text) = &params.text {
-        text.as_bytes().to_vec()
+        Ok(text.as_bytes().to_vec())
     } else {
-        return Err(CoreError::BadRequest(
+        Err(CoreError::BadRequest(
             "terminal.send 需要 data 或 text".to_string(),
-        ));
-    };
-
-    if params.enter {
-        payload.push(b'\r');
+        ))
     }
-    Ok(payload)
+}
+
+/// `enter=true` 时追加的换行字节：pty 用 `\r`，stdio 用 `\n`。
+fn enter_byte(mode: Mode) -> u8 {
+    match mode {
+        Mode::Pty => b'\r',
+        Mode::Stdio => b'\n',
+    }
 }
 
 /// 在阻塞线程池中调用后端 `spawn`，避免占用 async worker。
@@ -1080,6 +1266,15 @@ fn fill_runtime_info(
     snapshot
 }
 
+/// 把 `termx-proc` 的输出流来源映射为协议 `Stream`。
+fn protocol_stream(stream: OutputStream) -> Stream {
+    match stream {
+        OutputStream::Pty => Stream::Pty,
+        OutputStream::Stdout => Stream::Stdout,
+        OutputStream::Stderr => Stream::Stderr,
+    }
+}
+
 /// 事件摄取任务：把 `termx-proc` 事件翻译为协议事件并写入 registry。
 ///
 /// 每次只在同步块内取 registry 锁；收到终态事件后退出，避免后台任务泄漏。
@@ -1094,12 +1289,12 @@ async fn ingest_proc_events(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match event {
-                ProcEvent::Output(bytes) => (
+                ProcEvent::Output { data, stream } => (
                     registry.report_event(
                         &terminal_id,
                         EventKind::Output {
-                            data: BASE64_STANDARD.encode(bytes),
-                            stream: Stream::Pty,
+                            data: BASE64_STANDARD.encode(data),
+                            stream: protocol_stream(stream),
                         },
                     ),
                     false,
@@ -1147,7 +1342,7 @@ fn subscribe_terminals(
     registry: &mut Registry,
     params: SubscribeParams,
     client_id: &str,
-    event_tx: &UnboundedSender<Event>,
+    event_tx: &Sender<Event>,
 ) -> Result<Vec<SubscriptionCursor>, CoreError> {
     let mut explicit = Vec::new();
     let mut seen_targets = BTreeSet::new();
@@ -1255,6 +1450,7 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         CoreError::PermissionDenied => ErrorCode::PermissionDenied,
         CoreError::SpawnFailed { .. } => ErrorCode::SpawnFailed,
         CoreError::UnsupportedSignal(_) => ErrorCode::BadRequest,
+        CoreError::LimitExceeded(_) => ErrorCode::LimitExceeded,
         CoreError::BackendFailed(_) => ErrorCode::Internal,
     };
     let terminal_id = match &error {
@@ -1493,13 +1689,16 @@ mod tests {
     }
 
     #[test]
-    fn send_payload_prefers_data_and_appends_carriage_return() {
+    fn send_payload_prefers_data_and_enter_byte_depends_on_mode() {
         let payload =
             send_payload(&send_params(Some("aGk="), Some("ignored"), true)).expect("data 应优先");
-        assert_eq!(payload, b"hi\r");
+        assert_eq!(payload, b"hi");
 
         let payload = send_payload(&send_params(None, Some("echo"), false)).expect("text 应可用");
         assert_eq!(payload, b"echo");
+
+        assert_eq!(enter_byte(Mode::Pty), b'\r');
+        assert_eq!(enter_byte(Mode::Stdio), b'\n');
     }
 
     #[test]

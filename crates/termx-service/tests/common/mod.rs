@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use termx_core::Registry;
 use termx_protocol::{CreateResult, Event, PROTOCOL_VERSION, Response, from_json};
 use termx_service::{Service, ServiceConfig, ServiceError};
-use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
+use tokio::{net::TcpStream, sync::oneshot, task::JoinHandle, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 /// 测试用 WebSocket 客户端类型。
@@ -34,8 +34,10 @@ pub struct TestService {
     pub token: String,
     /// 与服务共享的 registry；测试可据此直接注入事件或检查订阅状态。
     pub registry: Arc<Mutex<Registry>>,
-    /// `Service::run` 任务句柄。
-    handle: JoinHandle<Result<(), ServiceError>>,
+    /// 优雅停机信号；`shutdown` 或 Drop 时发送。
+    shutdown: Option<oneshot::Sender<()>>,
+    /// `Service::run_until` 任务句柄。
+    handle: Option<JoinHandle<Result<(), ServiceError>>>,
 }
 
 impl TestService {
@@ -53,12 +55,26 @@ impl TestService {
             .expect("token 文件缺失")
             .trim()
             .to_string();
-        let handle = tokio::spawn(service.run());
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(service.run_until(async move {
+            let _ = stop_rx.await;
+        }));
         Self {
             addr,
             token,
             registry,
-            handle,
+            shutdown: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+
+    /// 优雅停机并等待管理循环退出（会终止所有后端）。
+    pub async fn shutdown(&mut self) {
+        if let Some(stop) = self.shutdown.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = timeout(TERMINATE_WAIT, handle).await;
         }
     }
 
@@ -73,7 +89,12 @@ impl TestService {
 
 impl Drop for TestService {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(stop) = self.shutdown.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 

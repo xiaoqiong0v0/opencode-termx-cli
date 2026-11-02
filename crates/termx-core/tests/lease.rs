@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use termx_core::{CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, MockFactory, Registry, TerminalId};
 use termx_protocol::{CreateParams, Event, EventKind, Mode, TerminalLocator};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, channel};
 
 /// 构造 pty 创建参数。
 fn params(root_session_id: &str, name: &str) -> CreateParams {
@@ -50,7 +50,7 @@ fn by_key(root_session_id: &str, name: &str) -> TerminalLocator {
 }
 
 /// 取出当前已缓冲的全部事件。
-fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
+fn drain(rx: &mut Receiver<Event>) -> Vec<Event> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -128,7 +128,7 @@ fn claim_conflict_requires_force_and_emits_revoke_to_old_owner() {
     let terminal_id = create_terminal(&mut registry, "build");
     let locator = by_id(&terminal_id);
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .subscribe(&locator, "client-old", None, tx)
         .expect("旧 owner 订阅应成功");
@@ -189,7 +189,7 @@ fn release_only_succeeds_for_current_owner() {
         .claim(&locator, "client-a", false)
         .expect("claim 应成功");
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .subscribe(&locator, "client-a", None, tx)
         .expect("owner 订阅应成功");
@@ -314,7 +314,7 @@ fn release_all_clears_only_leases_owned_by_the_client_and_emits_revoked() {
     let second = create_terminal(&mut registry, "second");
 
     // 观察者订阅两个终端，用于确认断连清理也会广播 lease_revoked。
-    let (observer_tx, mut observer_rx) = unbounded_channel();
+    let (observer_tx, mut observer_rx) = channel(64);
     registry
         .subscribe(&by_id(&first), "observer", None, observer_tx.clone())
         .expect("observer 订阅 first 应成功");

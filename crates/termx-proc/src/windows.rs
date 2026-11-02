@@ -38,13 +38,13 @@ use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    PROCESS_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
 
-use crate::{ProcError, ProcEvent, PtyConfig, normalize_signal};
+use crate::{OutputStream, ProcError, ProcEvent, PtyConfig, normalize_signal};
 
 /// 事件通道容量；读线程满时通过 `blocking_send` 施加背压。
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -249,42 +249,70 @@ impl PtySession {
     /// 仍可按 `th32ParentProcessID` 链找回后代；`cmd` 使用 exe 名，
     /// `pgid` 固定为 0。
     pub fn tree(&self) -> Result<Vec<ProcNode>, ProcError> {
-        let processes = snapshot_processes()?;
-        let by_pid: HashMap<u32, usize> = processes
-            .iter()
-            .enumerate()
-            .map(|(index, proc_entry)| (proc_entry.pid, index))
-            .collect();
-        let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (index, proc_entry) in processes.iter().enumerate() {
-            children.entry(proc_entry.ppid).or_default().push(index);
-        }
-
-        let mut nodes = Vec::new();
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(self.pid);
-        while let Some(pid) = queue.pop_front() {
-            if !visited.insert(pid) {
-                continue;
-            }
-            // 根进程已退出时快照里没有它，但仍要展开其子节点：
-            // Windows 的 `th32ParentProcessID` 在父进程退出后保持不变。
-            if let Some(&index) = by_pid.get(&pid) {
-                let proc_entry = &processes[index];
-                nodes.push(ProcNode {
-                    pid: proc_entry.pid,
-                    ppid: proc_entry.ppid,
-                    pgid: 0,
-                    cmd: proc_entry.cmd.clone(),
-                });
-            }
-            if let Some(kids) = children.get(&pid) {
-                queue.extend(kids.iter().map(|&kid| processes[kid].pid));
-            }
-        }
-        Ok(nodes)
+        tree_for(self.pid)
     }
+}
+
+/// 采集指定根进程的进程树；PTY 与 stdio 后端共用。
+///
+/// 根进程已退出时快照里没有它，但仍会展开其子节点：Windows 的
+/// `th32ParentProcessID` 在父进程退出后保持不变。
+pub(crate) fn tree_for(root_pid: u32) -> Result<Vec<ProcNode>, ProcError> {
+    let processes = snapshot_processes()?;
+    let by_pid: HashMap<u32, usize> = processes
+        .iter()
+        .enumerate()
+        .map(|(index, proc_entry)| (proc_entry.pid, index))
+        .collect();
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, proc_entry) in processes.iter().enumerate() {
+        children.entry(proc_entry.ppid).or_default().push(index);
+    }
+
+    let mut nodes = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(root_pid);
+    while let Some(pid) = queue.pop_front() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(&index) = by_pid.get(&pid) {
+            let proc_entry = &processes[index];
+            nodes.push(ProcNode {
+                pid: proc_entry.pid,
+                ppid: proc_entry.ppid,
+                pgid: 0,
+                cmd: proc_entry.cmd.clone(),
+            });
+        }
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids.iter().map(|&kid| processes[kid].pid));
+        }
+    }
+    Ok(nodes)
+}
+
+/// 按 pid 终止单个进程（stdio 后端的**回退**路径）。
+///
+/// stdio 启动时已把子进程加入 `KILL_ON_JOB_CLOSE` 的 Job Object，正常终止走
+/// `TerminateJobObject`（可清理整棵进程树）。本函数只用于 Job 创建/关联失败
+/// 或终止失败时的降级：Windows 无 Unix 进程组语义，此时仅能终止根进程，
+/// 后代可能残留。
+pub(crate) fn terminate_process(pid: u32) -> Result<(), ProcError> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }.map_err(|err| {
+        ProcError::Io(std::io::Error::other(format!(
+            "OpenProcess({pid}) 失败: {err}"
+        )))
+    })?;
+    let handle = OwnedHandle::from_raw(handle);
+    unsafe { TerminateProcess(handle.get(), TERMINATE_EXIT_CODE) }.map_err(|err| {
+        ProcError::Io(std::io::Error::other(format!(
+            "TerminateProcess({pid}) 失败: {err}"
+        )))
+    })
 }
 
 impl Drop for PtySession {
@@ -326,6 +354,64 @@ impl Drop for OwnedHandle {
                 warn!(error = %err, "关闭 Win32 句柄失败");
             }
         }
+    }
+}
+
+/// stdio 后端的 Job Object 句柄（`KILL_ON_JOB_CLOSE`）。
+///
+/// 与 PTY 共用 `assign_job` 的配置；stdio 只能按 pid 打开进程句柄后加入，
+/// 若子进程已极快退出，加入失败由调用方降级为只终止根进程。
+pub(crate) struct JobHandle {
+    /// Job 句柄；析构即关闭并触发 `KILL_ON_JOB_CLOSE`。
+    handle: OwnedHandle,
+}
+
+impl JobHandle {
+    /// 创建带 `KILL_ON_JOB_CLOSE` 的 Job。
+    pub(crate) fn create() -> Result<Self, ProcError> {
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(|err| {
+            ProcError::Internal {
+                message: format!("CreateJobObjectW 失败: {err}"),
+            }
+        })?;
+        let handle = OwnedHandle::from_raw(job);
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                handle.get(),
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        }
+        .map_err(|err| ProcError::Internal {
+            message: format!("SetInformationJobObject 失败: {err}"),
+        })?;
+        Ok(Self { handle })
+    }
+
+    /// 按 pid 打开进程并加入 Job。
+    pub(crate) fn assign_pid(&self, pid: u32) -> Result<(), ProcError> {
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) }
+            .map_err(|err| ProcError::Internal {
+                message: format!("OpenProcess({pid}) 失败: {err}"),
+            })?;
+        let process = OwnedHandle::from_raw(process);
+        unsafe { AssignProcessToJobObject(self.handle.get(), process.get()) }.map_err(|err| {
+            ProcError::Internal {
+                message: format!("AssignProcessToJobObject({pid}) 失败: {err}"),
+            }
+        })
+    }
+
+    /// 终止 Job 内全部进程。
+    pub(crate) fn terminate(&self) -> Result<(), ProcError> {
+        unsafe { TerminateJobObject(self.handle.get(), TERMINATE_EXIT_CODE) }.map_err(|err| {
+            ProcError::Io(std::io::Error::other(format!(
+                "TerminateJobObject 失败: {err}"
+            )))
+        })
     }
 }
 
@@ -601,7 +687,11 @@ fn read_loop(output: OwnedHandle, process: Arc<OwnedHandle>, tx: Sender<ProcEven
             Ok(()) if read == 0 => break,
             Ok(()) => {
                 let chunk = buffer[..read as usize].to_vec();
-                if tx.blocking_send(ProcEvent::Output(chunk)).is_err() {
+                let event = ProcEvent::Output {
+                    data: chunk,
+                    stream: OutputStream::Pty,
+                };
+                if tx.blocking_send(event).is_err() {
                     // 接收端已丢弃：停止读取并让句柄随作用域关闭。
                     return;
                 }

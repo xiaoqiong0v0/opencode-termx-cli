@@ -28,7 +28,7 @@ async fn wait_exit(rx: &mut Receiver<ProcEvent>) -> (Vec<u8>, i32) {
     let exit_code = timeout(TEST_TIMEOUT, async {
         loop {
             match rx.recv().await {
-                Some(ProcEvent::Output(chunk)) => output.extend_from_slice(&chunk),
+                Some(ProcEvent::Output { data, .. }) => output.extend_from_slice(&data),
                 Some(ProcEvent::Exited(code)) => return code,
                 Some(ProcEvent::Signaled(signal)) => {
                     panic!("Windows 不应收到 Signaled({signal})")

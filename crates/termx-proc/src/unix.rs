@@ -34,7 +34,7 @@ use termx_protocol::ProcNode;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, warn};
 
-use crate::{ProcError, ProcEvent, PtyConfig, normalize_signal};
+use crate::{OutputStream, ProcError, ProcEvent, PtyConfig, normalize_signal};
 
 /// 事件通道容量；读线程满时通过 `blocking_send` 施加背压。
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -335,61 +335,7 @@ impl PtySession {
     /// 清理与长度截断。除父进程链外，还会补入与根进程同一会话的后代，避免
     /// 孤儿被重新挂到 init 后丢失。
     pub fn tree(&self) -> Result<Vec<ProcNode>, ProcError> {
-        let entries = match std::fs::read_dir("/proc") {
-            Ok(entries) => entries,
-            // 非 Linux 的 Unix（如 macOS）没有 /proc：返回空树而不是报错。
-            Err(_) => return Ok(Vec::new()),
-        };
-
-        let mut stats: HashMap<u32, ProcStat> = HashMap::new();
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if let Some(stat) = read_proc_stat(pid) {
-                stats.insert(pid, stat);
-            }
-        }
-
-        let root_session = self.session;
-
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for stat in stats.values() {
-            children.entry(stat.ppid).or_default().push(stat.pid);
-        }
-
-        // 从根 PID 出发按父子关系遍历。根进程已退出时仍要展开它的子节点，
-        // 因为子进程的 `ppid` 在父进程退出后不会改变。
-        let mut nodes = Vec::new();
-        let mut visited: HashSet<u32> = HashSet::new();
-        let mut queue: VecDeque<u32> = VecDeque::new();
-        queue.push_back(self.pid);
-        while let Some(pid) = queue.pop_front() {
-            if !visited.insert(pid) {
-                continue;
-            }
-            if let Some(stat) = stats.get(&pid) {
-                nodes.push(to_node(stat));
-            }
-            if let Some(kids) = children.get(&pid) {
-                queue.extend(kids.iter().copied());
-            }
-        }
-
-        // 根进程退出后，后台作业可能已被重新挂到 init，但会话 ID 仍是根 PID；
-        // 按会话补全才能覆盖这类后代。
-        if root_session != 0 {
-            for stat in stats.values() {
-                if stat.session == root_session && visited.insert(stat.pid) {
-                    nodes.push(to_node(stat));
-                }
-            }
-        }
-        Ok(nodes)
+        tree_for(self.pid, self.session)
     }
 
     /// 向子进程组发 SIGTERM → 宽限轮询 → SIGKILL；不触碰自身进程组。
@@ -448,6 +394,66 @@ impl PtySession {
             signal_one(pid, Signal::SIGKILL);
         }
     }
+}
+
+/// 采集指定根进程的进程树；PTY 与 stdio 后端共用。
+///
+/// `root_session` 非 0 时额外补入同会话后代（PTY 的 `setsid` 会话）；stdio
+/// 后端没有独立会话，传 0 只按父子链遍历，避免把无关进程算进树里。
+pub(crate) fn tree_for(root_pid: u32, root_session: u32) -> Result<Vec<ProcNode>, ProcError> {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        // 非 Linux 的 Unix（如 macOS）没有 /proc：返回空树而不是报错。
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut stats: HashMap<u32, ProcStat> = HashMap::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(stat) = read_proc_stat(pid) {
+            stats.insert(pid, stat);
+        }
+    }
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for stat in stats.values() {
+        children.entry(stat.ppid).or_default().push(stat.pid);
+    }
+
+    // 从根 PID 出发按父子关系遍历。根进程已退出时仍要展开它的子节点，
+    // 因为子进程的 `ppid` 在父进程退出后不会改变。
+    let mut nodes = Vec::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.push_back(root_pid);
+    while let Some(pid) = queue.pop_front() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(stat) = stats.get(&pid) {
+            nodes.push(to_node(stat));
+        }
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids.iter().copied());
+        }
+    }
+
+    // 根进程退出后，后台作业可能已被重新挂到 init，但会话 ID 仍是根 PID；
+    // 按会话补全才能覆盖这类后代。
+    if root_session != 0 {
+        for stat in stats.values() {
+            if stat.session == root_session && visited.insert(stat.pid) {
+                nodes.push(to_node(stat));
+            }
+        }
+    }
+    Ok(nodes)
 }
 
 /// 向单个进程发送信号；进程已不存在或无权时忽略。
@@ -805,7 +811,11 @@ fn read_loop(master: OwnedFd, tx: Sender<ProcEvent>, gate: Arc<Gate>) {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = buffer[..read].to_vec();
-                if tx.blocking_send(ProcEvent::Output(chunk)).is_err() {
+                let event = ProcEvent::Output {
+                    data: chunk,
+                    stream: OutputStream::Pty,
+                };
+                if tx.blocking_send(event).is_err() {
                     // 接收端已丢弃：停止读取并让 fd 随作用域关闭。
                     break;
                 }

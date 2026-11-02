@@ -2,6 +2,8 @@
 //!
 //! 依赖方向：本模块位于 `core`，可依赖 `termx-proc`（`proc` 不反向依赖 `core`）。
 //! - [`PtyFactory`] 调用 [`termx_proc::PtySession::spawn`] 创建真实 PTY/ConPTY；
+//! - [`StdioFactory`] 调用 [`termx_proc::StdioSession::spawn`] 创建独立管道；
+//! - [`ModeFactory`] 按 `mode` 路由到上述两种真实后端，是 registry 的默认工厂；
 //! - [`MockFactory`] / [`MockBackend`] 不创建真实进程，供 registry / service 的
 //!   既有 mock 测试复用；
 //! - 所有可能阻塞的后端方法（`write` / `resize` / `signal` / `terminate` / `tree`
@@ -13,7 +15,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
-use termx_proc::{ProcError, ProcEvent, PtyConfig, PtySession};
+use termx_proc::{ProcError, ProcEvent, PtyConfig, PtySession, StdioSession};
 use termx_protocol::{CreateParams, Mode, ProcNode};
 use tokio::sync::mpsc::{Receiver, channel};
 
@@ -148,6 +150,7 @@ impl TerminalBackend for PtyBackend {
 fn map_proc_error(error: ProcError) -> CoreError {
     match error {
         ProcError::UnsupportedSignal(name) => CoreError::UnsupportedSignal(name),
+        ProcError::WriteQueueFull => CoreError::LimitExceeded("stdio 写入队列已满".to_string()),
         other => CoreError::BackendFailed(other.to_string()),
     }
 }
@@ -160,24 +163,179 @@ impl BackendFactory for PtyFactory {
     fn spawn(&self, params: &CreateParams) -> Result<SpawnedBackend, CoreError> {
         if params.mode != Mode::Pty {
             return Err(CoreError::BadRequest(
-                "stdio 模式将在 M3 支持，当前请使用 pty".to_string(),
+                "PtyFactory 仅支持 pty 模式".to_string(),
             ));
         }
 
-        let config = PtyConfig {
-            program: params.cmd.clone(),
-            args: params.args.clone(),
-            cwd: params.cwd.clone(),
-            env: params.env.clone(),
-            cols: params.cols.unwrap_or(DEFAULT_PTY_COLS),
-            rows: params.rows.unwrap_or(DEFAULT_PTY_ROWS),
-        };
-
+        let config = build_config(params);
         let (session, events) =
             PtySession::spawn(config).map_err(|error| CoreError::SpawnFailed {
                 message: error.to_string(),
             })?;
         Ok((Arc::new(PtyBackend::new(session)), events))
+    }
+}
+
+/// 真实管道 stdio 后端：包装 [`termx_proc::StdioSession`]。
+pub struct StdioBackend {
+    /// 底层 stdio 会话；所有可变操作都在锁内完成。
+    session: Mutex<StdioSession>,
+    /// 创建后不变的根进程 ID。
+    pid: u32,
+    /// 创建后不变的进程组 ID。
+    pgid: u32,
+}
+
+impl StdioBackend {
+    /// 包装一个已启动的 stdio 会话。
+    pub fn new(session: StdioSession) -> Self {
+        let pid = session.pid();
+        let pgid = session.pgid();
+        Self {
+            session: Mutex::new(session),
+            pid,
+            pgid,
+        }
+    }
+
+    /// 获取会话锁；锁中毒时取回内部值继续。
+    fn lock_session(&self) -> MutexGuard<'_, StdioSession> {
+        self.session.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl TerminalBackend for StdioBackend {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn pgid(&self) -> u32 {
+        self.pgid
+    }
+
+    fn foreground_pgrp(&self) -> Option<u32> {
+        // stdio 没有 TTY/前台进程组。
+        self.lock_session().foreground_pgrp().ok().flatten()
+    }
+
+    fn tree(&self) -> Vec<ProcNode> {
+        self.lock_session().tree().unwrap_or_default()
+    }
+
+    fn write(&self, data: &[u8]) -> Result<(), CoreError> {
+        self.lock_session().write(data).map_err(map_proc_error)
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), CoreError> {
+        self.lock_session()
+            .resize(cols, rows)
+            .map_err(map_proc_error)
+    }
+
+    fn signal(&self, name: &str) -> Result<(), CoreError> {
+        self.lock_session().signal(name).map_err(map_proc_error)
+    }
+
+    fn terminate(&self) {
+        if let Err(error) = self.lock_session().terminate() {
+            tracing::warn!(%error, "终止 stdio 会话失败");
+        }
+    }
+}
+
+/// 真实 stdio 工厂：启动独立管道的子进程。
+#[derive(Debug, Clone, Copy)]
+pub struct StdioFactory {
+    /// stdin 有界写队列容量（条）。
+    write_queue_capacity: usize,
+}
+
+impl StdioFactory {
+    /// 使用指定写队列容量创建工厂。
+    pub fn with_write_queue_capacity(write_queue_capacity: usize) -> Self {
+        Self {
+            write_queue_capacity,
+        }
+    }
+}
+
+impl Default for StdioFactory {
+    fn default() -> Self {
+        Self::with_write_queue_capacity(termx_proc::DEFAULT_STDIO_WRITE_QUEUE_CAPACITY)
+    }
+}
+
+impl BackendFactory for StdioFactory {
+    fn spawn(&self, params: &CreateParams) -> Result<SpawnedBackend, CoreError> {
+        if params.mode != Mode::Stdio {
+            return Err(CoreError::BadRequest(
+                "StdioFactory 仅支持 stdio 模式".to_string(),
+            ));
+        }
+
+        let (session, events) =
+            StdioSession::spawn_with_write_queue(build_config(params), self.write_queue_capacity)
+                .map_err(|error| CoreError::SpawnFailed {
+                message: error.to_string(),
+            })?;
+        Ok((Arc::new(StdioBackend::new(session)), events))
+    }
+}
+
+/// 按 `mode` 路由到真实 PTY / stdio 工厂；registry 的默认工厂。
+///
+/// 测试仍可用 [`crate::MockFactory`] 注入单一 mock 工厂，此时所有模式都走 mock。
+pub struct ModeFactory {
+    /// pty 模式工厂。
+    pty: Arc<dyn BackendFactory>,
+    /// stdio 模式工厂。
+    stdio: Arc<dyn BackendFactory>,
+}
+
+impl ModeFactory {
+    /// 用自定义子工厂构造路由器（便于测试或替换平台实现）。
+    pub fn new(pty: Arc<dyn BackendFactory>, stdio: Arc<dyn BackendFactory>) -> Self {
+        Self { pty, stdio }
+    }
+
+    /// 用默认 PTY/stdio 子工厂构造路由器，并指定 stdio 写队列容量。
+    pub fn with_stdio_write_queue_capacity(write_queue_capacity: usize) -> Self {
+        Self {
+            pty: Arc::new(PtyFactory),
+            stdio: Arc::new(StdioFactory::with_write_queue_capacity(
+                write_queue_capacity,
+            )),
+        }
+    }
+}
+
+impl Default for ModeFactory {
+    fn default() -> Self {
+        Self {
+            pty: Arc::new(PtyFactory),
+            stdio: Arc::new(StdioFactory::default()),
+        }
+    }
+}
+
+impl BackendFactory for ModeFactory {
+    fn spawn(&self, params: &CreateParams) -> Result<SpawnedBackend, CoreError> {
+        match params.mode {
+            Mode::Pty => self.pty.spawn(params),
+            Mode::Stdio => self.stdio.spawn(params),
+        }
+    }
+}
+
+/// 把创建参数转换为 [`PtyConfig`]；stdio 路径忽略尺寸。
+fn build_config(params: &CreateParams) -> PtyConfig {
+    PtyConfig {
+        program: params.cmd.clone(),
+        args: params.args.clone(),
+        cwd: params.cwd.clone(),
+        env: params.env.clone(),
+        cols: params.cols.unwrap_or(DEFAULT_PTY_COLS),
+        rows: params.rows.unwrap_or(DEFAULT_PTY_ROWS),
     }
 }
 
@@ -286,6 +444,13 @@ impl TerminalBackend for MockBackend {
     }
 
     fn signal(&self, name: &str) -> Result<(), CoreError> {
+        // 与真实后端保持一致：只接受 SIGINT/SIGTERM/SIGKILL（含无前缀别名），
+        // 未知信号返回错误，便于测试「失败不落 pending_interrupt」。
+        let upper = name.trim().to_ascii_uppercase();
+        let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
+        if !matches!(bare, "INT" | "TERM" | "KILL") {
+            return Err(CoreError::UnsupportedSignal(name.to_string()));
+        }
         self.signals
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

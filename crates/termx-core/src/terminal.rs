@@ -8,7 +8,7 @@ use termx_protocol::{
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::{EventBuffer, TerminalBackend};
+use crate::{EventBuffer, EventRecord, TerminalBackend};
 
 /// 终端内部全局唯一标识；使用 26 字符 ULID 表示。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,11 +107,23 @@ pub struct TerminalEntry {
 
 impl TerminalEntry {
     /// 写入一条事件，并同步 `seq` / `last_activity`。
+    ///
+    /// 返回值是本次事件的 `seq`；若伴随输出淘汰，registry 还需调用
+    /// [`TerminalEntry::emit_with_drops`] 拿到 `output_dropped` marker 并投递。
     pub fn emit(&mut self, kind: EventKind) -> u64 {
-        let seq = self.events.emit(kind);
-        self.seq = seq;
+        self.emit_with_drops(kind).0.seq
+    }
+
+    /// 写入事件并立即落成待发的 `output_dropped` marker（可能多条）。
+    ///
+    /// 返回 `(本次事件记录, output_dropped 记录列表)`。`self.seq` 取最后一条
+    /// 记录（通常是最新 marker）的 `seq`，保证快照游标始终是最后 seq。
+    pub fn emit_with_drops(&mut self, kind: EventKind) -> (EventRecord, Vec<EventRecord>) {
+        let record = self.events.emit(kind);
+        let markers = self.events.take_drop_markers();
+        self.seq = markers.last().map_or(record.seq, |marker| marker.seq);
         self.last_activity = self.events.latest_ts().map(str::to_string);
-        seq
+        (record, markers)
     }
 
     /// 把最后活动时间刷新为 `at`（RFC3339 UTC）。

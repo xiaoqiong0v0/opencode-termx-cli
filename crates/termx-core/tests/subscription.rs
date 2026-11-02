@@ -6,7 +6,7 @@ use termx_core::{DEFAULT_EVENT_BUFFER_CAPACITY, MockFactory, Registry, TerminalI
 use termx_protocol::{
     CreateParams, Event, EventKind, LifecycleState, Mode, ResetReason, Stream, TerminalLocator,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, channel};
 
 /// 构造 pty 创建参数。
 fn params(root_session_id: &str, name: &str) -> CreateParams {
@@ -51,7 +51,7 @@ fn output(data: &str) -> EventKind {
 }
 
 /// 取出当前已缓冲的全部事件。
-fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
+fn drain(rx: &mut Receiver<Event>) -> Vec<Event> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -64,7 +64,7 @@ fn report_event_increments_seq_and_delivers_to_subscriber() {
     let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let id = TerminalId::new(terminal_id.clone());
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator(&terminal_id), "client-a", Some(0), tx)
         .expect("attach 应成功");
@@ -86,7 +86,7 @@ fn report_event_increments_seq_and_delivers_to_subscriber() {
 fn attach_with_cursor_zero_replays_started() {
     let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
 
     let result = registry
         .attach(&locator(&terminal_id), "client-a", Some(0), tx)
@@ -111,7 +111,7 @@ fn attach_with_cursor_zero_replays_started() {
 fn attach_without_cursor_returns_snapshot_only() {
     let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
 
     let result = registry
         .attach(&locator(&terminal_id), "client-a", None, tx)
@@ -132,17 +132,21 @@ fn attach_with_cursor_older_than_ring_returns_too_old() {
     registry.report_event(&id, output("YQ==")).unwrap();
     registry.report_event(&id, output("Yg==")).unwrap();
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     let result = registry
         .attach(&locator(&terminal_id), "client-a", Some(0), tx)
         .expect("attach 应成功");
 
     assert_eq!(result.reset, Some(ResetReason::TooOld));
-    assert_eq!(result.cursor, 3, "基线为当前 last seq，不含 attached");
+    // output_dropped 也占用 seq：started=1、两个 output 被淘汰后合并成一条
+    // marker（seq=4，闭区间 2..=3）。
+    assert_eq!(result.cursor, 4, "基线为当前 last seq，不含 attached");
     let events = drain(&mut rx);
-    assert_eq!(events.len(), 1, "too_old 不回放历史");
+    // too_old 只返回 reset + 基线，不回放历史（包括丢弃 marker），因此订阅者
+    // 只收到紧随其后的 attached。
+    assert_eq!(events.len(), 1, "too_old 不回放历史，只发 attached");
     assert!(matches!(events[0].kind, EventKind::Attached { .. }));
-    assert_eq!(events[0].seq, 4);
+    assert_eq!(events[0].seq, 5);
 }
 
 #[test]
@@ -198,7 +202,7 @@ fn output_after_terminal_is_dropped() {
     let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let id = TerminalId::new(terminal_id.clone());
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator(&terminal_id), "client-a", None, tx)
         .expect("attach 应成功");
@@ -232,11 +236,11 @@ fn detach_removes_subscription_and_emits_detached_to_others() {
     let terminal_id = create_terminal(&mut registry, "build");
     let id = TerminalId::new(terminal_id.clone());
 
-    let (tx_a, mut rx_a) = unbounded_channel();
+    let (tx_a, mut rx_a) = channel(64);
     registry
         .attach(&locator(&terminal_id), "client-a", None, tx_a)
         .expect("attach 应成功");
-    let (tx_b, mut rx_b) = unbounded_channel();
+    let (tx_b, mut rx_b) = channel(64);
     registry
         .subscribe(&locator(&terminal_id), "client-b", None, tx_b)
         .expect("subscribe 应成功");
@@ -264,7 +268,7 @@ fn detach_removes_subscription_and_emits_detached_to_others() {
 #[test]
 fn subscribe_all_receives_events_from_future_terminals() {
     let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     let cursors = registry.subscribe_all("client-a", tx);
     assert!(cursors.is_empty(), "尚无终端");
 
@@ -285,7 +289,7 @@ fn unsubscribe_does_not_emit_detached() {
     let mut registry = Registry::with_factory(DEFAULT_EVENT_BUFFER_CAPACITY, Arc::new(MockFactory));
     let terminal_id = create_terminal(&mut registry, "build");
     let id = TerminalId::new(terminal_id.clone());
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     registry
         .attach(&locator(&terminal_id), "client-a", None, tx)
         .expect("attach 应成功");
@@ -308,7 +312,7 @@ fn attach_with_nonzero_cursor_replays_without_gap_or_duplicate() {
     registry.report_event(&id, output("YQ==")).unwrap();
     registry.report_event(&id, output("Yg==")).unwrap();
 
-    let (tx, mut rx) = unbounded_channel();
+    let (tx, mut rx) = channel(64);
     let result = registry
         .attach(&locator(&terminal_id), "client-a", Some(2), tx)
         .expect("attach 应成功");
@@ -332,7 +336,7 @@ fn global_subscription_excludes_detached_terminal_until_resubscribe() {
     let first = create_terminal(&mut registry, "first");
     let second = create_terminal(&mut registry, "second");
 
-    let (global_tx, mut global_rx) = unbounded_channel();
+    let (global_tx, mut global_rx) = channel(64);
     let cursors = registry.subscribe_all("client-a", global_tx);
     assert_eq!(cursors.len(), 2);
     assert!(drain(&mut global_rx).is_empty());
@@ -353,7 +357,7 @@ fn global_subscription_excludes_detached_terminal_until_resubscribe() {
     assert_eq!(drain(&mut global_rx).len(), 1);
 
     // 重新 attach 后恢复接收（终端级投递优先，全局按 client_id 去重）。
-    let (terminal_tx, mut terminal_rx) = unbounded_channel();
+    let (terminal_tx, mut terminal_rx) = channel(64);
     registry
         .attach(&locator(&first), "client-a", None, terminal_tx)
         .expect("attach 应成功");
@@ -373,13 +377,13 @@ fn detach_all_emits_detached_only_for_terminal_subscriptions() {
     let first = create_terminal(&mut registry, "first");
     let _second = create_terminal(&mut registry, "second");
 
-    let (observer_tx, mut observer_rx) = unbounded_channel();
+    let (observer_tx, mut observer_rx) = channel(64);
     registry.subscribe_all("observer", observer_tx);
     drain(&mut observer_rx);
 
-    let (global_tx, mut global_rx) = unbounded_channel();
+    let (global_tx, mut global_rx) = channel(64);
     registry.subscribe_all("client-a", global_tx);
-    let (terminal_tx, mut terminal_rx) = unbounded_channel();
+    let (terminal_tx, mut terminal_rx) = channel(64);
     registry
         .attach(&locator(&first), "client-a", None, terminal_tx)
         .expect("attach 应成功");
