@@ -1,15 +1,18 @@
-//! 会话状态机、registry、事件总线与背压（M0 占位）。
+//! 会话状态机、registry、事件缓冲与终端后端抽象。
 //!
-//! 依赖方向：本 crate 位于 `protocol` 之上，`service` / `cli` 之下；
-//! M1 起实现会话键 `(root_session_id, name)`、attach/detach 与订阅回放。
+//! 依赖方向：本 crate 位于 `protocol` 之上，`service` / `cli` 之下。
+//! F2 承载 `(root_session_id, name)` 会话键、事件 seq/ring buffer 与 mock 后端；
+//! F3 增加事件摄取、attach/detach 与 cursor 回放；F4 增加 locator 与输入 lease。
+//! 当前不创建真实 PTY / 子进程，真实后端留到 M2。
 
-use termx_protocol::LifecycleState;
+mod backend;
+mod error;
+mod event;
+mod registry;
+mod terminal;
 
-/// 会话注册表占位；M1 起承载 `(root_session_id, name)` → 终端映射。
-#[derive(Debug, Default)]
-pub struct SessionRegistry;
-
-/// 判断当前生命周期状态是否接受写操作（终态拒绝）。
-pub fn accepts_input(state: LifecycleState) -> bool {
-    !state.is_terminal()
-}
+pub use backend::{MOCK_PID_START, MockBackend, TerminalBackend};
+pub use error::CoreError;
+pub use event::{DEFAULT_EVENT_BUFFER_CAPACITY, EventBuffer, EventRecord, now_rfc3339};
+pub use registry::{DETACH_REASON_DISCONNECT, INITIAL_CURSOR, Registry};
+pub use terminal::{TerminalEntry, TerminalId};

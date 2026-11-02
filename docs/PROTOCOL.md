@@ -16,10 +16,11 @@
 
 ## 3. 鉴权
 - 服务启动生成随机 token，写入仅当前用户可读的 token 文件。
-- token 文件约定路径：Linux/macOS `$XDG_CONFIG_HOME/termx/token`（缺省 `~/.config/termx/token`）；Windows `%APPDATA%\termx\token`；权限 `0600` / 当前用户 ACL。
+- token 文件约定路径：Linux/macOS `$XDG_CONFIG_HOME/termx/token`（缺省 `~/.config/termx/token`）；Windows `%APPDATA%\termx\token`；Unix 权限 `0600`。Windows v0 依赖**环回绑定 + token** 保证本机访问面，文件 ACL 收紧列为后续项（实现当前继承目录 ACL，不夸大已收紧）。
 - 发现优先级：`--token-file` > `TERMX_TOKEN` 环境变量 > 默认 token 文件。
-- token 在 service 重启时轮换，旧 token 失效；不写入日志。
-- token 通过 `hello` 的 `token` 字段校验（也可用 `Authorization: Bearer <token>` 头）。
+- token 持久化于 token 文件，首次启动生成；如需轮换，删除 token 文件或使用显式轮换（后续），旧 token 随即失效；不写入日志。
+- token 通过 `hello` 的 `token` 字段校验，也可用 `Authorization: Bearer <token>` 头；两者同时给出时**头优先**。
+- token 文件采用同目录临时文件 + rename 原子写入，避免读到半截内容。
 - 仅接受环回地址连接；非环回在 WebSocket 握手阶段拒绝。
 - 握手失败返回 `auth_failed` 并断开；不提供匿名访问。
 
@@ -62,17 +63,17 @@
 | --- | --- | --- |
 | `hello` | `{ proto, token, client }` | `{ proto, server, capabilities }` |
 | `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"} }` | `{ terminal_id, cursor }` |
-| `terminal.claim` | `{ terminal_id, force? }` | `{ owner, lease }` |
-| `terminal.release` | `{ terminal_id }` | `{ ok }` |
-| `terminal.attach` | `{ terminal_id, cursor? }` | `{ cursor, snapshot, reset? }` |
-| `terminal.detach` | `{ terminal_id }` | `{ ok }` |
+| `terminal.claim` | `{ locator, force? }` | `{ owner, lease }` |
+| `terminal.release` | `{ locator }` | `{ ok }` |
+| `terminal.attach` | `{ locator, cursor? }` | `{ cursor, snapshot, reset? }` |
+| `terminal.detach` | `{ locator }` | `{ ok }` |
 | `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, pid?, idle_timeout?, last_activity?, created_at }]` |
-| `terminal.status` | `{ terminal_id }` | `{ snapshot }` |
-| `terminal.read` | `{ terminal_id, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
-| `terminal.send` | `{ terminal_id, data(base64)?, text?, enter? }` | `{ ok }` |
-| `terminal.resize` | `{ terminal_id, cols, rows }` | `{ ok }` |
-| `terminal.signal` | `{ terminal_id, signal }` | `{ ok }` |
-| `terminal.terminate` | `{ terminal_id, force? }` | `{ ok }` |
+| `terminal.status` | `{ locator }` | `{ snapshot }` |
+| `terminal.read` | `{ locator, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
+| `terminal.send` | `{ locator, data(base64)?, text?, enter? }` | `{ ok }` |
+| `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
+| `terminal.signal` | `{ locator, signal }` | `{ ok }` |
+| `terminal.terminate` | `{ locator, force? }` | `{ ok }` |
 | `terminal.prune` | `{ states?, older_than?: {value, unit:"s"\|"ms"}, basis?: "last_activity"\|"created_at" }` | `{ removed }` |
 | `subscribe` | `{ terminals?: [{terminal_id, cursor?}], all?: boolean }` | `{ cursors: [{terminal_id, cursor, reset?}] }` |
 | `unsubscribe` | `{ terminals? }` | `{ ok }` |
@@ -81,15 +82,21 @@
 - `pty` 必带 `cols/rows`（可默认）；`stdio` 忽略尺寸。
 - `env?` 为 **JSON 对象 map**（如 `{"TERM":"xterm-256color"}`），不是元组/二元数组。
 - `idle_timeout` 省略或 `value=0` 表示**永不超时**；`action` 仅在 `value>0` 时必填，`value=0` 可缺省。默认 `0`。该规则由 `IdleTimeout::validate` 校验，`terminal.create`（M1）调用。
-- **会话键**为 `(root_session_id, name)`；`terminal_id` 为内部全局唯一标识。`name` 禁止 `/`、`\`、空串。
+- **会话键**为 `(root_session_id, name)`；`terminal_id` 为内部全局唯一标识。`name` 禁止 `/`、`\`、空串，且长度上限为 **64** 个字符（按 Unicode 字符计数）。
 - 同名处理：同一 `(root_session_id, name)` 已存在时，`create` 不带 `force` → `session_exists`（错误载荷的 `terminal_id` 字段携带旧终端 ID，并附说明）；`force=true` → 终止旧终端（落 `interrupted{source:"terminate"}`）后新建。
-- 分阶段定位：v0/M0 除 `create` 外的方法参数以 `terminal_id` 为准；M1 起这些方法参数引入 `TerminalLocator`（支持 `{root_session_id, name}`；两者都给时以 `terminal_id` 为准），届时同步更新表内参数。
-- `terminal.create` 返回初始 `cursor`（创建时的事件序列位置）；客户端据此 `attach` 可回放 `started` 与首屏 output，避免 create→attach 空窗丢事件。
+- 终端定位：除 `terminal.create` 外，终端级方法的 `locator` 均为 `TerminalLocator`，形状为 `{ terminal_id?, root_session_id?, name? }`（JSON 中平铺，不嵌套 `locator` 键）。
+  - `terminal_id` 存在时优先；否则使用 `(root_session_id, name)` 查会话键。
+  - 两者同时给出时以 `terminal_id` 为准，不回退到会话键。
+  - 定位字段全部缺省 → `bad_request`；解析不到终端 → `not_found`。
+- 连接标识：服务端为每条连接生成唯一 `client_id`（ULID），用于 `attached`/`detached`/`lease_revoked` 事件与输入 lease 归属；`hello.client` 仅作为日志标签，不参与任何键或归属判断。
+- `terminal.create` 返回初始 `cursor`，固定为 `0`（`started` 的 seq=1 之前的位置）；客户端据此 `attach(cursor=0)` 可回放 `started` 与首屏 output，避免 create→attach 空窗丢事件。
 - `terminal.send`：`data` 与 `text` 二选一（同传取 `data`）；`text` 按 UTF-8；`enter=true` 追加换行（`\r`，pty）/`\n`（stdio）。
-- `terminal.claim` 取得输入 lease；同一终端同一时刻只有一个 lease owner。`force=true` 抢占（旧 owner 收 `permission_denied`/`lease_revoked`）。未 claim 或非 owner 的 `send` 返回 `permission_denied`。
+- `terminal.claim` 取得输入 lease；同一终端同一时刻只有一个 lease owner。`force=true` 抢占时向订阅者广播 `lease_revoked{old_client_id}`，随后授予新 owner。未 claim 或非 owner 的 `send` 返回 `permission_denied`。
 - `terminal.read`：`cursor` 早于缓冲下界时返回 `reset` + 基线 `cursor`，客户端清空本地 output 视图后继续。
 - `attach` 不带 `cursor`：返回当前 `snapshot` + 当前基线 `cursor`（不补发历史 output，仅快照）。
 - `attach` 到终态终端：允许只读（返回 `snapshot` 与剩余 output）。
+- `subscribe` 的 `terminals` 与 `all` 同时给出时，结果按 `terminal_id` 去重；任一目标解析失败则整体失败，不注册任何订阅、不回放事件。
+- `detach`/`unsubscribe` 某终端后，该终端从该客户端的 `subscribe_all` 全局投递中排除；再次 `attach`/`subscribe` 该终端时恢复。
 
 ## 7. 事件
 | `type` | 关键字段 | 说明 |

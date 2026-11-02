@@ -458,11 +458,28 @@ pub struct CreateResult {
 /// `terminal.attach` 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// 客户端已处理的最后 seq；缺省表示只要快照。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u64>,
+}
+
+/// `terminal.detach` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DetachParams {
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
+}
+
+/// `terminal.status` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StatusParams {
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
 }
 
 /// `subscribe` 的单个终端订阅项。
@@ -565,8 +582,9 @@ pub struct HelloResult {
 /// `terminal.claim` 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// 是否抢占现有 lease。
     #[serde(default)]
     pub force: bool,
@@ -577,15 +595,16 @@ pub struct ClaimParams {
 pub struct ClaimResult {
     /// 当前 lease owner（客户端 ID）。
     pub owner: String,
-    /// lease 标识。
+    /// lease 标识；v1 直接使用 owner 的连接级 `client_id`。
     pub lease: String,
 }
 
 /// `terminal.release` 参数。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ReleaseParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
 }
 
 /// 通用成功结果；用于 `detach` / `release` / `resize` / `signal` / `terminate` / `unsubscribe`。
@@ -654,8 +673,9 @@ pub struct StatusResult {
 /// `terminal.read` 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// 起始游标（必填，对齐 PROTOCOL §6）。
     pub cursor: u64,
     /// 单次返回的字节上限。
@@ -690,8 +710,9 @@ pub enum ResetReason {
 /// `terminal.send` 参数；`data` 与 `text` 二选一（同传取 `data`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// base64 编码的原始字节。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
@@ -706,8 +727,9 @@ pub struct SendParams {
 /// `terminal.resize` 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResizeParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// 列数。
     pub cols: u16,
     /// 行数。
@@ -717,8 +739,9 @@ pub struct ResizeParams {
 /// `terminal.signal` 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// 信号名，如 `SIGINT`。
     pub signal: String,
 }
@@ -726,8 +749,9 @@ pub struct SignalParams {
 /// `terminal.terminate` 参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminateParams {
-    /// 终端 ID。
-    pub terminal_id: String,
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
     /// 是否强制终止（跳过优雅退出）。
     #[serde(default)]
     pub force: bool,
@@ -1125,7 +1149,11 @@ mod tests {
         assert_eq!(chunk, chunk_back);
 
         let attach = AttachParams {
-            terminal_id: "01JABCDEF".to_string(),
+            locator: TerminalLocator {
+                terminal_id: Some("01JABCDEF".to_string()),
+                root_session_id: None,
+                name: None,
+            },
             cursor: Some(41),
         };
         let attach_back: AttachParams =
@@ -1167,7 +1195,11 @@ mod tests {
         }
 
         let attach = AttachParams {
-            terminal_id: "01JABCDEF".to_string(),
+            locator: TerminalLocator {
+                terminal_id: Some("01JABCDEF".to_string()),
+                root_session_id: None,
+                name: None,
+            },
             cursor: None,
         };
         let attach_json: JsonValue =
@@ -1234,6 +1266,74 @@ mod tests {
             serde_json::from_str(&to_json(&locator).expect("序列化失败")).expect("JSON 解析失败");
         assert!(json.get("root_session_id").is_none());
         assert!(json.get("name").is_none());
+    }
+
+    #[test]
+    fn locator_params_flatten_and_round_trip() {
+        // 只给 terminal_id：定位字段与外层参数平铺在同一层。
+        let attach: AttachParams =
+            from_json(r#"{"terminal_id":"01JABCDEF","cursor":3}"#).expect("attach 反序列化失败");
+        assert_eq!(attach.locator.terminal_id.as_deref(), Some("01JABCDEF"));
+        assert!(attach.locator.root_session_id.is_none());
+        assert_eq!(attach.cursor, Some(3));
+
+        let attach_json: JsonValue =
+            serde_json::from_str(&to_json(&attach).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(attach_json["terminal_id"], "01JABCDEF");
+        assert!(attach_json.get("root_session_id").is_none());
+        assert!(attach_json.get("name").is_none());
+
+        // 只给 (root_session_id, name)。
+        let claim: ClaimParams =
+            from_json(r#"{"root_session_id":"ses-1","name":"build"}"#).expect("claim 反序列化失败");
+        assert!(claim.locator.terminal_id.is_none());
+        assert_eq!(claim.locator.root_session_id.as_deref(), Some("ses-1"));
+        assert_eq!(claim.locator.name.as_deref(), Some("build"));
+        assert!(!claim.force);
+
+        let claim_back: ClaimParams =
+            from_json(&to_json(&claim).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(claim, claim_back);
+
+        // 三项都缺省时定位器为空，交由 core 判定 bad_request/not_found。
+        let empty: StatusParams = from_json("{}").expect("status 反序列化失败");
+        assert!(empty.locator.is_empty());
+
+        let detach: DetachParams =
+            from_json(r#"{"terminal_id":"01JABCDEF"}"#).expect("detach 反序列化失败");
+        assert_eq!(detach.locator.terminal_id.as_deref(), Some("01JABCDEF"));
+
+        let release: ReleaseParams = from_json(r#"{"root_session_id":"ses-1","name":"build"}"#)
+            .expect("release 反序列化失败");
+        assert_eq!(release.locator.root_session_id.as_deref(), Some("ses-1"));
+        assert_eq!(release.locator.name.as_deref(), Some("build"));
+
+        // 其余带定位器的方法参数同样支持平铺。
+        let read: ReadParams =
+            from_json(r#"{"root_session_id":"ses-1","name":"build","cursor":7,"max_bytes":4096}"#)
+                .expect("read 反序列化失败");
+        assert_eq!(read.locator.name.as_deref(), Some("build"));
+        assert_eq!(read.cursor, 7);
+        assert_eq!(read.max_bytes, Some(4096));
+
+        let send: SendParams = from_json(r#"{"terminal_id":"01JABCDEF","text":"ls","enter":true}"#)
+            .expect("send 反序列化失败");
+        assert_eq!(send.locator.terminal_id.as_deref(), Some("01JABCDEF"));
+        assert_eq!(send.text.as_deref(), Some("ls"));
+        assert!(send.enter);
+
+        let resize: ResizeParams =
+            from_json(r#"{"name":"build","root_session_id":"ses-1","cols":120,"rows":30}"#)
+                .expect("resize 反序列化失败");
+        assert_eq!((resize.cols, resize.rows), (120, 30));
+
+        let signal: SignalParams = from_json(r#"{"terminal_id":"01JABCDEF","signal":"SIGINT"}"#)
+            .expect("signal 反序列化失败");
+        assert_eq!(signal.signal, "SIGINT");
+
+        let terminate: TerminateParams = from_json(r#"{"terminal_id":"01JABCDEF","force":true}"#)
+            .expect("terminate 反序列化失败");
+        assert!(terminate.force);
     }
 
     #[test]

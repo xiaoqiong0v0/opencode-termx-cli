@@ -21,3 +21,16 @@ rust-version = "1.85"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# M1 本机 WebSocket 传输 / 鉴权所需依赖。
+tokio = { version = "1", features = ["full"] }
+# 0.30 起 tokio-tungstenite 默认即 Tokio 实现，不再提供 `tokio` feature。
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.10"
+
+# M1/F2 终端 registry 所需：全局唯一 ID 与 RFC3339 时间戳。
+ulid = "3"
+time = { version = "0.3", features = ["formatting"] }

@@ -7,3 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 termx-protocol = { path = "../termx-protocol" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+ulid = { workspace = true }

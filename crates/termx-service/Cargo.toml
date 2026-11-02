@@ -1,6 +1,30 @@
 [package]
 name = "termx-service"
-description = "termx daemon：传输、鉴权、RPC 与订阅（M0 占位）"
+description = "termx daemon：传输、鉴权、RPC 与订阅"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "termx_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "termx-service"
+path = "src/main.rs"
+
+[dependencies]
+termx-protocol = { path = "../termx-protocol" }
+termx-core = { path = "../termx-core" }
+futures-util = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
