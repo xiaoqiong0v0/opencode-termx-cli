@@ -1,0 +1,25 @@
+[package]
+name = "termx-client"
+description = "termx 客户端库：连接与握手、请求配对、事件广播（CLI/adapter 共用）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "termx_client"
+path = "src/lib.rs"
+
+[dependencies]
+termx-protocol = { path = "../termx-protocol" }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[dev-dependencies]
+# 集成测试起真实 service 与真实 PTY/ConPTY，并解码 output 事件。
+base64 = { workspace = true }
+tempfile = "3"
+termx-core = { path = "../termx-core" }
+termx-service = { path = "../termx-service" }

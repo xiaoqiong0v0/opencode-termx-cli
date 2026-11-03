@@ -2,7 +2,7 @@
 
 用 Rust 重写终端会话/进程监督层的独立项目，目标是为本地终端与 SSH 终端提供**真实进程状态**、**精确退出/中断**和**交互事件**，而不是依赖输出文本中的完成标记。
 
-> 当前状态：需求与关键决策（OQ-1~6）已确认；M0 工程骨架（Cargo workspace、协议类型、CI 门禁）已建立，进入 M1（service 骨架）。协议/开发计划仍随实现定稿。先读 `docs/REQUIREMENTS.md` 与 `docs/PROTOCOL.md`。
+> 当前状态：**M0–M5 已完成**——协议、service（WS/token/hello）、本地 PTY/stdio、交互识别、`termx-client` 客户端库与 `termx-cli` 均已落地并有集成测试；M6（SSH/helper）待实现。先读 `docs/REQUIREMENTS.md`、`docs/PROTOCOL.md` 与 `docs/ADAPTER.md`。
 
 > 架构：**中心化 termx service**。终端归服务所有；opencode 模型/Web/CLI 都是客户端，经**本机 WebSocket（环回）+ token** 访问。opencode 会话重启只 detach，不杀终端。
 
@@ -24,6 +24,8 @@
 - `docs/DEV_PLAN.md`：技术选型、crate 结构、里程碑 M0–M6、门禁、测试策略、风险。
 - `docs/ARCHITECTURE.md`：分层、事件状态机、依赖与质量门禁。
 - `docs/REFERENCE_AND_PITFALLS.md`：旧实现可参考点、已知坑、设计约束。
+- `docs/ADAPTER.md`：opencode `termx_*` 工具 → RPC 映射与事件通知契约。
+- `docs/ASYNC.md`：并发交互点清单（共享状态/保护手段/顺序契约）。
 
 ## 实现顺序
 见 `docs/DEV_PLAN.md` 的里程碑 M0–M6：工程骨架 → service 骨架 → 本地 PTY → stdio/流控 → 交互识别 → CLI/adapter → SSH/helper。
@@ -35,6 +37,34 @@
 - **自研**：VT/ANSI 解析、屏幕/滚动缓冲、光标/模式、键盘编码、粘贴/焦点、进程组/前台进程、事件状态机。
 - 终端核心跑在**独立 daemon 进程**，绝不继承 opencode 的 stdin/stdout/控制终端；CLI/opencode 通过 WebSocket（环回）/JSON 事件通信。
 - 如果连 OS PTY/ConPTY 都不允许：只能支持普通程序的 stdin/stdout 管道模式，无法可靠支持 vim/top/ssh 密码提示等全屏交互程序；这是范围裁剪，不是实现细节。
+
+## CLI 用法（M5b）
+`termx-cli` 默认从 `TERMX_CONFIG_DIR`（否则平台配置目录）读取 `port` 与 `token` 自动连接本机 service；也可用 `--endpoint` / `--token` / `--config-dir` 覆盖。`--endpoint` 只替换地址，token 仍按 `--token` > `TERMX_TOKEN` > token 文件解析；endpoint 必须是 `ws://127.0.0.1:<port>` 或 `ws://[::1]:<port>`。全局参数 `--root-session-id`（默认 `TERMX_ROOT_SESSION_ID` 或 `default`）、`--name`、`--force`、`--json` 在子命令前后都可写。
+
+```sh
+# 创建并跟随一个命名 PTY（默认 %COMSPEC% / $SHELL）
+termx-cli local --name build --follow
+
+# 空闲 30 分钟后断开（终端继续运行）；动作可改为 terminate
+termx-cli local --name build --idle-timeout 1800 --idle-action detach
+
+# 一次性执行命令：stdout/stderr 按原字节输出，退出码透传（中断为 130）
+termx-cli exec -- sh -c 'echo out; echo err 1>&2; exit 3'
+termx-cli exec --pty -- cmd.exe /C "echo hi"
+
+# 终端操作：--name 与 --root-session-id 组合定位，或直接用 --terminal-id
+termx-cli list
+termx-cli status --name build
+termx-cli read --name build --cursor 0 --max-bytes 65536
+termx-cli send --name build --text "make test" --enter   # 同一连接内自动 claim
+termx-cli resize --name build --cols 120 --rows 30
+termx-cli terminate --name build --force
+
+# 机器可读：事件/结果为单行 JSON（output 以 base64 承载）
+termx-cli --json list
+```
+
+CLI 是「一次调用一条连接」：`send` 会在同一连接内先自动 `claim` 再发送；`--force` 可抢占他人持有的 lease。`ssh` 子命令在 M6 之前返回「M6 未实现」并以非零码退出。
 
 ## 构建与测试
 要求 stable Rust ≥ 1.85（edition 2024）。仓库提交 `Cargo.lock`，本机与 CI 门禁统一使用 `--locked`：

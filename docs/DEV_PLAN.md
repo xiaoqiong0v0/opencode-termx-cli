@@ -37,11 +37,12 @@ termx/
 │  ├─ termx-ssh/             # SSH 连接、PTY、helper 握手/降级
 │  ├─ termx-core/            # 会话状态机、registry、事件总线、背压
 │  ├─ termx-service/         # daemon：传输、鉴权、RPC、订阅
+│  ├─ termx-client/          # 客户端库：发现/hello/请求配对/事件广播（CLI 与 adapter 共用）
 │  ├─ termx-cli/             # 客户端：local/ssh/exec/status/read/send/...
 │  └─ termx-helper/          # 远端 sidecar（可单独构建/交叉编译）
 └─ adr/                      # 架构决策记录（选型留痕）
 ```
-依赖方向：`protocol` ← `terminal`/`proc`/`ssh` ← `core` ← `service`/`cli`；`helper` 只依赖 `protocol`+`proc` 子集。
+依赖方向：`protocol` ← `terminal`/`proc`/`ssh` ← `core` ← `service`；`termx-client` 只依赖 `protocol`，由 `cli`/adapter 复用；`helper` 只依赖 `protocol`+`proc` 子集。
 
 ## 4. 里程碑
 ### M0 工程骨架
@@ -67,6 +68,7 @@ termx/
 ### M5 CLI + adapter
 - 交付：CLI 全子命令；opencode adapter 薄层（`termx_*` 工具）；Web 客户端订阅同一协议。
 - 门禁：端到端 US-1~US-6；WebSocket JSON 事件可回放。
+- 已完成（M5b）：`termx-cli` 子命令（`local` / `exec` / `status` / `list` / `read` / `send` / `resize` / `signal` / `terminate` / `prune` / `attach` / `detach` / `claim` / `release`）与集成测试；`ssh` 返回 M6 未实现错误。`exec` 透传子进程退出码，`interrupted` 固定 130；`send` 在单次连接内自动 claim（`--force` 可抢占他人 lease）。
 
 ### M6 SSH + helper
 - 交付：`russh` SSH PTY、exit/断线终态；helper 分发/校验/握手/降级；`capabilities`/`bestEffort`。

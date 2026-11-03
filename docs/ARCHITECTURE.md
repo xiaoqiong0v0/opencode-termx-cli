@@ -59,6 +59,7 @@ idle_timeout > 0：按配置仅 detach 或 terminate
 - `opencode adapter`：薄层，把模型工具调用映射为 service RPC；不解析终端渲染状态。
 - `Web`：订阅同一 service 事件；raw/transcript/命令输入都走 service，不直连本地 PTY。
 - `CLI`：调试/运维客户端，和 Web 使用同一协议。
+- `termx-client`：CLI 与 opencode adapter 共用的客户端库，负责服务发现、`hello`、按 `id` 配对请求与 `broadcast` 事件；不解析终端渲染状态。
 - 多客户端：同一 terminal 可多 attach；输入冲突需定义 owner/lease，至少保证输出广播顺序。
 
 ## 5. 事件状态机
