@@ -38,6 +38,8 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 
 # M2c1：PTY 输出按协议要求以 base64 承载。
 base64 = "0.22"
+# M6b-2：helper 分发时的 sha256 校验（与 russh 传递依赖同版本）。
+sha2 = "0.11"
 
 # M5b：CLI 子命令解析。
 clap = { version = "4", features = ["derive"] }

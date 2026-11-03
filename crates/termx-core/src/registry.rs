@@ -429,6 +429,7 @@ impl Registry {
             idle_timeout: params.idle_timeout,
             lease: None,
             pending_interrupt: None,
+            capabilities: backend.capabilities(),
             analyzer: InteractionAnalyzer::with_start_time(
                 self.interaction_config,
                 OffsetDateTime::now_utc(),
@@ -1586,9 +1587,11 @@ fn canonical_signal(name: &str) -> Option<&'static str> {
 
 /// 信号编号 → 协议信号名；未知编号原样格式化为 `SIG<n>`。
 ///
-/// v0 的 Unix 基线为 Linux 编号；Windows 不会产生信号终止。
+/// `0` 是 SSH 层对“无法识别的信号名”的占位值，映射为 `"UNKNOWN"`，
+/// 不伪造具体信号。v0 的 Unix 基线为 Linux 编号；Windows 不会产生信号终止。
 fn signal_name(signal: i32) -> String {
     let name = match signal {
+        0 => "UNKNOWN",
         1 => "SIGHUP",
         2 => "SIGINT",
         3 => "SIGQUIT",
@@ -1747,6 +1750,9 @@ fn base64_decoded_len(data: &str) -> u64 {
 /// `mode` 由默认 [`ModeFactory`] 路由；pty/stdio 都是合法模式。
 fn validate_create(params: &CreateParams) -> Result<(), CoreError> {
     validate_name(&params.name)?;
+    if params.ssh.is_some() && params.mode != Mode::Pty {
+        return Err(CoreError::BadRequest("SSH 终端仅支持 pty 模式".to_string()));
+    }
     if let Some(idle_timeout) = &params.idle_timeout {
         idle_timeout
             .validate()
@@ -1793,6 +1799,7 @@ mod tests {
             name: name.to_string(),
             force,
             idle_timeout: None,
+            ssh: None,
         }
     }
 

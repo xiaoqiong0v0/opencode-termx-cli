@@ -63,7 +63,7 @@
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
 | `hello` | `{ proto, token, client }` | `{ proto, server, capabilities }` |
-| `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"} }` | `{ terminal_id, cursor }` |
+| `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, accept_any_host_key? } }` | `{ terminal_id, cursor }` |
 | `terminal.claim` | `{ locator, force? }` | `{ owner, lease }` |
 | `terminal.release` | `{ locator }` | `{ ok }` |
 | `terminal.attach` | `{ locator, cursor? }` | `{ cursor, snapshot, reset? }` |
@@ -81,6 +81,17 @@
 
 约束：
 - `pty` 必带 `cols/rows`（可默认）；`stdio` 忽略尺寸。
+- `ssh?`：存在时 `mode` 必须为 `pty`，由 SSH 后端建立远端会话；`cmd` 为空或 `"shell"` 时申请交互式 shell，否则把 `cmd + args` 按 POSIX 单引号规则拼成远端命令（helper 模式下直接作为 `spawn.cmd/args`，不经 shell 二次分词）。
+  - `auth`：`{ type:"password", password }` 或 `{ type:"key", path, passphrase? }`；`Debug` 输出遮蔽密码/口令，凭据不落日志。
+  - `accept_any_host_key` 缺省 `false`：要求 known_hosts 存在可信记录；缺失/不匹配以明确错误失败。仅测试或用户显式开启时置 `true`。
+  - helper 启用判定：`helper_path` 非空，或 `upload_helper=true`；两者互斥。
+    - `upload_helper` 缺省 `false`：使用 `helper_path` 指向的**远端已存在** helper，不写远端文件；`helper_sha256` 可选，用于 `sha256sum` 校验该文件。
+    - `upload_helper=true`：必须同时提供 `helper_local_path`（本地二进制），不得再设 `helper_path`；二进制上传到远端 `mktemp -d` 新建的 700 私有目录内固定文件名 `termx-helper`，`chmod 700` + `sha256sum` 校验后执行。`helper_sha256` 可选，用于校验本地与远端二进制。
+    - 非法组合（`upload_helper=true` 缺 `helper_local_path`、与 `helper_path` 同时出现、`helper_path` 含空白/控制字符、未上传却设 `helper_local_path`、`helper_sha256` 缺 `helper_path`）一律 `bad_request`，不静默回退。
+  - helper 成功时 `started` 带远端真实 `pid`/`pgid`，`foreground_pgrp` 为根进程组，`tree` 由 helper 提供，`cwd`/`env` 生效。
+  - helper 不可用（未配置、上传/摘要/握手/版本/`spawn` 失败）：关闭 helper 通道并回退 fallback（`helper:false`、`bestEffort:true`、`version:"russh-fallback"`），不阻塞普通命令。请求包含 `cwd`/`env` 时因 fallback 无法应用而返回 `bad_request`（SSH 层同样拒绝，不只依赖 core 工厂）。
+  - fallback 远端 `pid`/`pgid` 为 `0`；`foreground_pgrp` 缺省、`tree` 为空；无 `exit-status`（仅 channel 关闭）时退出码为 `-1`（best-effort）。
+  - 终端级能力经 `attach`/`status` 的 `snapshot.capabilities` 暴露（见 §7）；`hello.capabilities` 是服务级声明，不代表任一终端的 helper 状态。
 - `env?` 为 **JSON 对象 map**（如 `{"TERM":"xterm-256color"}`），不是元组/二元数组。
 - `idle_timeout` 省略或 `value=0` 表示**永不超时**；`action` 仅在 `value>0` 时必填，`value=0` 可缺省。默认 `0`。该规则由 `IdleTimeout::validate` 校验，`terminal.create` 在创建终端前调用。
 - `last_activity` 由 `terminal.create` 写入的 `started` 事件初始化；此后在 `output`、`terminal.send`、`terminal.attach`、`terminal.resize` 时刷新为服务端当前时间（RFC3339 UTC）；`idle_timeout` 的 `detach` 动作会在发送 `detached{reason:"idle_timeout"}` 后刷新它，避免同一空闲周期重复触发。
@@ -118,8 +129,12 @@
 | `exited` | `exit_code` | **终态** |
 | `interrupted` | `signal, source` | **终态** |
 | `error` | `code, message, retryable` | **终态**（含 `service_lost`） |
-| `capabilities` | `helper, version, bestEffort` | SSH/helper 能力与降级标识 |
+| `capabilities` | `helper, version, bestEffort` | 某终端的 SSH/helper 能力与降级标识（终端级） |
 
+- `capabilities` 的层级语义：
+  - `hello.capabilities` 是**服务级**声明（当前 `helper:false`、`version` 为协议版本），只表示服务自身能力，不代表任何终端的 helper 状态；
+  - 终端级能力只通过 `attach`/`status` 的 `snapshot.capabilities` 或该终端的事件流暴露；客户端不得用 `hello.capabilities` 推断某个 SSH 终端是否启用 helper。
+- `snapshot.foreground_pgrp` 以后端上报为准：helper 模式为会话根进程组（当前实现不随前台作业切换），fallback 无值（字段缺省）。
 - 所有事件共用每终端单调 `seq`；`output_dropped` 作为**新事件**分配自己的单调 `seq`（不复用被丢输出的 `seq`），使缺口可检测。
 - `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
 - 区间只包含**实际被丢弃的 `output`**：状态事件永不丢弃；若被淘汰的 output 之间夹有状态事件，服务端按连续区间拆成多条 `output_dropped`，每条区间互不重叠且按 `from_seq` 升序。
@@ -130,7 +145,7 @@
   - `no_output` 由静默启发式产生：前台存在子进程时为 `medium`，仅 shell 静默时为 `low`；
   - 同一 `(confidence, reason)` 默认按节流间隔重复投递；`waiting_input` **不是终态**，也不会清除历史提示，命令开始执行后不再产生新的等待事件。
   - `stdin_blocked` 需要真实阻塞态证据（`wchan`/fd 等），当前版本不伪造该 reason，保留给具备阻塞态采集的平台实现。
-- `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`。
+- `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；无法识别的信号名映射为 `"UNKNOWN"`，不猜测为 `SIGTERM`。`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`。
 - `reason` 与 `source` 按字符串处理：未知取值**原样透传**（前向兼容），客户端不得因未识别值拒绝事件。
 - 快照 `snapshot` 结构：
   ```jsonc
@@ -196,22 +211,37 @@
   { "method": "resize", "cols": 120, "rows": 30 }
   { "method": "signal", "signal": "SIGINT" }
   { "method": "terminate" }
+  { "method": "tree" }
 
   // 响应/事件
   { "type": "started", "pid": 123, "pgid": 123 }
   { "type": "output", "data": "aGVsbG8=", "stream": "pty" }
   { "type": "exited", "code": 0 }
   { "type": "signaled", "signal": "SIGTERM" }
+  { "type": "tree", "processes": [{ "pid": 123, "ppid": 100, "pgid": 123, "cmd": "sh" }] }
   { "type": "error", "code": "spawn_failed", "message": "启动失败" }
   ```
-- helper 随 SSH 通道分发、sha256 校验与失败降级到 `capabilities{helper:false, bestEffort:true}` 属 M6b；M6a 只定义并实现本地 stdio 协议。
+- `tree` 为同步请求/响应：helper 按请求顺序返回一条 `tree` 事件；无活动会话时 `processes` 为空。客户端按发送顺序配对（同一连接内串行 tree 请求）。
+- helper 随 SSH 通道分发、sha256 校验与失败降级属 M6b-2；M6a 只定义并实现本地 stdio 协议。
+- M6b-1 已实现 **无 helper 的 SSH fallback**（russh 客户端）：`terminal.create` 带 `ssh` 时直接 `exec` 或 `request_pty + request_shell`，能力固定为 `capabilities{helper:false, bestEffort:true, version:"russh-fallback"}`。
+- M6b-2 已实现 **helper 分发/握手/降级**：
+  - 上传模式（`helper_local_path` + `upload_helper=true`）：远端 `mktemp -d /tmp/termx-helper.XXXXXXXXXX` 创建唯一私有目录（700），把本地二进制写入目录内固定文件名 `termx-helper`（`set -C` 拒绝复用已存在路径，`umask 077`），随后 `chmod 700` 并用 `sha256sum` 校验；
+  - 非上传模式：只使用 `helper_path` 指向的远端已存在文件（可选 `sha256sum` 校验），不写远端；
+  - 校验通过后 `exec <helper> serve`，握手 `hello`/`hello_ok`（`proto` 必须为 `termx-helper/1`），再 `spawn` 取得 `started.pid/pgid`；
+  - 成功时能力为 `{helper:true, version:"termx-helper/1", bestEffort:false}`，`pid`/`pgid`/`tree` 由 helper 提供，`foreground_pgrp` 为根进程组，`cwd`/`env` 生效；
+  - 上传失败、摘要不符、握手失败、版本不符或 `spawn` 失败：关闭 helper 通道、清理本次临时目录并回退 fallback（`helper:false`、`bestEffort:true`），不阻塞普通命令；请求包含 `cwd`/`env` 时因 fallback 无法应用而返回明确错误。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全
 - 不记录原始输入/输出与密钥；事件日志只留元数据与 seq。
 - 密码/口令类输入默认不回显存储；service 不落盘原始输入输出。
 - base64 仅用于传输，不做加密；传输安全性依赖本机 socket/pipe 权限 + token。
-- helper 分发时需 sha256 校验；不在命令行/日志暴露凭据（M6a 本地 stdio 不涉及分发）。
+- helper 分发时必须 sha256 校验，且只写本次连接创建的私有临时目录：
+  - 目录由远端 `mktemp -d /tmp/termx-helper.XXXXXXXXXX` 创建并 `chmod 700`，目录内固定文件名 `termx-helper`；写入使用 `set -C`（noclobber）+ `umask 077`，**拒绝复用/覆盖已存在路径**；随后 `chmod 700` + `sha256sum` 校验。
+  - 清理只对本次创建且格式校验通过的目录执行 `rm -rf --`；任一步失败、上传成功但握手前超时/取消、会话终态或连接断开都会清理。清理由上传阶段的守卫兜底（取消时把连接移入后台清理任务），不依赖调用方补救。
+  - **绝不覆盖或删除用户配置的 `helper_path`**；非上传模式不写远端，`helper_path` 仅在不上传（远端已存在）模式下使用。
+  - 不在命令行/日志暴露凭据；上传/校验/清理命令只拼接路径与十六进制摘要（M6a 本地 stdio 不涉及分发）。
+- SSH 密码/私钥口令只经 `terminal.create` 参数传输并仅存于进程内存；`SshConfig`/`SshAuth` 的 `Debug` 输出遮蔽凭据，不写文件、不进日志，也不使用系统 `ssh`/`scp`。上传/校验命令只拼接路径与十六进制摘要，不含凭据。
 
 ## 13. 终态后操作契约（固定，避免歧义）
 | 操作 | 未知 terminal_id/键 | 已知且已终态 |

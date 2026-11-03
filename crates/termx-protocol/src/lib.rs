@@ -4,7 +4,7 @@
 //! 约定：每个 WebSocket text frame 承载一个完整 JSON 对象；事件无 `id`，
 //! 以 `terminal_id` + 每终端单调 `seq` 定位；`ts` 为 RFC3339 UTC 字符串。
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +105,98 @@ pub enum Mode {
     Pty,
     /// 管道 stdio 模式。
     Stdio,
+}
+
+/// SSH 认证方式。
+///
+/// `Debug` 实现会遮蔽密码/口令；`Serialize` 保留原值以便经本机 WebSocket 传输，
+/// 调用方不得把本类型或 [`SshConfig`] 以 Debug/日志形式输出。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SshAuth {
+    /// 密码认证。
+    Password {
+        /// 登录密码（Debug 时遮蔽）。
+        password: String,
+    },
+    /// 私钥认证（M6b-1 预留，russh 侧已接线）。
+    Key {
+        /// 私钥文件路径。
+        path: String,
+        /// 私钥口令（Debug 时遮蔽）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        passphrase: Option<String>,
+    },
+}
+
+impl fmt::Debug for SshAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Password { .. } => formatter
+                .debug_struct("Password")
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Key { path, passphrase } => formatter
+                .debug_struct("Key")
+                .field("path", path)
+                .field("passphrase", &passphrase.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
+}
+
+/// `terminal.create` 的 SSH 连接参数。
+///
+/// 存在该字段时 `mode` 必须为 [`Mode::Pty`]，由 termx-ssh 建立远端会话。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    /// 主机名或 IP。
+    pub host: String,
+    /// 端口。
+    pub port: u16,
+    /// 登录用户。
+    pub user: String,
+    /// 认证方式。
+    pub auth: SshAuth,
+    /// 远端已存在的 helper 路径；仅在 `upload_helper=false` 时使用。
+    ///
+    /// 必须是单个路径（拒绝空白/控制字符）；与 `upload_helper=true` 互斥。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub helper_path: Option<String>,
+    /// 本地 helper 二进制路径；`upload_helper=true` 时上传到远端专用临时目录。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub helper_local_path: Option<String>,
+    /// 期望的 helper 二进制 sha256（小写十六进制）；不匹配时不使用 helper。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub helper_sha256: Option<String>,
+    /// 是否把 `helper_local_path` 上传到远端 `mktemp -d` 新建的私有目录（默认 false）。
+    ///
+    /// 为 `true` 时必须提供 `helper_local_path`，且不得同时设置 `helper_path`。
+    #[serde(default)]
+    pub upload_helper: bool,
+    /// 是否接受任意主机密钥。
+    ///
+    /// 仅测试或用户显式开启时置 `true`；否则要求 known_hosts 中存在可信记录，
+    /// 缺失/不匹配时连接以明确错误失败。
+    #[serde(default)]
+    pub accept_any_host_key: bool,
+}
+
+impl fmt::Debug for SshConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SshConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("auth", &self.auth)
+            .field("helper_path", &self.helper_path)
+            .field("helper_local_path", &self.helper_local_path)
+            .field("helper_sha256", &self.helper_sha256)
+            .field("upload_helper", &self.upload_helper)
+            .field("accept_any_host_key", &self.accept_any_host_key)
+            .finish()
+    }
 }
 
 /// 协议错误码，序列化为 snake_case。
@@ -357,6 +449,9 @@ pub struct TerminalSnapshot {
     pub rows: u16,
     /// 当前事件缓冲基线游标。
     pub cursor: u64,
+    /// 后端能力；SSH fallback 时 `helper=false`、`bestEffort=true`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
 }
 
 /// `terminal.read` 返回的一段输出。
@@ -446,6 +541,9 @@ pub struct CreateParams {
     /// 空闲超时；缺省表示永不超时。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<IdleTimeout>,
+    /// SSH 连接参数；存在时走远端 SSH 后端（fallback 模式）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshConfig>,
 }
 
 /// `terminal.create` 结果。
@@ -1049,6 +1147,7 @@ mod tests {
             name: "build".to_string(),
             force: true,
             idle_timeout,
+            ssh: None,
         }
     }
 
@@ -1077,6 +1176,44 @@ mod tests {
             let back: CreateParams = from_json(&json).expect("反序列化失败");
             assert_eq!(params, back);
         }
+    }
+
+    #[test]
+    fn ssh_config_round_trips_and_debug_redacts_secrets() {
+        let config = SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: 2222,
+            user: "afubek".to_string(),
+            auth: SshAuth::Password {
+                password: "s3cret-pass".to_string(),
+            },
+            helper_path: Some("/usr/local/bin/termx-helper".to_string()),
+            helper_local_path: Some("./target/termx-helper".to_string()),
+            helper_sha256: Some("0123456789abcdef".to_string()),
+            upload_helper: true,
+            accept_any_host_key: true,
+        };
+
+        let back: SshConfig =
+            from_json(&to_json(&config).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(config, back, "serde 需保留原值供本机传输");
+
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("s3cret-pass"),
+            "Debug 不得泄露密码: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "Debug 应标注遮蔽: {debug}");
+
+        let key = SshAuth::Key {
+            path: "/home/afubek/.ssh/id_ed25519".to_string(),
+            passphrase: Some("key-pass".to_string()),
+        };
+        let key_debug = format!("{key:?}");
+        assert!(
+            !key_debug.contains("key-pass"),
+            "Debug 不得泄露口令: {key_debug}"
+        );
     }
 
     #[test]
@@ -1131,6 +1268,7 @@ mod tests {
             cols: 120,
             rows: 30,
             cursor: 42,
+            capabilities: None,
         }
     }
 
@@ -1189,10 +1327,11 @@ mod tests {
             name: "io".to_string(),
             force: false,
             idle_timeout: None,
+            ssh: None,
         };
         let params_json: JsonValue =
             serde_json::from_str(&to_json(&params).expect("序列化失败")).expect("JSON 解析失败");
-        for key in ["cwd", "env", "cols", "rows", "idle_timeout"] {
+        for key in ["cwd", "env", "cols", "rows", "idle_timeout", "ssh"] {
             assert!(params_json.get(key).is_none(), "{key} 不应出现在 JSON 中");
         }
 

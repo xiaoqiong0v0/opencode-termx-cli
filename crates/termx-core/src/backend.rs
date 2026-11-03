@@ -16,7 +16,8 @@ use std::sync::{
 };
 
 use termx_proc::{ProcError, ProcEvent, PtyConfig, PtySession, StdioSession};
-use termx_protocol::{CreateParams, Mode, ProcNode};
+use termx_protocol::{Capabilities, CreateParams, Mode, ProcNode};
+use termx_ssh::{SshConnectRequest, SshError, SshSession, helper_enabled};
 use tokio::sync::mpsc::{Receiver, channel};
 
 use crate::CoreError;
@@ -61,6 +62,14 @@ pub trait TerminalBackend: Send + Sync {
     fn signal(&self, name: &str) -> Result<(), CoreError>;
     /// 终止后端进程树（幂等）。
     fn terminate(&self);
+
+    /// 后端能力；默认 `None`（本地 PTY/stdio 不降级）。
+    ///
+    /// SSH fallback 返回 `helper=false`、`bestEffort=true`，由 registry 写入
+    /// 快照并经 `attach`/`status` 暴露给客户端。
+    fn capabilities(&self) -> Option<Capabilities> {
+        None
+    }
 }
 
 /// 后端工厂：把 `terminal.create` 参数变成真实进程或 mock 进程。
@@ -282,7 +291,112 @@ impl BackendFactory for StdioFactory {
     }
 }
 
-/// 按 `mode` 路由到真实 PTY / stdio 工厂；registry 的默认工厂。
+/// SSH 后端：包装 [`termx_ssh::SshSession`]。
+///
+/// helper 模式下 `pid` / `pgid` 来自远端 `started`，`tree` 经 helper 协议查询，
+/// `foreground_pgrp` 使用根进程组；fallback 模式固定为 0 / 空 / `None`。
+pub struct SshBackend {
+    /// 底层 SSH 会话句柄（内部为控制通道，方法均非阻塞）。
+    session: SshSession,
+}
+
+impl SshBackend {
+    /// 包装一个已建立的 SSH 会话。
+    pub fn new(session: SshSession) -> Self {
+        Self { session }
+    }
+}
+
+impl TerminalBackend for SshBackend {
+    fn pid(&self) -> u32 {
+        self.session.pid()
+    }
+
+    fn pgid(&self) -> u32 {
+        self.session.pgid()
+    }
+
+    fn foreground_pgrp(&self) -> Option<u32> {
+        self.session.foreground_pgrp()
+    }
+
+    fn tree(&self) -> Vec<ProcNode> {
+        self.session.tree()
+    }
+
+    fn write(&self, data: &[u8]) -> Result<(), CoreError> {
+        self.session.write(data).map_err(map_ssh_error)
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), CoreError> {
+        self.session.resize(cols, rows).map_err(map_ssh_error)
+    }
+
+    fn signal(&self, name: &str) -> Result<(), CoreError> {
+        self.session.signal(name).map_err(map_ssh_error)
+    }
+
+    fn terminate(&self) {
+        self.session.terminate();
+    }
+
+    fn capabilities(&self) -> Option<Capabilities> {
+        Some(self.session.capabilities())
+    }
+}
+
+/// 把 `termx-ssh` 错误映射为 core 错误。
+fn map_ssh_error(error: SshError) -> CoreError {
+    match error {
+        SshError::UnsupportedSignal(name) => CoreError::UnsupportedSignal(name),
+        SshError::BadRequest(message) => CoreError::BadRequest(message),
+        other => CoreError::BackendFailed(other.to_string()),
+    }
+}
+
+/// SSH 工厂：存在 `params.ssh` 时建立远端会话。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SshFactory;
+
+impl BackendFactory for SshFactory {
+    fn spawn(&self, params: &CreateParams) -> Result<SpawnedBackend, CoreError> {
+        let config = params
+            .ssh
+            .as_ref()
+            .ok_or_else(|| CoreError::BadRequest("SSH 工厂缺少 ssh 参数".to_string()))?;
+        if params.mode != Mode::Pty {
+            return Err(CoreError::BadRequest("SSH 终端仅支持 pty 模式".to_string()));
+        }
+        // 远端 cwd/env 只能由 helper 应用；未启用 helper 时明确拒绝，避免静默忽略。
+        // 判定口径与 termx-ssh 的校验共用 `helper_enabled`，避免两处漂移。
+        if !helper_enabled(config) {
+            if params.cwd.is_some() {
+                return Err(CoreError::BadRequest("SSH 终端暂不支持 cwd".to_string()));
+            }
+            if params.env.as_ref().is_some_and(|env| !env.is_empty()) {
+                return Err(CoreError::BadRequest("SSH 终端暂不支持 env".to_string()));
+            }
+        }
+
+        let request = SshConnectRequest::from_create(
+            &params.cmd,
+            &params.args,
+            params.cols.unwrap_or(DEFAULT_PTY_COLS),
+            params.rows.unwrap_or(DEFAULT_PTY_ROWS),
+        )
+        .with_working_dir(params.cwd.clone(), params.env.clone());
+        let (session, events) =
+            SshSession::connect(config, request).map_err(|error| match error {
+                SshError::BadRequest(message) => CoreError::BadRequest(message),
+                other => CoreError::SpawnFailed {
+                    message: other.to_string(),
+                },
+            })?;
+        Ok((Arc::new(SshBackend::new(session)), events))
+    }
+}
+
+/// 按 `params.ssh` 与 `mode` 路由到 SSH / PTY / stdio 工厂；registry 的默认工厂。
 ///
 /// 测试仍可用 [`crate::MockFactory`] 注入单一 mock 工厂，此时所有模式都走 mock。
 pub struct ModeFactory {
@@ -290,12 +404,27 @@ pub struct ModeFactory {
     pty: Arc<dyn BackendFactory>,
     /// stdio 模式工厂。
     stdio: Arc<dyn BackendFactory>,
+    /// SSH 工厂。
+    ssh: Arc<dyn BackendFactory>,
 }
 
 impl ModeFactory {
-    /// 用自定义子工厂构造路由器（便于测试或替换平台实现）。
+    /// 用自定义 pty/stdio 子工厂构造路由器（SSH 使用默认 [`SshFactory`]）。
     pub fn new(pty: Arc<dyn BackendFactory>, stdio: Arc<dyn BackendFactory>) -> Self {
-        Self { pty, stdio }
+        Self {
+            pty,
+            stdio,
+            ssh: Arc::new(SshFactory),
+        }
+    }
+
+    /// 用三个自定义子工厂构造路由器（便于测试或替换实现）。
+    pub fn with_factories(
+        pty: Arc<dyn BackendFactory>,
+        stdio: Arc<dyn BackendFactory>,
+        ssh: Arc<dyn BackendFactory>,
+    ) -> Self {
+        Self { pty, stdio, ssh }
     }
 
     /// 用默认 PTY/stdio 子工厂构造路由器，并指定 stdio 写队列容量。
@@ -305,6 +434,7 @@ impl ModeFactory {
             stdio: Arc::new(StdioFactory::with_write_queue_capacity(
                 write_queue_capacity,
             )),
+            ssh: Arc::new(SshFactory),
         }
     }
 }
@@ -314,12 +444,16 @@ impl Default for ModeFactory {
         Self {
             pty: Arc::new(PtyFactory),
             stdio: Arc::new(StdioFactory::default()),
+            ssh: Arc::new(SshFactory),
         }
     }
 }
 
 impl BackendFactory for ModeFactory {
     fn spawn(&self, params: &CreateParams) -> Result<SpawnedBackend, CoreError> {
+        if params.ssh.is_some() {
+            return self.ssh.spawn(params);
+        }
         match params.mode {
             Mode::Pty => self.pty.spawn(params),
             Mode::Stdio => self.stdio.spawn(params),

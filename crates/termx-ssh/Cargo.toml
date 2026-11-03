@@ -1,6 +1,25 @@
 [package]
 name = "termx-ssh"
-description = "SSH 连接、PTY、helper 握手与降级（M0 占位）"
+description = "SSH 连接、PTY、helper 分发/握手/降级"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+termx-protocol = { path = "../termx-protocol" }
+# 直接复用本地后端的统一事件词表，便于 core/service 用同一摄取路径。
+termx-proc = { path = "../termx-proc" }
+# 0.63.1 是满足 workspace MSRV 1.85 的最新稳定线；仅启用 ring，避免 aws-lc-rs
+# 在 Windows 上额外依赖 C 工具链。
+russh = { version = "0.63.1", default-features = false, features = ["ring"] }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# 版本不匹配测试用本地临时脚本伪造 helper。
+tempfile = "3"

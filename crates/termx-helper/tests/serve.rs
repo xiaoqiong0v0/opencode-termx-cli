@@ -481,6 +481,52 @@ fn terminate_long_running_then_spawn_again() {
     assert_echo_exit(&events);
 }
 
+/// `tree` 请求应返回当前会话进程树；非 Linux 平台返回空列表。
+#[test]
+fn tree_reports_session_processes() {
+    let mut helper = Helper::start();
+    helper.handshake();
+    helper.send(&spawn_long());
+
+    let started = helper.collect_until(|event| {
+        matches!(
+            event,
+            HelperEvent::Started { .. } | HelperEvent::Error { .. }
+        )
+    });
+    let _pid = started_pid(&started);
+
+    helper.send(&HelperRequest::Tree);
+    let events = helper.collect_until(|event| matches!(event, HelperEvent::Tree { .. }));
+    let processes = events
+        .iter()
+        .find_map(|event| match event {
+            HelperEvent::Tree { processes } => Some(processes),
+            _ => None,
+        })
+        .expect("缺少 tree 事件");
+
+    // 只有 Linux 通过 /proc 采集进程树；其它平台按协议返回空列表。
+    #[cfg(target_os = "linux")]
+    assert!(
+        processes.iter().any(|node| node.pid == _pid),
+        "进程树应包含根进程 {_pid}: {processes:?}"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        processes.is_empty(),
+        "非 Linux 平台应返回空树: {processes:?}"
+    );
+
+    helper.send(&HelperRequest::Terminate);
+    let _ = helper.collect_until(|event| {
+        matches!(
+            event,
+            HelperEvent::Exited { .. } | HelperEvent::Signaled { .. } | HelperEvent::Error { .. }
+        )
+    });
+}
+
 /// stdin EOF 应让 helper 终止会话并以 0 退出，不留孤儿。
 #[test]
 fn stdin_eof_cleans_session() {

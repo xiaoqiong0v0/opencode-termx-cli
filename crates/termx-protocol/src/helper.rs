@@ -1,9 +1,10 @@
 //! `termx-helper` sidecar 的 JSON Lines 协议。
 //!
 //! 与主协议一致，本模块只做类型定义，不含任何 OS 依赖：
-//! - 请求以 `method` 为标签（`hello` / `spawn` / `input` / `resize` / `signal` / `terminate`）；
+//! - 请求以 `method` 为标签（`hello` / `spawn` / `input` / `resize` / `signal` /
+//!   `terminate` / `tree`）；
 //! - 响应与事件以 `type` 为标签（`hello_ok` / `started` / `output` / `exited` /
-//!   `signaled` / `error`）。
+//!   `signaled` / `tree` / `error`）。
 //!
 //! 复用主协议的 [`Stream`] 与 [`ErrorCode`]：helper 是主协议链路的延伸，
 //! 客户端已经按同一套错误码与流语义做映射；额外定义一套只会增加两处漂移风险。
@@ -13,7 +14,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ErrorCode, Stream};
+use crate::{ErrorCode, ProcNode, Stream};
 
 /// helper 声明的能力列表，顺序固定，便于测试与文档核对。
 pub const HELPER_CAPABILITIES: &[&str] = &["pty", "proc_tree", "exit_status"];
@@ -68,6 +69,8 @@ pub enum HelperRequest {
     },
     /// 终止整棵进程树并释放 PTY（幂等）。
     Terminate,
+    /// 查询当前会话的远端进程树；无活动会话时返回空列表。
+    Tree,
 }
 
 /// helper 响应/事件（helper → 客户端），以 `type` 为标签。
@@ -104,6 +107,14 @@ pub enum HelperEvent {
     Signaled {
         /// 信号名，如 `SIGTERM`；未知编号回退为 `SIG<num>`。
         signal: String,
+    },
+    /// 进程树快照，对应一次 `tree` 请求。
+    ///
+    /// 请求与响应按 helper 的串行处理顺序一一对应；客户端应用队列保存待回填
+    /// 的请求方，收到本事件时弹出队首。
+    Tree {
+        /// 以会话根进程为起点的进程树；无活动会话时为空。
+        processes: Vec<ProcNode>,
     },
     /// 请求失败或协议违例；不改变当前会话状态。
     Error {
@@ -149,8 +160,17 @@ mod tests {
                 signal: "SIGINT".to_string(),
             },
             HelperRequest::Terminate,
+            HelperRequest::Tree,
         ];
-        let tags = ["hello", "spawn", "input", "resize", "signal", "terminate"];
+        let tags = [
+            "hello",
+            "spawn",
+            "input",
+            "resize",
+            "signal",
+            "terminate",
+            "tree",
+        ];
 
         for (request, tag) in requests.into_iter().zip(tags) {
             let json = serde_json::to_string(&request).expect("请求序列化失败");
@@ -185,13 +205,21 @@ mod tests {
             HelperEvent::Signaled {
                 signal: "SIGTERM".to_string(),
             },
+            HelperEvent::Tree {
+                processes: vec![crate::ProcNode {
+                    pid: 123,
+                    ppid: 100,
+                    pgid: 123,
+                    cmd: "sh".to_string(),
+                }],
+            },
             HelperEvent::Error {
                 code: ErrorCode::SpawnFailed,
                 message: "启动失败".to_string(),
             },
         ];
         let tags = [
-            "hello_ok", "started", "output", "exited", "signaled", "error",
+            "hello_ok", "started", "output", "exited", "signaled", "tree", "error",
         ];
 
         for (event, tag) in events.into_iter().zip(tags) {

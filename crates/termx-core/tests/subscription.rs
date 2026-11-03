@@ -22,6 +22,7 @@ fn params(root_session_id: &str, name: &str) -> CreateParams {
         name: name.to_string(),
         force: false,
         idle_timeout: None,
+        ssh: None,
     }
 }
 

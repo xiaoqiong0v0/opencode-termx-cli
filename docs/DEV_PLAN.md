@@ -1,6 +1,7 @@
 # 开发计划：opencode-termx-cli
 
 日期：2026-11-02
+状态：**M0–M6 已实现并通过 Windows/WSL + 真实 SSH 容器测试**
 依赖：`docs/REQUIREMENTS.md`（范围/验收）、`docs/PROTOCOL.md`（协议权威）
 
 ## 1. 原则
@@ -73,6 +74,8 @@ termx/
 ### M6 SSH + helper
 - 交付：`russh` SSH PTY、exit/断线终态；helper 分发/校验/握手/降级；`capabilities`/`bestEffort`。
 - 门禁：AC-9；helper 缺失/失败回退不阻塞；`capabilities.bestEffort` 正确。
+- **M6b-1 已完成（fallback）**：`CreateParams.ssh`（host/port/user/`SshAuth`/helper_path/helper_local_path/helper_sha256/upload_helper/accept_any_host_key，Debug 遮蔽凭据）；`termx-ssh` 用 russh 0.63.1 连接/认证、`request_pty + request_shell` 或 `exec`、write/resize/signal/terminate、channel EOF/Close 或断连终态（有 exit-status 用，否则 `-1` best-effort）；`termx-core` 的 `SshBackend`/`SshFactory` 与 `ModeFactory` 路由；service 复用同一事件摄取；`snapshot.capabilities` 暴露 `{helper:false,bestEffort:true}`。真实容器测试（exec/shell/service）env-gated。
+- **M6b-2 已完成（helper）**：`SshConfig` 增加 `helper_local_path`/`helper_sha256`/`upload_helper`；上传模式由远端 `mktemp -d /tmp/termx-helper.XXXXXXXXXX` 创建 700 私有目录，写入固定文件名 `termx-helper`（`set -C` 拒绝复用、`umask 077`），随后 `chmod 700` + `sha256sum` 校验；非上传模式只使用 `helper_path`（可选摘要校验）且**绝不删除/覆盖该文件**；`exec <helper> serve` 后完成 `hello`/`hello_ok` 与 `spawn`/`started` 握手。helper 模式下 input/resize/signal/terminate/tree 全部走 helper 协议，`pid`/`pgid`/`tree` 与 `cwd`/`env` 生效、`foreground_pgrp` 为根进程组，能力为 `{helper:true,version,bestEffort:false}`；上传/摘要/版本/握手/spawn 任一失败关闭通道并回退 fallback，本次临时目录在失败、握手前超时/取消（`UploadGuard` 兜底）、会话终态或断连时清理；非法 helper 配置统一 `bad_request`。`termx-protocol::helper` 增加 `tree` 请求与 `tree` 事件；`termx-helper` 在 Linux 读 `/proc` 返回进程树（非 Linux 空列表）。真实容器测试（上传/握手/pid/tree/input/resize/terminate/错误 helper_path/sha 不符/版本不符/临时目录清理/helper_path 不被删除）env-gated。
 
 ## 5. 阶段风险
 | 风险 | 影响 | 缓解 |
@@ -90,7 +93,7 @@ termx/
 - 集成：真实 PTY（`sh`/`pwsh`）、`exit 7`、`kill -TERM`、Ctrl-C、子进程树、关闭无孤儿。
 - stdio：`cat`/自定义 echo 程序、EOF、等待输入。
 - 交互：shell→python→exit；shell→sudo（fake）→回退。
-- SSH：本机 sshd/容器；helper 有/无/失败/断线。
+- SSH：本机 sshd/容器；helper 有/无/失败/断线。M6b-1 的真实连接测试由 `TERMX_TEST_SSH_HOST/PORT/USER/PASSWORD` 驱动，未设置时跳过；密码只在运行时注入环境变量，不写入文件或日志。
 - 平台矩阵：Windows、Linux 为 v0 必过；macOS 后补。
 - 红线：测试不得以文本标记/HTTP 200 作为完成证据。
 

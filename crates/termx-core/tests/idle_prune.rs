@@ -32,6 +32,7 @@ fn params(root_session_id: &str, name: &str, idle_timeout: Option<IdleTimeout>) 
         name: name.to_string(),
         force: false,
         idle_timeout,
+        ssh: None,
     }
 }
 

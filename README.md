@@ -2,7 +2,7 @@
 
 用 Rust 重写终端会话/进程监督层的独立项目，目标是为本地终端与 SSH 终端提供**真实进程状态**、**精确退出/中断**和**交互事件**，而不是依赖输出文本中的完成标记。
 
-> 当前状态：**M0–M5 已完成**——协议、service（WS/token/hello）、本地 PTY/stdio、交互识别、`termx-client` 客户端库与 `termx-cli` 均已落地并有集成测试；M6（SSH/helper）待实现。先读 `docs/REQUIREMENTS.md`、`docs/PROTOCOL.md` 与 `docs/ADAPTER.md`。
+> 当前状态：**M0–M6 已完成**——协议、service（WS/token/hello）、本地 PTY/stdio、交互识别、`termx-client`/`termx-cli`、SSH（russh）与 `termx-helper` 分发/回退均已落地；Windows/WSL 与真实 SSH 容器测试通过。先读 `docs/REQUIREMENTS.md`、`docs/PROTOCOL.md` 与 `docs/ADAPTER.md`。
 
 > 架构：**中心化 termx service**。终端归服务所有；opencode 模型/Web/CLI 都是客户端，经**本机 WebSocket（环回）+ token** 访问。opencode 会话重启只 detach，不杀终端。
 

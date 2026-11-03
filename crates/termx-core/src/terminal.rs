@@ -3,7 +3,8 @@
 use std::{fmt, sync::Arc};
 
 use termx_protocol::{
-    Confidence, EventKind, IdleTimeout, InteractionState, LifecycleState, Mode, TerminalSnapshot,
+    Capabilities, Confidence, EventKind, IdleTimeout, InteractionState, LifecycleState, Mode,
+    TerminalSnapshot,
 };
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -104,6 +105,8 @@ pub struct TerminalEntry {
     pub pending_interrupt: Option<PendingInterrupt>,
     /// 每终端一份的交互识别状态机。
     pub(crate) analyzer: InteractionAnalyzer,
+    /// 后端能力；SSH fallback 为 `Some(helper=false, bestEffort=true)`。
+    pub capabilities: Option<Capabilities>,
     /// 后端进程句柄。
     pub backend: Arc<dyn TerminalBackend>,
 }
@@ -174,6 +177,7 @@ impl TerminalEntry {
             cols: self.cols,
             rows: self.rows,
             cursor: self.seq,
+            capabilities: self.capabilities.clone(),
         }
     }
 }
@@ -228,6 +232,7 @@ mod tests {
             idle_timeout: None,
             lease: None,
             pending_interrupt: None,
+            capabilities: None,
             analyzer: InteractionAnalyzer::with_start_time(
                 crate::InteractionConfig::default(),
                 OffsetDateTime::now_utc(),

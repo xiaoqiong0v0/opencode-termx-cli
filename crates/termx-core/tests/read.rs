@@ -19,6 +19,7 @@ fn params(name: &str) -> CreateParams {
         name: name.to_string(),
         force: false,
         idle_timeout: None,
+        ssh: None,
     }
 }
 

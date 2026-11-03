@@ -18,8 +18,8 @@ mod terminal;
 
 pub use backend::{
     BackendFactory, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, MOCK_PID_START, MockBackend, MockFactory,
-    ModeFactory, PtyBackend, PtyFactory, SpawnedBackend, StdioBackend, StdioFactory,
-    TerminalBackend,
+    ModeFactory, PtyBackend, PtyFactory, SpawnedBackend, SshBackend, SshFactory, StdioBackend,
+    StdioFactory, TerminalBackend,
 };
 pub use error::CoreError;
 pub use event::{

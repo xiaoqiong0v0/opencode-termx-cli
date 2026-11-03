@@ -49,6 +49,7 @@ fn build_params(cli: &Cli, args: &LocalArgs) -> Result<CreateParams, CliError> {
         name: new_terminal_name(cli, "local"),
         force: cli.force,
         idle_timeout: build_idle_timeout(args),
+        ssh: None,
     })
 }
 

@@ -61,6 +61,7 @@ fn build_params(cli: &Cli, args: &ExecArgs) -> Result<CreateParams, CliError> {
         name: new_terminal_name(cli, "exec"),
         force: cli.force,
         idle_timeout: None,
+        ssh: None,
     })
 }
 

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use termx_proc::{OutputStream, ProcError, ProcEvent, PtyConfig, PtySession};
 use termx_protocol::helper::{HELPER_CAPABILITIES, HelperEvent, HelperRequest};
-use termx_protocol::{ErrorCode, HELPER_PROTOCOL_VERSION, Stream, to_json};
+use termx_protocol::{ErrorCode, HELPER_PROTOCOL_VERSION, ProcNode, Stream, to_json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -233,6 +233,7 @@ impl HelperState {
             HelperRequest::Resize { cols, rows } => self.resize(cols, rows, out_tx).await,
             HelperRequest::Signal { signal } => self.signal(signal, out_tx).await,
             HelperRequest::Terminate => self.terminate(out_tx).await,
+            HelperRequest::Tree => self.tree(out_tx).await,
         }
     }
 
@@ -327,6 +328,33 @@ impl HelperState {
         match session_op(&mut self.session, |session| session.terminate()).await {
             Ok(()) => self.running.store(false, Ordering::SeqCst),
             Err(err) => self.report(err, out_tx),
+        }
+    }
+
+    /// 采集当前会话的进程树；无活动会话或采集失败时返回空树。
+    ///
+    /// 只有 Linux 走 `/proc` 采集；其它平台按协议返回空列表，避免把
+    /// “平台不支持”伪装成会话错误。
+    async fn tree(&mut self, out_tx: &UnboundedSender<HelperEvent>) {
+        let processes = self.collect_tree().await;
+        let _ = out_tx.send(HelperEvent::Tree { processes });
+    }
+
+    /// 在阻塞线程池里读取 `/proc`，失败只记日志。
+    async fn collect_tree(&mut self) -> Vec<ProcNode> {
+        #[cfg(target_os = "linux")]
+        {
+            match session_op(&mut self.session, |session| session.tree()).await {
+                Ok(processes) => processes,
+                Err(err) => {
+                    debug!(error = %err, "采集进程树失败，返回空树");
+                    Vec::new()
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
         }
     }
 
