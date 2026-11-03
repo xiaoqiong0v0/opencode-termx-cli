@@ -888,6 +888,9 @@ pub struct PruneParams {
     /// 清理基准。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis: Option<PruneBasis>,
+    /// 是否清理全部终态终端；缺省 `false`，且为空过滤时必须显式置 `true`。
+    #[serde(default)]
+    pub all: bool,
 }
 
 /// `terminal.prune` 结果。
@@ -1595,5 +1598,19 @@ mod tests {
             }
             other => panic!("期望 interactive_changed，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn prune_params_all_defaults_to_false() {
+        let params: PruneParams = from_json("{}").expect("空 PruneParams 反序列化失败");
+        assert!(!params.all, "缺省 all 必须为 false");
+
+        let params: PruneParams = from_json(r#"{"all":true}"#).expect("显式 all 反序列化失败");
+        assert!(params.all);
+
+        let value: JsonValue =
+            serde_json::from_str(&to_json(&PruneParams::default()).expect("序列化失败"))
+                .expect("JSON 解析失败");
+        assert_eq!(value["all"], JsonValue::Bool(false));
     }
 }

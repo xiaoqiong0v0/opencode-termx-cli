@@ -396,7 +396,7 @@ impl Client {
         signal => "terminal.signal", SignalParams, SimpleResult;
         /// 终止终端（`terminal.terminate`）。
         terminate => "terminal.terminate", TerminateParams, SimpleResult;
-        /// 清理终态终端（`terminal.prune`）。
+        /// 清理终态终端（`terminal.prune`）；空过滤需显式 `PruneParams::all = true`。
         prune => "terminal.prune", PruneParams, PruneResult;
         /// 订阅事件（`subscribe`）。
         ///

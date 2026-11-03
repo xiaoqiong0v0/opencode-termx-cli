@@ -75,7 +75,7 @@
 | `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
 | `terminal.signal` | `{ locator, signal }` | `{ ok }` |
 | `terminal.terminate` | `{ locator, force? }` | `{ ok }` |
-| `terminal.prune` | `{ states?, older_than?: {value, unit:"s"\|"ms"}, basis?: "last_activity"\|"created_at" }` | `{ removed }` |
+| `terminal.prune` | `{ states?, older_than?: {value, unit:"s"\|"ms"}, basis?: "last_activity"\|"created_at", all?: boolean }` | `{ removed }` |
 | `subscribe` | `{ terminals?: [{terminal_id, cursor?}], all?: boolean }` | `{ cursors: [{terminal_id, cursor, reset?}] }` |
 | `unsubscribe` | `{ terminals? }` | `{ ok }` |
 
@@ -95,7 +95,7 @@
 - `env?` 为 **JSON 对象 map**（如 `{"TERM":"xterm-256color"}`），不是元组/二元数组。
 - `idle_timeout` 省略或 `value=0` 表示**永不超时**；`action` 仅在 `value>0` 时必填，`value=0` 可缺省。默认 `0`。该规则由 `IdleTimeout::validate` 校验，`terminal.create` 在创建终端前调用。
 - `last_activity` 由 `terminal.create` 写入的 `started` 事件初始化；此后在 `output`、`terminal.send`、`terminal.attach`、`terminal.resize` 时刷新为服务端当前时间（RFC3339 UTC）；`idle_timeout` 的 `detach` 动作会在发送 `detached{reason:"idle_timeout"}` 后刷新它，避免同一空闲周期重复触发。
-- `terminal.prune` 只清理终态终端；`basis` 缺省为 `last_activity`（缺失时回退 `created_at`），`older_than` 缺省表示不做时间过滤；结果 `removed` 为被删除的 `terminal_id` 列表（数量 = 其长度）。
+- `terminal.prune` 只清理终态终端，且**必须显式指定过滤**：`states` 非空、`older_than` 或 `all=true` 至少一个；三者都缺省（或 `states` 为空数组且未给 `older_than`）时返回 `bad_request`，**绝不隐式清理全部终态**。`all=true` 表示清理全部终态终端，并忽略其它过滤；`basis` 缺省为 `last_activity`（缺失时回退 `created_at`），`older_than` 缺省表示不做时间过滤；结果 `removed` 为被删除的 `terminal_id` 列表（数量 = 其长度）。
 - **会话键**为 `(root_session_id, name)`；`terminal_id` 为内部全局唯一标识。`name` 禁止 `/`、`\`、空串，且长度上限为 **64** 个字符（按 Unicode 字符计数）。
 - 同名处理：同一 `(root_session_id, name)` 已存在时，`create` 不带 `force` → `session_exists`（错误载荷的 `terminal_id` 字段携带旧终端 ID，并附说明）；`force=true` → 终止旧终端（落 `interrupted{source:"terminate"}`）后新建。
 - 终端定位：除 `terminal.create` 外，终端级方法的 `locator` 均为 `TerminalLocator`，形状为 `{ terminal_id?, root_session_id?, name? }`（JSON 中平铺，不嵌套 `locator` 键）。

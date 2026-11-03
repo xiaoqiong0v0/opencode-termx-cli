@@ -70,6 +70,7 @@ termx/
 - 交付：CLI 全子命令；opencode adapter 薄层（`termx_*` 工具）；Web 客户端订阅同一协议。
 - 门禁：端到端 US-1~US-6；WebSocket JSON 事件可回放。
 - 已完成（M5b）：`termx-cli` 子命令（`local` / `exec` / `status` / `list` / `read` / `send` / `resize` / `signal` / `terminate` / `prune` / `attach` / `detach` / `claim` / `release`）与集成测试；`ssh` 返回 M6 未实现错误。`exec` 透传子进程退出码，`interrupted` 固定 130；`send` 在单次连接内自动 claim（`--force` 可抢占他人 lease）。
+- 安全约束（防误操作）：终端级子命令必须给 `--terminal-id` 或 `--name`；`terminate`/`detach` 不传定位即用法错误（非零退出），批量关闭必须显式 `--all` 且不得与定位同用；`prune` 必须显式给 `--states`/`--older-than`/`--all` 之一，服务端对空过滤且 `all=false` 返回 `bad_request`，不得默认清理全部终态。
 
 ### M6 SSH + helper
 - 交付：`russh` SSH PTY、exit/断线终态；helper 分发/校验/握手/降级；`capabilities`/`bestEffort`。

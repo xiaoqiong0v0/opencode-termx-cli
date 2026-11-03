@@ -60,11 +60,19 @@ termx-cli send --name build --text "make test" --enter   # 同一连接内自动
 termx-cli resize --name build --cols 120 --rows 30
 termx-cli terminate --name build --force
 
+# 关闭全部必须显式 --all；不传名称/定位不会隐式关闭任何终端
+termx-cli terminate --all --force
+termx-cli detach --all
+
+# prune 不会默认清空：--states / --older-than / --all 至少给一个
+termx-cli prune --states exited
+termx-cli prune --all
+
 # 机器可读：事件/结果为单行 JSON（output 以 base64 承载）
 termx-cli --json list
 ```
 
-CLI 是「一次调用一条连接」：`send` 会在同一连接内先自动 `claim` 再发送；`--force` 可抢占他人持有的 lease。`ssh` 子命令在 M6 之前返回「M6 未实现」并以非零码退出。
+CLI 是「一次调用一条连接」：`send` 会在同一连接内先自动 `claim` 再发送；`--force` 可抢占他人持有的 lease。终端级子命令必须给 `--terminal-id` 或 `--name`；`terminate`/`detach` 只有显式 `--all` 才会批量处理，`prune` 必须显式给过滤或 `--all`。`ssh` 子命令在 M6 之前返回「M6 未实现」并以非零码退出。
 
 ## 构建与测试
 要求 stable Rust ≥ 1.85（edition 2024）。仓库提交 `Cargo.lock`，本机与 CI 门禁统一使用 `--locked`：

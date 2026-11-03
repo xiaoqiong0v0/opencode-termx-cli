@@ -410,11 +410,24 @@ async fn prune_removes_terminal_terminals_only() {
     .await;
     assert!(terminate.ok, "terminate 应成功: {terminate:?}");
 
+    let empty = call(
+        &mut client,
+        "c-prune-empty",
+        "terminal.prune",
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(!empty.ok, "空过滤且 all=false 必须拒绝: {empty:?}");
+    assert_eq!(
+        empty.error.map(|error| error.code),
+        Some(termx_protocol::ErrorCode::BadRequest)
+    );
+
     let (prune, _) = call_collect(
         &mut client,
         "c-prune",
         "terminal.prune",
-        serde_json::json!({}),
+        serde_json::json!({ "all": true }),
     )
     .await;
     assert!(prune.ok, "terminal.prune 应成功: {prune:?}");

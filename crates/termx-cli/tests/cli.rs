@@ -389,6 +389,170 @@ async fn prune_removes_exited_terminal() {
     service.shutdown().await;
 }
 
+/// `terminate`/`detach` 缺 locator 且未给 `--all` 时拒绝执行；`--all` 才逐个处理。
+#[tokio::test]
+async fn terminate_and_detach_require_explicit_target() {
+    let mut service = TestService::start().await;
+    let shell = default_shell();
+    let created = run_cli(
+        &service,
+        &["local", "--json", "--name", "guard", "--cmd", &shell],
+    )
+    .await;
+    assert_eq!(created.code, Some(0), "stderr={}", created.stderr_text());
+
+    let terminate_missing = run_cli(&service, &["terminate"]).await;
+    assert_eq!(
+        terminate_missing.code,
+        Some(2),
+        "stderr={}",
+        terminate_missing.stderr_text()
+    );
+    assert!(
+        terminate_missing.stderr_text().contains("--all"),
+        "stderr={}",
+        terminate_missing.stderr_text()
+    );
+
+    let detach_missing = run_cli(&service, &["detach"]).await;
+    assert_eq!(
+        detach_missing.code,
+        Some(2),
+        "stderr={}",
+        detach_missing.stderr_text()
+    );
+    assert!(
+        detach_missing.stderr_text().contains("--all"),
+        "stderr={}",
+        detach_missing.stderr_text()
+    );
+
+    // 被拒绝的调用不得隐式关闭终端。
+    let alive = run_cli(&service, &["status", "--name", "guard", "--json"]).await;
+    assert_eq!(alive.code, Some(0), "stderr={}", alive.stderr_text());
+    assert_eq!(alive.stdout_json()["state"], "running");
+
+    let detach_all = run_cli(&service, &["detach", "--all", "--json"]).await;
+    assert_eq!(
+        detach_all.code,
+        Some(0),
+        "stderr={}",
+        detach_all.stderr_text()
+    );
+    assert_eq!(detach_all.stdout_json()["ok"], true);
+
+    let terminate_all = run_cli(&service, &["terminate", "--all", "--json"]).await;
+    assert_eq!(
+        terminate_all.code,
+        Some(0),
+        "stderr={}",
+        terminate_all.stderr_text()
+    );
+    assert_eq!(terminate_all.stdout_json()["ok"], true);
+
+    let stopped = run_cli(&service, &["status", "--name", "guard", "--json"]).await;
+    assert_eq!(stopped.code, Some(0), "stderr={}", stopped.stderr_text());
+    assert_ne!(stopped.stdout_json()["state"], "running");
+    service.shutdown().await;
+}
+
+/// `--all` 与 locator 同时给出视为用法错误；未知名称返回 `not_found`。
+#[tokio::test]
+async fn all_conflicts_with_locator_and_unknown_name_is_not_found() {
+    let mut service = TestService::start().await;
+
+    for command in ["terminate", "detach"] {
+        let conflict = run_cli(&service, &[command, "--name", "x", "--all"]).await;
+        assert_eq!(conflict.code, Some(2), "stderr={}", conflict.stderr_text());
+        assert!(
+            conflict.stderr_text().contains("同时使用"),
+            "stderr={}",
+            conflict.stderr_text()
+        );
+
+        let missing = run_cli(&service, &[command, "--name", "no-such-name"]).await;
+        assert_ne!(missing.code, Some(0));
+        assert!(
+            missing.stderr_text().contains("not_found"),
+            "stderr={}",
+            missing.stderr_text()
+        );
+    }
+    service.shutdown().await;
+}
+
+/// `prune` 必须显式给过滤或 `--all`；`--all` 清理全部终态。
+#[tokio::test]
+async fn prune_requires_explicit_selector_and_supports_all() {
+    let mut service = TestService::start().await;
+    let created = run_cli(&service, &quick_exit_args()).await;
+    assert_eq!(created.code, Some(0), "stderr={}", created.stderr_text());
+    let terminal_id = created.stdout_json()["terminal_id"]
+        .as_str()
+        .expect("缺少 terminal_id")
+        .to_string();
+    wait_for_state(&service, &terminal_id, "exited").await;
+
+    let missing = run_cli(&service, &["prune"]).await;
+    assert_eq!(missing.code, Some(2), "stderr={}", missing.stderr_text());
+    assert!(
+        missing.stderr_text().contains("--all"),
+        "stderr={}",
+        missing.stderr_text()
+    );
+
+    let prune_all = run_cli(&service, &["prune", "--all", "--json"]).await;
+    assert_eq!(
+        prune_all.code,
+        Some(0),
+        "stderr={}",
+        prune_all.stderr_text()
+    );
+    let removed = prune_all.stdout_json()["removed"]
+        .as_array()
+        .expect("removed 应为数组")
+        .clone();
+    assert!(
+        removed
+            .iter()
+            .any(|item| item.as_str() == Some(terminal_id.as_str())),
+        "prune --all removed={}",
+        prune_all.stdout_text()
+    );
+    service.shutdown().await;
+}
+
+/// 其余终端级子命令缺 locator 时统一返回用法错误（退出码 2）。
+#[tokio::test]
+async fn terminal_commands_require_locator() {
+    let mut service = TestService::start().await;
+    let cases: &[&[&str]] = &[
+        &["status"],
+        &["read", "--cursor", "0"],
+        &["send", "--text", "x"],
+        &["resize", "--cols", "80", "--rows", "24"],
+        &["signal", "--signal", "SIGINT"],
+        &["attach"],
+        &["claim"],
+        &["release"],
+    ];
+    for args in cases {
+        let output = run_cli(&service, args).await;
+        assert_eq!(
+            output.code,
+            Some(2),
+            "args={args:?} stderr={}",
+            output.stderr_text()
+        );
+        assert!(
+            output.stderr_text().contains("--terminal-id"),
+            "args={args:?} stderr={}",
+            output.stderr_text()
+        );
+    }
+    service.shutdown().await;
+}
+
 /// 用法错误与未实现子命令返回退出码 2。
 #[tokio::test]
 async fn usage_errors_and_unimplemented_ssh_exit_with_two() {

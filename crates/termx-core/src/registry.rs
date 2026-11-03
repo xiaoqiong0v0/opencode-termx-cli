@@ -866,15 +866,27 @@ impl Registry {
 
     /// 清理终态终端。
     ///
-    /// 仅删除 `state` 为终态的条目；`states` 作为附加过滤（即使包含运行态也不会
-    /// 删除运行中终端）。`older_than` 缺省时不做时间过滤；`basis` 缺省为
-    /// `last_activity`（缺失时回退创建时间）。删除时同步移除会话键、终端级订阅
-    /// 与全局订阅排除项，返回被删除的 `terminal_id` 列表。
-    pub fn prune<P>(&mut self, params: P) -> PruneResult
+    /// 仅删除 `state` 为终态的条目。**必须显式给出过滤或 `all=true`**：空过滤且
+    /// `all=false` 返回 `BadRequest`，绝不隐式清理全部终态。`states` 作为附加过滤
+    /// （即使包含运行态也不会删除运行中终端）；`older_than` 缺省时不做时间过滤；
+    /// `basis` 缺省为 `last_activity`（缺失时回退创建时间）。`all=true` 时忽略
+    /// 其余过滤，清理全部终态。删除时同步移除会话键、终端级订阅与全局订阅排除项，
+    /// 返回被删除的 `terminal_id` 列表。
+    pub fn prune<P>(&mut self, params: P) -> Result<PruneResult, CoreError>
     where
         P: Borrow<PruneParams>,
     {
         let params = params.borrow();
+        let has_states = params
+            .states
+            .as_ref()
+            .is_some_and(|states| !states.is_empty());
+        if !params.all && !has_states && params.older_than.is_none() {
+            return Err(CoreError::BadRequest(
+                "terminal.prune 需要 states/older_than 过滤，或显式 all=true".to_string(),
+            ));
+        }
+
         let now = OffsetDateTime::now_utc();
         let basis = params.basis.unwrap_or(PruneBasis::LastActivity);
         let threshold_ms = params.older_than.as_ref().map(time_span_millis);
@@ -884,21 +896,23 @@ impl Registry {
             if !entry.state.is_terminal() {
                 continue;
             }
-            if let Some(states) = &params.states {
-                if !states.contains(&entry.state) {
-                    continue;
+            if !params.all {
+                if let Some(states) = &params.states {
+                    if !states.contains(&entry.state) {
+                        continue;
+                    }
                 }
-            }
-            if let Some(threshold_ms) = threshold_ms {
-                let basis_time = match basis {
-                    PruneBasis::LastActivity => entry.activity_time(),
-                    PruneBasis::CreatedAt => crate::parse_rfc3339(&entry.created_at),
-                };
-                let Some(basis_time) = basis_time else {
-                    continue;
-                };
-                if (now - basis_time).whole_milliseconds() < threshold_ms {
-                    continue;
+                if let Some(threshold_ms) = threshold_ms {
+                    let basis_time = match basis {
+                        PruneBasis::LastActivity => entry.activity_time(),
+                        PruneBasis::CreatedAt => crate::parse_rfc3339(&entry.created_at),
+                    };
+                    let Some(basis_time) = basis_time else {
+                        continue;
+                    };
+                    if (now - basis_time).whole_milliseconds() < threshold_ms {
+                        continue;
+                    }
                 }
             }
             removed.push(id.clone());
@@ -915,9 +929,9 @@ impl Registry {
             }
         }
 
-        PruneResult {
+        Ok(PruneResult {
             removed: removed.into_iter().map(|id| id.0).collect(),
-        }
+        })
     }
 
     /// 解析定位器；`terminal_id` 优先于 `(root_session_id, name)`。

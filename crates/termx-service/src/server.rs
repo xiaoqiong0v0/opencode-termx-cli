@@ -1076,7 +1076,10 @@ async fn dispatch_request(
                 let mut registry = lock_registry(registry);
                 registry.prune(&params)
             };
-            Ok(ok_response(id, serde_json::to_value(result)?))
+            match result {
+                Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
+                Err(error) => Ok(response_from_core_error(id, error)),
+            }
         }
         "terminal.subscribe" | "subscribe" => {
             let params: SubscribeParams = match serde_json::from_value(params) {

@@ -159,6 +159,20 @@ pub struct TerminateArgs {
     /// 终端定位参数。
     #[command(flatten)]
     pub locator: LocatorArgs,
+    /// 显式终止全部终端；不能与 `--terminal-id`/`--name` 同时使用。
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// `detach` 子命令参数。
+#[derive(Debug, Args)]
+pub struct DetachArgs {
+    /// 终端定位参数。
+    #[command(flatten)]
+    pub locator: LocatorArgs,
+    /// 显式断开全部终端；不能与 `--terminal-id`/`--name` 同时使用。
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// `prune` 子命令参数。
@@ -173,6 +187,9 @@ pub struct PruneArgs {
     /// 清理基准。
     #[arg(long, value_parser = ["last_activity", "created_at"])]
     pub basis: Option<String>,
+    /// 显式清理全部终态终端；不能与 `--states`/`--older-than` 同时使用。
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// `attach` 子命令参数。
@@ -220,7 +237,7 @@ pub enum Command {
     /// 附着终端并返回快照/游标。
     Attach(AttachArgs),
     /// 断开附着。
-    Detach(LocatorArgs),
+    Detach(DetachArgs),
     /// 取得输入 lease。
     Claim(LocatorArgs),
     /// 释放输入 lease。

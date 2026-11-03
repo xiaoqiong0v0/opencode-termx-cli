@@ -297,7 +297,12 @@ fn prune_removes_only_terminal_terminals_and_reports_ids() {
     // 终态事件会投递给仍存在的终端级订阅，先清空再断言订阅被移除。
     drain(&mut terminal_rx);
 
-    let result = registry.prune(PruneParams::default());
+    let result = registry
+        .prune(PruneParams {
+            all: true,
+            ..PruneParams::default()
+        })
+        .expect("all=true 应清理全部终态");
     let mut removed = result.removed.clone();
     removed.sort();
     let mut expected = vec![
@@ -351,13 +356,55 @@ fn prune_removes_only_terminal_terminals_and_reports_ids() {
     assert_eq!(items[0].terminal_id, running.terminal_id);
 
     // states 过滤也绝不会删除运行中终端。
-    let result = registry.prune(PruneParams {
-        states: Some(vec![LifecycleState::Running]),
-        older_than: None,
-        basis: None,
-    });
+    let result = registry
+        .prune(PruneParams {
+            states: Some(vec![LifecycleState::Running]),
+            older_than: None,
+            basis: None,
+            all: false,
+        })
+        .expect("显式 states 过滤应正常执行");
     assert!(result.removed.is_empty());
     assert_eq!(registry.len(), 1);
+}
+
+#[test]
+fn prune_requires_filter_or_all() {
+    let mut registry = mock_registry();
+    let created = registry
+        .create_with_backend(
+            params("ses-prune-guard", "guard", None),
+            Arc::new(MockBackend::new()),
+        )
+        .expect("create 应成功");
+    registry
+        .terminate(&by_id(&created.terminal_id))
+        .expect("terminate 应成功");
+
+    let error = registry
+        .prune(PruneParams::default())
+        .expect_err("空过滤且 all=false 必须拒绝");
+    assert!(
+        matches!(error, CoreError::BadRequest(_)),
+        "应为 bad_request，实际 {error:?}"
+    );
+
+    let error = registry
+        .prune(PruneParams {
+            states: Some(Vec::new()),
+            ..PruneParams::default()
+        })
+        .expect_err("空 states 同样视为空过滤");
+    assert!(
+        matches!(error, CoreError::BadRequest(_)),
+        "空 states 应为 bad_request，实际 {error:?}"
+    );
+    assert!(
+        registry
+            .get(&TerminalId::new(created.terminal_id.clone()))
+            .is_some(),
+        "被拒绝的 prune 不得删除任何终端"
+    );
 }
 
 #[test]
@@ -391,14 +438,17 @@ fn prune_basis_selects_created_at_or_last_activity() {
         termx_core::format_rfc3339(OffsetDateTime::now_utc() + Duration::hours(1));
 
     // 以 created_at 为基准：只删除“创建时间很久以前”的终态终端。
-    let result = registry.prune(PruneParams {
-        states: None,
-        older_than: Some(TimeSpan {
-            value: 1,
-            unit: IdleTimeoutUnit::S,
-        }),
-        basis: Some(PruneBasis::CreatedAt),
-    });
+    let result = registry
+        .prune(PruneParams {
+            states: None,
+            older_than: Some(TimeSpan {
+                value: 1,
+                unit: IdleTimeoutUnit::S,
+            }),
+            basis: Some(PruneBasis::CreatedAt),
+            all: false,
+        })
+        .expect("older_than 过滤应正常执行");
     assert_eq!(result.removed, vec![old_created.terminal_id]);
     assert!(registry.get(&old_created_id).is_none());
     assert!(registry.get(&recent_id).is_some());
@@ -414,14 +464,17 @@ fn prune_basis_selects_created_at_or_last_activity() {
         &termx_core::format_rfc3339(OffsetDateTime::now_utc() + Duration::hours(1)),
     );
 
-    let result = registry.prune(PruneParams {
-        states: None,
-        older_than: Some(TimeSpan {
-            value: 1,
-            unit: IdleTimeoutUnit::S,
-        }),
-        basis: Some(PruneBasis::LastActivity),
-    });
+    let result = registry
+        .prune(PruneParams {
+            states: None,
+            older_than: Some(TimeSpan {
+                value: 1,
+                unit: IdleTimeoutUnit::S,
+            }),
+            basis: Some(PruneBasis::LastActivity),
+            all: false,
+        })
+        .expect("older_than 过滤应正常执行");
     assert!(
         result.removed.is_empty(),
         "last_activity 为未来时间时不应被清理"
@@ -429,14 +482,17 @@ fn prune_basis_selects_created_at_or_last_activity() {
 
     // 把终态记录的 last_activity 改旧，验证 last_activity 基准确实生效。
     set_last_activity(&mut registry, &recent_id, "2000-01-01T00:00:00Z");
-    let result = registry.prune(PruneParams {
-        states: None,
-        older_than: Some(TimeSpan {
-            value: 1,
-            unit: IdleTimeoutUnit::S,
-        }),
-        basis: Some(PruneBasis::LastActivity),
-    });
+    let result = registry
+        .prune(PruneParams {
+            states: None,
+            older_than: Some(TimeSpan {
+                value: 1,
+                unit: IdleTimeoutUnit::S,
+            }),
+            basis: Some(PruneBasis::LastActivity),
+            all: false,
+        })
+        .expect("older_than 过滤应正常执行");
     assert_eq!(result.removed, vec![recent.terminal_id]);
 }
 
