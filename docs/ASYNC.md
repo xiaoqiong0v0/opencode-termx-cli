@@ -24,6 +24,9 @@
 | 14 | 每终端 `InteractionAnalyzer`（OSC 扫描器、静默计时、前台交互对象、节流签名） | 同 #1 的 registry 锁 | 输出摄取在**同一把 registry 锁内**先 `report_event(output)` 再 `observe_output`：只做 OSC 增量解析与事件投递，不调用后端、不跨 `await`。交互 ticker 在锁内只取 `running_backends()` 快照；`foreground_pgrp`/`tree` 在锁外 `spawn_blocking` 采集，随后每终端单独取锁调用 `sample_interaction`。仅状态变化或节流到期才写事件，永不产生终态事件 | `crates/termx-core/src/interaction.rs`、`crates/termx-core/src/registry.rs`、`crates/termx-service/src/server.rs`（`ingest_proc_events` / `run_interaction_ticker`） |
 | 15 | 交互识别 ticker | `tokio::time::interval` 任务 + 共享 `watch` 停止信号 | 周期缺省 250ms（`TERMX_INTERACTION_TICK_MS`），无输出阈值缺省 5s、重复间隔缺省 30s，分别由 `TERMX_INTERACTION_NO_OUTPUT_MS` / `TERMX_INTERACTION_REPEAT_MS` 覆盖，`TERMX_INTERACTION_ENABLED` 可整体关闭；关闭时 ticker 只等停止信号。每轮先取 `running_backends()` 快照，再**为每个终端独立 `tokio::spawn` 采样任务**：采集在 `spawn_blocking` + `timeout(2s)` 内完成，单个 `tree()` 卡住只影响自身；等待采样结果时 `select!` 停止信号，停机不等卡住任务。与空闲 ticker 共用 `run_until` 的 `watch`，停机时两 ticker 都 `await` 退出后才终止后端 | `crates/termx-service/src/server.rs`（`run_interaction_ticker` / `sample_terminal_interaction`）、`crates/termx-service/src/config.rs` |
 | 16 | `termx-client`：写端 sink、pending 配对表、已用请求 ID、事件广播发送端、连接级错误 | 写端 `tokio::sync::Mutex<SplitSink>`；pending 为 `std::sync::Mutex<HashMap<id, oneshot::Sender>>`；`used_ids` 为 `std::sync::Mutex<HashSet<String>>`；events 为 `std::sync::Mutex<Option<broadcast::Sender<Event>>>`；`last_error` 为 `std::sync::Mutex<Option<ProtocolError>>`；`AtomicBool closed` | 请求先查 `last_error` 与 closed，再**在已用 ID 表中占位（连接内唯一，显式 ID 完成后也不释放）**，随后在 pending 表内二次校验并插入，最后取 sink 串行写帧；响应等待受 `ClientConfig::request_timeout` 约束，超时移除 pending 并返回 `Timeout`。单 reader 任务读帧：带 `id` 的响应移出 pending 并 `send`；`id == ""` 的连接级错误写入 `last_error` 后结束读循环；无 `id` 的帧广播。收尾 `shutdown()` 幂等：先置 closed → 取走 events 发送端（关闭通道）→ 清空 pending 并统一回 `Closed`，不清 `last_error`。std 锁不跨 `await`；仅 sink 的 tokio 锁在发送期间持有。`close()` 收尾后发 Close 帧并中断 reader；Drop 同样收尾。连接前 endpoint 还要求环回字面量，拒绝外部主机以免泄露 token | `crates/termx-client/src/client.rs`、`crates/termx-client/src/config.rs` |
+| 17 | `termx-helper` 请求状态：当前 `PtySession`、转发任务句柄、`running` 标记 | 单任务串行（`run_loop` 独占 `HelperState`）+ `Arc<AtomicBool>` | stdin 逐行解析后**串行**处理；`spawn` 前若有活动会话返回 `bad_request`，否则先 `cleanup()`；PTY 操作经 `session_op` 临时移出会话、在 `spawn_blocking` 内执行后放回；`running=false` 只由转发任务/清理路径/成功的 `terminate` 置位（`terminate` 返回即代表进程树已回收，随后 `spawn` 不会被旧转发任务阻塞，会话句柄保留以支持重复 `terminate` 幂等）；判断题：`crates/termx-helper/src/lib.rs` 中 `HelperState` 方法内不得出现“先持会话再 `await`”的结构 | `crates/termx-helper/src/lib.rs`（`run_loop` / `HelperState`） |
+| 18 | `termx-helper` PTY 事件转发 | 每会话独立 `tokio` 任务 + `mpsc::Receiver<ProcEvent>` + 无界 `UnboundedSender<HelperEvent>` | 转发任务只持有事件接收端，不触碰 `PtySession`；按 `termx-proc` 事件顺序编码 `output`/`exited`/`signaled` 并入队；事件流关闭（会话释放）后置 `running=false` 并退出；终态事件唯一由 `termx-proc` 保证 | `crates/termx-helper/src/lib.rs`（`spawn_forwarder` / `translate_event`） |
+| 19 | `termx-helper` stdout 输出 | 单写任务 `UnboundedReceiver<HelperEvent>` | 串行 `write_all` + `\n` + `flush`，保证 JSON Lines 帧不交错；stdout 只写协议帧，日志固定 stderr；收尾顺序：请求循环退出 → `cleanup()`（terminate + await 转发任务）→ drop `out_tx` → await writer | `crates/termx-helper/src/lib.rs`（`write_loop` / `serve`） |
 
 ## 2. `terminal.send` / `resize` / `signal` / `terminate` 的锁纪律
 
@@ -48,7 +51,16 @@
 - 订阅队列背压（M3b）：`try_send` 非阻塞。**任何事件**队满 → 移除订阅者并触发限流 watch，forwarder 发连接级 `error{id:"",code:"limit_exceeded",retryable:true}` 后断开（不伪装成正常 `detached`，也不在订阅者侧补合成 marker）。`seq` 始终取事件自身单调值，绝不回退；队列满导致的断连会让客户端按 cursor 重连补齐。终端 ring 的 `output_dropped` 是另一层机制：只由 ring 淘汰 output 触发，marker 用新 `seq`、闭区间只含实际被丢 output。
 - stdio 收尾顺序（M3）：`StdioSession::Drop`/`terminate` 先终止子进程（Unix `killpg`；Windows `TerminateJobObject` + 关闭 Job 触发 `KILL_ON_JOB_CLOSE`）并关闭写队列；writer 线程退出时关闭 stdin，避免调用方在锁内阻塞 `write_all`。service `run_until` 停机顺序：停 accept → 停 ticker 并 `await` → 锁内 `collect_backends()` → 锁外逐个终止。
 
-## 4. 检查方式
+## 4. termx-helper 线程边界（M6a 本地 stdio）
+
+- **stdin 请求循环**：`run_loop` 独占 `HelperState`，逐行解析 `HelperRequest` 后串行处理；首帧 `hello` 校验失败即发 `error` 并退出。请求之间不共享锁。
+- **PTY 操作**：`spawn` 与每次 `input` / `resize` / `signal` / `terminate` 都经 `session_op` 把 `PtySession` 移出 `Option`，在 `spawn_blocking` 中执行后放回；运行时线程不直接调用可能阻塞的 PTY 方法。
+- **事件转发任务**：每会话一个 `tokio` 任务消费 `termx-proc` 的 `Receiver<ProcEvent>`，只做 base64 与流映射后入无界发送队列；不持有 `PtySession`。事件流关闭时置 `running=false`。
+- **stdout 写任务**：单任务消费 `HelperEvent` 队列，串行写一行 JSON 并 flush；stdout 只含协议帧，tracing 固定 stderr。
+- **收尾顺序**：stdin EOF / 读错误 → 跳出循环 → `cleanup()`（`spawn_blocking(terminate)` → `await` 转发任务）→ `drop(out_tx)` → `await` writer。`serve` 任一路径都走该顺序，确保 PTY 与进程树被释放、无孤儿。
+- **顺序契约**：同一时刻只有一个 PTY 会话；活动会话期间的 `spawn` 直接 `bad_request`；`exited` / `signaled` 由 `termx-proc` 保证唯一，且输出在终态前排空。
+
+## 5. 检查方式
 
 - 代码审查：`server.rs` 中所有 `lock_registry(...)` 作用域内不得出现 `.await`，也不得调用 `TerminalBackend::{write,resize,signal,terminate,tree,foreground_pgrp}`。
 - 测试：`cargo test -p termx-core --test io`（lease 门禁 / terminate 幂等）、`cargo test -p termx-service --test send_terminate`（真实 PTY/ConPTY、无孤儿）。
@@ -57,4 +69,5 @@
 - stdio：`cargo test -p termx-proc --test stdio`（stdout/stderr 分离、终态唯一、env/cwd/不经 shell、killpg/Job 终止与后代消失、drop 收尾）、`cargo test -p termx-service --test stdio`（service 退出终止长驻子进程、`enter` 换行）。
 - 交互识别：`cargo test -p termx-core --test interaction`（OSC 置信度/reason、前台 pgrp 变化、节流、终态不受影响）、`cargo test -p termx-service --test interaction`（真实 PTY 中 OSC prompt → `waiting_input{high,shell_integration}`，Unix 前台作业 → `interactive_changed`，期间无 `exited`）。
 - 客户端：`cargo test -p termx-client --test lifecycle --test concurrency`（hello/错误映射、真实 PTY 收发、并发配对、事件与响应并行、断开后 pending 返回 `Closed`）。
+- helper：`cargo test -p termx-helper`（`--version`、hello/proto 错误、spawn 输出与退出码、input/resize/terminate、stdin EOF 清理）；手工检查 `termx-helper serve` 的 stdout 不含日志行。
 - 改动上述任一交互点时，必须同批更新本表的「顺序契约」与对应测试。

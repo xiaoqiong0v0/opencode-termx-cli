@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod helper;
+
 /// 主协议版本标识，对应 `hello.proto`。
 pub const PROTOCOL_VERSION: &str = "termx/1";
 

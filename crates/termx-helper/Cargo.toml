@@ -1,6 +1,23 @@
 [package]
 name = "termx-helper"
-description = "远端 sidecar：提供进程/退出状态增强（M0 占位）"
+description = "远端 sidecar：JSON Lines stdio 协议与本地 PTY 会话"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "termx_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "termx-helper"
+path = "src/main.rs"
+
+[dependencies]
+termx-protocol = { path = "../termx-protocol" }
+termx-proc = { path = "../termx-proc" }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

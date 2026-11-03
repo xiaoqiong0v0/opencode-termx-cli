@@ -748,6 +748,15 @@ dependencies = [
 [[package]]
 name = "termx-helper"
 version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde_json",
+ "termx-proc",
+ "termx-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "termx-proc"

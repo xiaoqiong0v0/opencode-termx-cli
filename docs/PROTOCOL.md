@@ -176,21 +176,42 @@
 ## 11. 版本协商
 - 主协议 `proto: "termx/1"`；helper 协议 `termx-helper/1`。
 - 主协议不匹配 → `version_mismatch` 断开。
-- helper 握手（最小集）：
+- helper 本地 stdio（M6a）：
+  - 传输：stdin/stdout 各一行一个 UTF-8 JSON 对象（JSON Lines）；**stdout 只承载协议帧**，日志一律 stderr。
+  - 首帧必须是 `hello` 且 `proto` 匹配；否则回 `error` 后退出（`bad_request` / `version_mismatch`）。
+  - 请求以 `method` 为标签，响应/事件以 `type` 为标签；字段 snake_case。
+  - `input.data` / `output.data` 为 base64；`output.stream` 复用主协议 `Stream`（helper 固定 `pty`）；`error.code` 复用主协议错误码表，避免两套词表漂移。
+  - `input` / `resize` / `signal` / `terminate` 成功**不回 ack**；失败才回 `error`。终态由 `exited` / `signaled` 唯一表达。
+  - 同一时刻只允许一个 PTY 会话；活动会话未结束时再次 `spawn` → `bad_request`。`terminate` 返回后会话即视为结束，可直接 `spawn` 新会话（重复 `terminate` 幂等）。
+  - stdin EOF / helper 退出：终止整棵进程树并释放 PTY，不留孤儿。
   ```jsonc
-  // client -> helper
-  { "method": "helper.hello", "params": { "proto": "termx-helper/1", "sha256": "…", "version": "…" } }
+  // client -> helper（首帧）
+  { "method": "hello", "proto": "termx-helper/1", "version": "0.1.0" }
   // helper -> client
-  { "method": "helper.hello_ok", "result": { "proto": "termx-helper/1", "capabilities": ["pty","proc_tree","exit_status"] } }
+  { "type": "hello_ok", "proto": "termx-helper/1", "capabilities": ["pty","proc_tree","exit_status"] }
+
+  // 请求
+  { "method": "spawn", "cmd": "bash", "args": ["-l"], "cwd": "/tmp", "env": { "TERM": "xterm-256color" }, "cols": 120, "rows": 30 }
+  { "method": "input", "data": "bHMNCg==" }
+  { "method": "resize", "cols": 120, "rows": 30 }
+  { "method": "signal", "signal": "SIGINT" }
+  { "method": "terminate" }
+
+  // 响应/事件
+  { "type": "started", "pid": 123, "pgid": 123 }
+  { "type": "output", "data": "aGVsbG8=", "stream": "pty" }
+  { "type": "exited", "code": 0 }
+  { "type": "signaled", "signal": "SIGTERM" }
+  { "type": "error", "code": "spawn_failed", "message": "启动失败" }
   ```
-  不匹配 / sha256 不符 / 启动失败 / 超时 → 降级 `capabilities{helper:false, bestEffort:true}`，主流程继续。
+- helper 随 SSH 通道分发、sha256 校验与失败降级到 `capabilities{helper:false, bestEffort:true}` 属 M6b；M6a 只定义并实现本地 stdio 协议。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全
 - 不记录原始输入/输出与密钥；事件日志只留元数据与 seq。
 - 密码/口令类输入默认不回显存储；service 不落盘原始输入输出。
 - base64 仅用于传输，不做加密；传输安全性依赖本机 socket/pipe 权限 + token。
-- helper 传输需 sha256 校验；不在命令行/日志暴露凭据。
+- helper 分发时需 sha256 校验；不在命令行/日志暴露凭据（M6a 本地 stdio 不涉及分发）。
 
 ## 13. 终态后操作契约（固定，避免歧义）
 | 操作 | 未知 terminal_id/键 | 已知且已终态 |
