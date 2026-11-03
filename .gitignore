@@ -12,3 +12,7 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# 交叉编译/独立 target 目录
+/target-linux/
+/target-*/
