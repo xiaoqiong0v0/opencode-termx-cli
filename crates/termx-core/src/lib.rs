@@ -31,8 +31,13 @@ pub use interaction::{
     InteractionUpdate, InteractiveTarget, REASON_NO_OUTPUT, REASON_SHELL_INTEGRATION,
 };
 pub use registry::{
-    DEFAULT_READ_MAX_BYTES, DEFAULT_SUBSCRIBER_QUEUE_CAPACITY, DETACH_REASON_DISCONNECT,
-    ExitOutcome, IDLE_DETACH_REASON, INITIAL_CURSOR, IdleAction, PreparedSignal, Registry,
-    TIMEOUT_SOURCE,
+    CLIENT_TIMEOUT_SOURCE, ClientlessCandidate, DEFAULT_READ_MAX_BYTES,
+    DEFAULT_SUBSCRIBER_QUEUE_CAPACITY, DETACH_REASON_DISCONNECT, ExitOutcome, IDLE_DETACH_REASON,
+    INITIAL_CURSOR, IdleAction, PreparedSignal, Registry, TIMEOUT_SOURCE,
 };
 pub use terminal::{PendingInterrupt, TerminalEntry, TerminalId};
+
+mod transcript;
+pub use transcript::{
+    DEFAULT_QUIET_FINALIZE, DEFAULT_TRANSCRIPT_CAPACITY, TranscriptBuffer, clean_output,
+};

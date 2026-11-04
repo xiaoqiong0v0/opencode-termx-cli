@@ -14,10 +14,18 @@
 - 单帧上限可配置；超限视为 `bad_request`。
 - WebSocket 便于 Web 客户端与 CLI/adapter 复用同一协议；不提供 Unix socket / named pipe（后续如需可再评估）。
 
+### 2.1 Web 网关（W1）
+- `termx-service` 在 `--web-port > 0` 时额外启动 HTTP + WebSocket 网关；`/ws` 由网关代理到内部环回 service（`ws://127.0.0.1:<service_port>`）。
+- **浏览器不持有内部 token**：网关先向内部服务发送 `hello`（`client:"termx-web"`、`admin:true`，不带 `root_session_id`），再把内部返回的 `hello` 响应转发给浏览器；后续帧原样双向转发。Web 代理是管理连接，可查看/操作全部会话的终端。
+- 默认只绑定 `127.0.0.1`，回环请求免登录；`--web-allow-remote true` 时绑定 `0.0.0.0`，非回环请求必须通过 `/login` 建立会话 Cookie（`termx_web`）。
+- 远程访问必须配置密码（环境变量 `TERMX_WEB_PASSWORD`）；未配置时登录必失败。密码与内部 token 均不写入日志或命令行。
+- `/ws` 升级前校验 Host/Origin，防浏览器跨站 WebSocket 劫持（CSWSH）：仅本机模式要求 Host 为回环主机（`127.0.0.1` / `localhost` / `[::1]`），带 Origin 时必须与 Host 同源；远程模式要求 Origin 存在且同源。校验失败返回 403，不升级。
+
 ## 3. 鉴权
 - 服务启动生成随机 token，写入仅当前用户可读的 token 文件。
-- token 文件约定路径：Linux/macOS `$XDG_CONFIG_HOME/termx/token`（缺省 `~/.config/termx/token`）；Windows `%APPDATA%\termx\token`；Unix 权限 `0600`。Windows v0 依赖**环回绑定 + token** 保证本机访问面，文件 ACL 收紧列为后续项（实现当前继承目录 ACL，不夸大已收紧）。
-- 发现优先级：`--token-file` > `TERMX_TOKEN` 环境变量 > 默认 token 文件。
+- token 文件位于服务启动时**显式指定**的配置目录（`--config-dir`，或非空 `TERMX_CONFIG_DIR`）下的 `token`；不推导平台默认目录。Unix 权限 `0600`。Windows v0 依赖**环回绑定 + token** 保证本机访问面，文件 ACL 收紧列为后续项（实现当前继承目录 ACL，不夸大已收紧）。
+- 服务端 token 优先级：`--token-file` > 非空 `TERMX_TOKEN` > `<config-dir>/token`（缺失时生成）。
+- 客户端必须显式提供配置目录或 endpoint（`--config-dir` / `--endpoint` / 非空 `TERMX_CONFIG_DIR`），不会回退到 `XDG_CONFIG_HOME`、`%APPDATA%` 等平台默认目录。客户端 token 优先级：`--token` > `TERMX_TOKEN` 环境变量 > `<config-dir>/token`。
 - token 持久化于 token 文件，首次启动生成；如需轮换，删除 token 文件或使用显式轮换（后续），旧 token 随即失效；不写入日志。
 - token 通过 `hello` 的 `token` 字段校验，也可用 `Authorization: Bearer <token>` 头；两者同时给出时**头优先**。
 - token 文件采用同目录临时文件 + rename 原子写入，避免读到半截内容。
@@ -62,18 +70,23 @@
 ## 6. RPC 方法
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
-| `hello` | `{ proto, token, client }` | `{ proto, server, capabilities }` |
+| `hello` | `{ proto, token, client, root_session_id?, admin? }` | `{ proto, server, capabilities }` |
+| `heartbeat` | `{ root_session_id? }` | `{ ok }` |
+| `session_closed` | `{ root_session_id }` | `{ ok }` |
+| `session.list` | `{}` | `{ sessions: [{ root_session_id, live, last_seen_ms?, terminals }] }` |
 | `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, accept_any_host_key? } }` | `{ terminal_id, cursor }` |
 | `terminal.claim` | `{ locator, force? }` | `{ owner, lease }` |
 | `terminal.release` | `{ locator }` | `{ ok }` |
 | `terminal.attach` | `{ locator, cursor? }` | `{ cursor, snapshot, reset? }` |
 | `terminal.detach` | `{ locator }` | `{ ok }` |
-| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, pid?, idle_timeout?, last_activity?, created_at }]` |
+| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, command, args, cwd?, pid?, idle_timeout?, last_activity?, created_at }]`；`limit` 取最近活动的前 N 条 |
 | `terminal.status` | `{ locator }` | `{ snapshot }` |
 | `terminal.read` | `{ locator, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
+| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output}], revision }` |
 | `terminal.send` | `{ locator, data(base64)?, text?, enter? }` | `{ ok }` |
 | `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
 | `terminal.signal` | `{ locator, signal }` | `{ ok }` |
+| `terminal.rebind` | `{ locator, root_session_id, name?, force? }` | `{ terminal_id, root_session_id, name }` |
 | `terminal.terminate` | `{ locator, force? }` | `{ ok }` |
 | `terminal.prune` | `{ states?, older_than?: {value, unit:"s"\|"ms"}, basis?: "last_activity"\|"created_at", all?: boolean }` | `{ removed }` |
 | `subscribe` | `{ terminals?: [{terminal_id, cursor?}], all?: boolean }` | `{ cursors: [{terminal_id, cursor, reset?}] }` |
@@ -96,9 +109,21 @@
 - `idle_timeout` 省略或 `value=0` 表示**永不超时**；`action` 仅在 `value>0` 时必填，`value=0` 可缺省。默认 `0`。该规则由 `IdleTimeout::validate` 校验，`terminal.create` 在创建终端前调用。
 - `last_activity` 由 `terminal.create` 写入的 `started` 事件初始化；此后在 `output`、`terminal.send`、`terminal.attach`、`terminal.resize` 时刷新为服务端当前时间（RFC3339 UTC）；`idle_timeout` 的 `detach` 动作会在发送 `detached{reason:"idle_timeout"}` 后刷新它，避免同一空闲周期重复触发。
 - `terminal.prune` 只清理终态终端，且**必须显式指定过滤**：`states` 非空、`older_than` 或 `all=true` 至少一个；三者都缺省（或 `states` 为空数组且未给 `older_than`）时返回 `bad_request`，**绝不隐式清理全部终态**。`all=true` 表示清理全部终态终端，并忽略其它过滤；`basis` 缺省为 `last_activity`（缺失时回退 `created_at`），`older_than` 缺省表示不做时间过滤；结果 `removed` 为被删除的 `terminal_id` 列表（数量 = 其长度）。
+- `session.list`：返回已知 opencode 会话，合并会话心跳表中 TTL 内的存活项与 registry 中所有终端的 `root_session_id`（去重、按 `root_session_id` 升序）。`live` 仅表示 TTL 内收到过 `heartbeat {root_session_id}`；`last_seen_ms` 为距最近心跳的毫秒数，仅存活项提供；`terminals` 为该会话当前终端数。不含 token 等敏感信息。**仅 `admin:true` 连接可用**，普通连接返回 `permission_denied`。
+- **连接级访问身份（会话隔离）**：`hello` 必须给出非空 `root_session_id` 或 `admin:true`，两者都没有 → `bad_request` 并断开；`admin:true` 时忽略 `root_session_id`。
+  - **保留会话 `@web`**：`root_session_id == "@web"` 表示 Web 未绑定终端。普通连接不得以 `@web` 作为自身 `root_session_id`（`hello` → `bad_request`），也不可见/不可访问该会话下的终端；只有 `admin:true`（Web 代理）可见/可操作。终端可手动 `terminate`，或由管理员 `rebind` 到真实会话/从真实会话迁回 `@web`（视为解绑）。
+  - 普通连接只能访问 `root_session_id` 与自身一致的终端；所有终端级方法在解析 locator 后统一鉴权，跨会话返回 `permission_denied`（不泄露目标是否存在）。
+  - `terminal.create` 的 `root_session_id` 必须是自身会话（管理员可指定任意会话）；`terminal.list` / `terminal.prune` 只作用于自身会话。
+  - `terminal.subscribe(all=true)` 仅管理员可用；普通连接只能显式订阅本会话终端。
+  - `heartbeat` / `session_closed` 携带的 `root_session_id` 必须与连接会话一致（管理员不受限）。
+  - `terminal.rebind` 采用「目标会话拉取」授权：普通连接只能把终端迁移到**自己的** `root_session_id`，管理员可迁移到任意会话；不要求调用方当前能访问源终端。
+  - `admin` 只用于 Web 代理等管理连接，普通客户端不得自行声明。连接身份在 `hello` 时固定，后续帧不能改变。
 - **会话键**为 `(root_session_id, name)`；`terminal_id` 为内部全局唯一标识。`name` 禁止 `/`、`\`、空串，且长度上限为 **64** 个字符（按 Unicode 字符计数）。
 - 同名处理：同一 `(root_session_id, name)` 已存在时，`create` 不带 `force` → `session_exists`（错误载荷的 `terminal_id` 字段携带旧终端 ID，并附说明）；`force=true` → 终止旧终端（落 `interrupted{source:"terminate"}`）后新建。
 - 终端定位：除 `terminal.create` 外，终端级方法的 `locator` 均为 `TerminalLocator`，形状为 `{ terminal_id?, root_session_id?, name? }`（JSON 中平铺，不嵌套 `locator` 键）。
+- `terminal.rebind`：把绑定键从旧 `(root_session_id, name)` 迁移到新键，**保留** `terminal_id`、进程、lease、订阅与事件缓冲；迁移后重置该终端的 clientless 计时，由新会话心跳重新判定保活。授权见上文「连接级访问身份」：普通连接目标会话必须是自身，管理员不限。`name` 省略表示保留原名；`name` 不同即视为无冲突（可重命名）。目标键已存在时：无 `force` → `session_exists`（错误载荷 `terminal_id` 为目标旧终端 ID）；`force=true` → 先终止目标旧终端（`interrupted{source:"terminate"}`）再迁移，旧后端在锁外终止。终态终端 → `already_terminal`。
+  - `rebind` 的 `root_session_id` 与 `name` 是**目标键**，因此其定位器只使用 `terminal_id`；旧键可由 `terminal_id` 唯一确定，不额外提供旧会话键字段。
+  - 成功迁移（键确实变化）时追加一条 `rebound` 事件；新键与旧键相同时只重置 clientless 计时，不产生事件。
   - `terminal_id` 存在时优先；否则使用 `(root_session_id, name)` 查会话键。
   - 两者同时给出时以 `terminal_id` 为准，不回退到会话键。
   - 定位字段全部缺省 → `bad_request`；解析不到终端 → `not_found`。
@@ -106,6 +131,14 @@
 - `terminal.create` 返回初始 `cursor`，固定为 `0`（`started` 的 seq=1 之前的位置）；客户端据此 `attach(cursor=0)` 可回放 `started` 与首屏 output，避免 create→attach 空窗丢事件。
 - `terminal.send`：`data` 与 `text` 二选一（同传取 `data`）；`text` 按 UTF-8；`enter=true` 追加换行（`\r`，pty）/`\n`（stdio）。
 - `terminal.claim` 取得输入 lease；同一终端同一时刻只有一个 lease owner。`force=true` 抢占时向订阅者广播 `lease_revoked{old_client_id}`，随后授予新 owner。未 claim 或非 owner 的 `send` 返回 `permission_denied`。
+- `terminal.transcript`：读取 service 侧记录的信息页**命令记录**（**不是事件流**）。
+  - 每条命令：`command`（仅 `terminal.send` 成功且 `enter=true`，去掉末尾 CR/LF）、`started_at`/`ended_at`（RFC3339 UTC）、`status`、`output`（已清洗）。`enter=false` 的按键/密码不记录。
+  - `status`：`running` → `done`（新命令到来或静默达到阈值）/ `exited` / `interrupted` / `error`（终端终态）。
+  - 输出清洗：去 ANSI 与控制字符；CR/CRLF 统一为 LF；首行包含命令文本时视为回显删除；删除末尾提示符行（cmd `...>`、PowerShell `PS ...>`、bash/zsh `user@host:...$/#`）；去首尾空行，保留其余原文。
+  - 每终端有界（默认 **200** 条，`TERMX_TRANSCRIPT_CAPACITY` 覆盖），超出淘汰最旧命令。
+  - 单条命令 `output` 最多保留 **64 KiB**（含截断标记）；超出后按 UTF-8 字符边界截断并只追加一次 `\n[output truncated]\n`，后续输出不再追加。
+  - `limit` 缺省/0 返回全部保留记录，否则返回最近 N 条（仍按时间升序）；`revision` 在每次记录/追加/结束时递增，供页面判断是否重渲染。
+  - 鉴权与其它终端级方法一致（按终端 `root_session_id`，`admin` 例外）。
 - `terminal.read`：**只回放 `output` 事件**，不返回 `started`/状态/终态事件；状态与终态由 `attach`/`subscribe` 回放。返回的 `cursor` 为本次扫描到的最后 `seq`（会越过被跳过的状态事件），客户端以它继续增量读取。
   - `cursor` 早于缓冲下界（或所需输出已被背压淘汰）时返回 `reset` + 基线 `cursor`，客户端清空本地 output 视图后继续。
   - `max_bytes` 为本次累计 `data` **解码后**字节上限；`null`/缺省/`0` 取服务端默认。按 `seq` 升序累加，达到上限即在下一条前停止；**单条 output 解码后超过上限时仍返回该条并前进游标**，避免反复拿到空结果形成活锁。
@@ -114,6 +147,16 @@
 - `attach` 到终态终端：允许只读（返回 `snapshot` 与剩余 output）。
 - `subscribe` 的 `terminals` 与 `all` 同时给出时，结果按 `terminal_id` 去重；任一目标解析失败则整体失败，不注册任何订阅、不回放事件。
 - `detach`/`unsubscribe` 某终端后，该终端从该客户端的 `subscribe_all` 全局投递中排除；再次 `attach`/`subscribe` 该终端时恢复。
+- **终端附着语义**：单终端「有客户端附着」只统计该终端的终端级 `attach`/`subscribe` 订阅；`subscribe_all` 的全局订阅**不计入**任何单终端附着。连接关闭时服务端 `detach_all` 清理该连接的全部终端级订阅。附着只影响输入 lease 与事件投递，**不参与终端保活**。
+- **会话保活（S1）**：「客户端」指 opencode 会话心跳（按 `root_session_id`），不是 Web 或连接。`heartbeat {root_session_id}` 每 30s 刷新服务端存活时间，TTL 默认 **90s**（`TERMX_SESSION_TTL_MS` 覆盖）；`session_closed {root_session_id}` 立即移除。终端的 `root_session_id` 在 TTL 内无心跳时开始计时，超过 `client_idle_timeout`（默认 **300000ms**，`0` 关闭）后按策略处理：
+  - `no_children`（默认）：若终端仍有**用户子进程**（排除根进程与 conhost/winpty/OpenConsole 等控制台辅助进程）则继续保活，子进程退出后重新计时；否则终止。
+  - `any`：到期即终止，不检查子进程。
+  - `never`：永不因无会话终止。
+   - 终止统一落 `interrupted{signal:"SIGTERM", source:"client_timeout"}`。
+   - **`@web` 豁免**：`root_session_id == "@web"` 的终端不参与无会话超时扫描（不记录 `clientless_since`），只能由管理员手动 `terminate`。
+   - Web 附着不发送会话心跳，因此不会让终端保活；旧的空参数 `heartbeat {}` 仅保留为连接级心跳，不影响终端保活。
+- `heartbeat` 可携带 `root_session_id` 刷新会话存活时间；空参数形式兼容旧客户端，但不再影响终端保活。
+- CLI 在 `local --follow` 与长 `exec` 期间每 30s 发送 `heartbeat {root_session_id}`（root 与 `hello` 一致）；发送失败只停止心跳，不中断命令与输出。
 
 ## 7. 事件
 | `type` | 关键字段 | 说明 |
@@ -129,6 +172,7 @@
 | `exited` | `exit_code` | **终态** |
 | `interrupted` | `signal, source` | **终态** |
 | `error` | `code, message, retryable` | **终态**（含 `service_lost`） |
+| `rebound` | `old_root_session_id, new_root_session_id, old_name, new_name` | 绑定键迁移完成；`terminal_id`/进程/lease 不变 |
 | `capabilities` | `helper, version, bestEffort` | 某终端的 SSH/helper 能力与降级标识（终端级） |
 
 - `capabilities` 的层级语义：
@@ -145,15 +189,24 @@
   - `no_output` 由静默启发式产生：前台存在子进程时为 `medium`，仅 shell 静默时为 `low`；
   - 同一 `(confidence, reason)` 默认按节流间隔重复投递；`waiting_input` **不是终态**，也不会清除历史提示，命令开始执行后不再产生新的等待事件。
   - `stdin_blocked` 需要真实阻塞态证据（`wchan`/fd 等），当前版本不伪造该 reason，保留给具备阻塞态采集的平台实现。
-- `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；无法识别的信号名映射为 `"UNKNOWN"`，不猜测为 `SIGTERM`。`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`。
+- `interrupted.signal` 为信号名字符串（如 `SIGINT`/`SIGTERM`）；无法识别的信号名映射为 `"UNKNOWN"`，不猜测为 `SIGTERM`。`source` 常见取值 `control-c`/`signal`/`timeout`/`terminate`/`client_timeout`。
 - `reason` 与 `source` 按字符串处理：未知取值**原样透传**（前向兼容），客户端不得因未识别值拒绝事件。
 - 快照 `snapshot` 结构：
   ```jsonc
-  { "terminal_id": "...", "state": "running", "mode": "pty", "pid": 123, "pgid": 123,
-    "ppid": 1, "foreground_pgrp": 123, "tree": [ /* {pid,ppid,pgid,cmd} */ ],
+  { "terminal_id": "...", "state": "running", "mode": "pty",
+    "command": "/bin/bash", "args": ["-l"], "cwd": "/home/me",
+    "pid": 123, "pgid": 123, "ppid": 1, "foreground_pgrp": 123,
+    "tree": [ /* {pid,ppid,pgid,cmd} */ ],
     "interactive": "none", "confidence": "low", "cols": 120, "rows": 30, "cursor": 42 }
   ```
+  - `command` / `args` / `cwd` 为 `terminal.create` 的原值（SSH 也保留原始 `cmd`/`args`），供 Web 信息页展示；`cwd` 未指定时缺省。`terminal.list` 的条目同样包含这三个字段。
 - `terminal.read.chunks`：`[{ seq, ts, data(base64) }]`，按 `seq` 升序。
+- `terminal.transcript.commands`：
+  ```jsonc
+  [{ "command": "ls", "started_at": "2026-01-01T00:00:00Z",
+     "ended_at": "2026-01-01T00:00:01Z", "status": "done", "output": "a.txt\nb.txt" }]
+  ```
+  `ended_at` 在 `running` 时为 `null`；`output` 已由 service 清洗。
 
 ## 8. 序号、游标与重连（责任划分）
 - **服务端**维护每终端事件缓冲与单调 `seq`（从 1 开始），并负责按游标回放。
@@ -161,8 +214,10 @@
 - `attach`/`subscribe` 带 `cursor`：回放**全部**事件（`output` + 状态/终态），并按缓冲返回新 `cursor`。
 - `read` 带 `cursor`：**只回放 `output`**；状态/终态不通过 `read` 返回。返回的 `cursor` 是本次扫描到的最后 `seq`（可能跳过区间内的状态事件），下一次从该 `cursor` 继续。
 - 不可回放（超出缓冲）：`read`/`attach`/`subscribe` 返回 `reset:{reason}` + 基线 `cursor`；客户端清空本地视图后继续。
+- 历史回放建议：先用 `terminal.read` 按 `cursor` 分段取历史，再用 `subscribe` 从 read 返回的游标接实时。`attach`/`subscribe` 的待回放事件超过订阅者队列余量时返回 `reset:"buffer_overflow"` + 基线 `cursor`，**跳过历史回放但保持订阅与连接**，客户端应改用 `read` 补齐。
 - **空基线合法**：无历史 ≠ 无会话；禁止用「data 为空」推断会话不存在。
 - 终态事件（`exited`/`interrupted`/`error`）对同一在线订阅者只推送一次；新 `attach`/`subscribe` 仍可按 `cursor` 回放该事件（`read` 不返回）。
+- `terminal.transcript` 不使用事件 `seq`/游标：`revision` 只增不减，页面可整表重渲染；命令条数由服务端容量淘汰。
 
 ## 9. 背压与流控
 - 终端有界输出缓冲；对端慢消费时丢弃**最旧 output**，并发出 `output_dropped{from_seq,to_seq}`（marker 使用新的单调 `seq`，闭区间只含实际被丢 output）；`started/interactive*/waiting_input/attached/detached/lease_revoked/exited/interrupted/error/capabilities` 永不丢弃。
@@ -177,7 +232,7 @@
 | `bad_request` | 参数/帧非法 | false |
 | `not_found` | 终端不存在/已清理 | false |
 | `already_terminal` | 对终态终端做写操作 | false |
-| `session_exists` | 同名 `(root_session_id, name)` 已存在且未带 `force` | false |
+| `session_exists` | 同名 `(root_session_id, name)` 已存在且未带 `force`（`create` 或 `rebind`） | false |
 | `permission_denied` | 非 lease owner / 权限不足 | false |
 | `limit_exceeded` | 超过会话/缓冲/队列上限 | true |
 | `spawn_failed` | 进程创建失败 | false |
@@ -234,6 +289,7 @@
 
 ## 12. 安全
 - 不记录原始输入/输出与密钥；事件日志只留元数据与 seq。
+- Web 登录密码只从 `TERMX_WEB_PASSWORD` 读取，常量时间比较；会话只存内存，不落盘。
 - 密码/口令类输入默认不回显存储；service 不落盘原始输入输出。
 - base64 仅用于传输，不做加密；传输安全性依赖本机 socket/pipe 权限 + token。
 - helper 分发时必须 sha256 校验，且只写本次连接创建的私有临时目录：
@@ -248,5 +304,6 @@
 | --- | --- | --- |
 | `attach` / `status` / `read` / `list` | `not_found` | 允许只读，返回快照/剩余 output |
 | `send` / `resize` / `signal` / `claim` / `release` | `not_found` | `already_terminal` |
+| `rebind` | `not_found` | `already_terminal` |
 | `terminate` | `not_found` | `ok:true`（幂等） |
 | `prune` | 不影响 | 可清理 |

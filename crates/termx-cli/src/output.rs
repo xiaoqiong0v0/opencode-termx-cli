@@ -7,7 +7,7 @@ use std::io::{self, Write};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Serialize;
-use termx_protocol::{Event, EventKind, ListItem, Stream, TerminalSnapshot};
+use termx_protocol::{Event, EventKind, ListItem, Stream, TerminalSnapshot, TranscriptCommand};
 
 use crate::error::CliError;
 
@@ -139,6 +139,17 @@ impl Printer {
                     scalar(code)
                 )?;
             }
+            EventKind::Rebound {
+                old_root_session_id,
+                new_root_session_id,
+                old_name,
+                new_name,
+            } => {
+                writeln!(
+                    err,
+                    "[{seq}] rebound {old_root_session_id}/{old_name} -> {new_root_session_id}/{new_name}"
+                )?;
+            }
             EventKind::Capabilities {
                 helper,
                 version,
@@ -230,6 +241,43 @@ pub fn print_list(items: &[ListItem]) -> Result<(), CliError> {
     }
     out.flush()?;
     Ok(())
+}
+
+/// 人类模式打印命令记录。
+///
+/// 每条格式：`HH:MM:SS → HH:MM:SS [status]`，随后是命令文本与清洗后输出。
+/// 输出已由 service 去 ANSI、命令回显与末尾提示符，不在此重复清洗。
+pub fn print_transcript(commands: &[TranscriptCommand]) -> Result<(), CliError> {
+    let mut out = io::stdout().lock();
+    if commands.is_empty() {
+        writeln!(out, "（无命令记录）")?;
+        out.flush()?;
+        return Ok(());
+    }
+    for (index, command) in commands.iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
+        let started = clock(&command.started_at);
+        let ended = command
+            .ended_at
+            .as_deref()
+            .map_or_else(|| "…".to_string(), clock);
+        writeln!(out, "{started} → {ended} [{}]", scalar(&command.status))?;
+        writeln!(out, "{}", command.command)?;
+        if !command.output.is_empty() {
+            writeln!(out, "{}", command.output)?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// 从 RFC3339 时间截取 `HH:MM:SS`；格式异常时原样返回。
+fn clock(timestamp: &str) -> String {
+    timestamp
+        .get(11..19)
+        .map_or_else(|| timestamp.to_string(), ToString::to_string)
 }
 
 /// 把事件类型映射为终态。

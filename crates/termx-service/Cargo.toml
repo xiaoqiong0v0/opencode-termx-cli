@@ -18,17 +18,23 @@ termx-protocol = { path = "../termx-protocol" }
 termx-core = { path = "../termx-core" }
 # 事件摄取任务直接消费 termx-proc 的 `ProcEvent` 流。
 termx-proc = { path = "../termx-proc" }
+axum = { workspace = true }
 base64 = { workspace = true }
 futures-util = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }
+subtle = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
+# 单实例锁：对 `<config_dir>/service.lock` 持有的排他文件锁，进程退出时由 OS 释放。
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3"

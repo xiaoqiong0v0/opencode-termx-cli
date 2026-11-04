@@ -30,6 +30,8 @@ tokio-tungstenite = "0.30"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 按日文件日志的非阻塞写入与退出前 flush。
+tracing-appender = "0.2"
 rand = "0.10"
 
 # M1/F2 终端 registry 所需：全局唯一 ID 与 RFC3339 时间戳。
@@ -43,3 +45,8 @@ sha2 = "0.11"
 
 # M5b：CLI 子命令解析。
 clap = { version = "4", features = ["derive"] }
+
+# W1：内置 Web 服务（HTTP 静态页 + WebSocket 代理）。
+axum = { version = "0.8", features = ["ws", "form"] }
+# 登录密码常量时间比较。
+subtle = "2"

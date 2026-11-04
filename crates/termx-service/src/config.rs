@@ -1,17 +1,18 @@
-//! 服务配置、配置目录解析与 token/port 文件读写。
+//! 服务配置、环境调参与 token/port 文件读写。
 //!
-//! 配置目录不写死具体路径：优先 `TERMX_CONFIG_DIR`，否则按平台落到用户配置目录。
-//! token 只写到 `config_dir/token`，端口写到 `config_dir/port`。
+//! 配置目录必须由调用方显式提供（服务入口来自 `--config-dir` 或非空
+//! `TERMX_CONFIG_DIR`），本模块**不做任何平台默认目录推导**。
+//! token 写到 `config_dir/token`（可由 `--token-file` 覆盖），端口写到
+//! `config_dir/port`；文件日志目录同样由调用方显式提供。
 
 use std::{
     ffi::OsString,
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-/// 覆盖配置目录的环境变量。
-const TERMX_CONFIG_DIR_ENV: &str = "TERMX_CONFIG_DIR";
 /// 直接提供 token 的环境变量；优先于默认 token 文件。
 const TERMX_TOKEN_ENV: &str = "TERMX_TOKEN";
 /// 覆盖空闲检查 ticker 周期的环境变量，单位为毫秒。
@@ -28,33 +29,41 @@ const TERMX_INTERACTION_ENABLED_ENV: &str = "TERMX_INTERACTION_ENABLED";
 const TERMX_MAX_TERMINALS_ENV: &str = "TERMX_MAX_TERMINALS";
 /// 覆盖 stdio 写队列容量的环境变量。
 const TERMX_STDIO_WRITE_QUEUE_ENV: &str = "TERMX_STDIO_WRITE_QUEUE";
-/// Linux/macOS 的 XDG 配置根目录环境变量。
-const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
-/// Unix 用户主目录环境变量。
-const HOME_ENV: &str = "HOME";
-/// Windows 用户配置根目录环境变量。
-const APPDATA_ENV: &str = "APPDATA";
-/// 配置目录内的 termx 子目录名。
-const TERMX_DIR_NAME: &str = "termx";
-/// Unix 缺省配置子路径。
-const UNIX_CONFIG_SUBDIR: &str = ".config";
+/// 覆盖每终端命令记录容量的环境变量。
+const TERMX_TRANSCRIPT_CAPACITY_ENV: &str = "TERMX_TRANSCRIPT_CAPACITY";
+/// Web 登录密码；只从环境变量读取，不进入命令行与日志输出。
+const TERMX_WEB_PASSWORD_ENV: &str = "TERMX_WEB_PASSWORD";
+/// 覆盖「无存活会话」超时的环境变量，单位为毫秒；`0` 表示关闭。
+const TERMX_CLIENT_IDLE_TIMEOUT_MS_ENV: &str = "TERMX_CLIENT_IDLE_TIMEOUT_MS";
+/// 无存活会话到期后的处理策略：`never` / `no_children` / `any`。
+const TERMX_CLIENT_IDLE_POLICY_ENV: &str = "TERMX_CLIENT_IDLE_POLICY";
+/// 覆盖会话心跳 TTL 的环境变量，单位为毫秒。
+const TERMX_SESSION_TTL_MS_ENV: &str = "TERMX_SESSION_TTL_MS";
 
 /// token 文件名。
 pub const TOKEN_FILE_NAME: &str = "token";
 /// 监听端口文件名。
 pub const PORT_FILE_NAME: &str = "port";
+/// 单实例锁文件名；同一 `config_dir` 只允许一个 service 持有该文件的排他锁。
+pub const SERVICE_LOCK_FILE_NAME: &str = "service.lock";
 
 /// 默认监听地址：仅环回，端口由 OS 分配。
 pub const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
 /// 每个终端的事件缓冲默认容量。
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = termx_core::DEFAULT_EVENT_BUFFER_CAPACITY;
+/// 每个终端的命令记录默认容量（条）。
+pub const DEFAULT_TRANSCRIPT_CAPACITY: usize = termx_core::DEFAULT_TRANSCRIPT_CAPACITY;
 /// 每个订阅者的有界事件队列默认容量。
 pub const DEFAULT_SUBSCRIBER_QUEUE_CAPACITY: usize = termx_core::DEFAULT_SUBSCRIBER_QUEUE_CAPACITY;
 /// 入站单帧默认上限（1 MiB）。
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// 空闲检查后台 ticker 的默认周期。
 pub const DEFAULT_IDLE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// 无存活会话的默认超时（5 分钟）；`0` 表示关闭。
+pub const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// 会话心跳 TTL：超过该时间未收到心跳视为会话已结束。
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(90);
 /// 交互识别后台 ticker 的默认周期。
 pub const DEFAULT_INTERACTION_TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// 交互识别默认无输出阈值（与 core 分析器共用同一来源）。
@@ -65,20 +74,46 @@ pub const DEFAULT_INTERACTION_REPEAT_INTERVAL: Duration = termx_core::DEFAULT_RE
 /// stdio stdin 有界写队列默认容量。
 pub const DEFAULT_STDIO_WRITE_QUEUE_CAPACITY: usize =
     termx_proc::DEFAULT_STDIO_WRITE_QUEUE_CAPACITY;
+/// 文件日志默认保留天数（含当天）。
+pub const DEFAULT_LOG_MAX_DAYS: u32 = 7;
 
-/// 配置解析失败原因。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ConfigError {
-    /// 平台默认配置目录所需的用户环境变量缺失。
-    #[error("环境变量 {name} 未设置，无法解析 termx 配置目录")]
-    MissingEnv {
-        /// 缺失的环境变量名。
-        name: &'static str,
-    },
+/// 无存活会话超过超时后的处理策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClientIdlePolicy {
+    /// 永不因无会话终止。
+    Never,
+    /// 到期时若仍有用户子进程则续期，否则终止（默认）。
+    #[default]
+    NoChildren,
+    /// 到期即终止，不检查子进程。
+    Any,
+}
+
+impl ClientIdlePolicy {
+    /// 解析环境变量/配置字符串；无法识别时返回 `None`。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "never" => Some(Self::Never),
+            "no_children" | "no-children" | "nochildren" => Some(Self::NoChildren),
+            "any" => Some(Self::Any),
+            _ => None,
+        }
+    }
+
+    /// 配置/日志使用的规范名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::NoChildren => "no_children",
+            Self::Any => "any",
+        }
+    }
 }
 
 /// 服务配置。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 自定义 `Debug`：`web_password` 只在输出中标记是否已设置，绝不打印明文。
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServiceConfig {
     /// token/port 文件所在目录。
     pub config_dir: PathBuf,
@@ -86,6 +121,8 @@ pub struct ServiceConfig {
     pub bind_addr: SocketAddr,
     /// 每个终端的事件缓冲容量；缺省 4096。
     pub event_buffer_capacity: usize,
+    /// 每个终端的命令记录容量（条）；缺省 200。
+    pub transcript_capacity: usize,
     /// 每个订阅者的有界事件队列容量；缺省 1024。
     pub subscriber_queue_capacity: usize,
     /// 自定义 token 文件路径；`Some` 时优先于 `TERMX_TOKEN` 与默认文件。
@@ -94,6 +131,17 @@ pub struct ServiceConfig {
     pub max_frame_bytes: usize,
     /// 空闲检查 ticker 周期；缺省 [`DEFAULT_IDLE_TICK_INTERVAL`]。
     pub idle_tick_interval: Duration,
+    /// 无存活会话的超时；`0` 表示关闭。
+    ///
+    /// 「存活」由 `root_session_id` 的会话心跳决定（见 `session_ttl`），
+    /// Web 附着与终端级 `attach`/`subscribe` 均不参与保活。
+    /// 缺省 [`DEFAULT_CLIENT_IDLE_TIMEOUT`]（5 分钟）。
+    pub client_idle_timeout: Duration,
+    /// 无存活会话到期后的处理策略；缺省 [`ClientIdlePolicy::NoChildren`]。
+    pub client_idle_policy: ClientIdlePolicy,
+    /// 会话心跳 TTL；超过该时间未收到 `heartbeat` 视为会话结束。
+    /// 缺省 [`DEFAULT_SESSION_TTL`]（90 秒）。
+    pub session_ttl: Duration,
     /// 交互识别 ticker 周期；缺省 [`DEFAULT_INTERACTION_TICK_INTERVAL`]。
     pub interaction_tick_interval: Duration,
     /// 交互识别无输出阈值；缺省 [`DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD`]。
@@ -106,6 +154,60 @@ pub struct ServiceConfig {
     pub max_terminals: Option<usize>,
     /// stdio stdin 有界写队列容量；缺省 [`DEFAULT_STDIO_WRITE_QUEUE_CAPACITY`]。
     pub stdio_write_queue_capacity: usize,
+    /// 是否写文件日志；缺省 `false`（仅 stderr）。
+    pub log_enabled: bool,
+    /// 文件日志目录；`log_enabled` 为 `true` 时必须有值。
+    pub log_dir: Option<PathBuf>,
+    /// 文件日志保留天数（含当天）；缺省 [`DEFAULT_LOG_MAX_DAYS`]。
+    pub log_max_days: u32,
+    /// Web 服务端口；`0` 表示不启动 Web 服务。
+    pub web_port: u16,
+    /// 是否允许远程访问；`false` 时 Web 只绑定 `127.0.0.1`。
+    pub web_allow_remote: bool,
+    /// Web 登录密码；来自 `TERMX_WEB_PASSWORD`，远程访问时必填。
+    pub web_password: Option<String>,
+}
+
+impl fmt::Debug for ServiceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceConfig")
+            .field("config_dir", &self.config_dir)
+            .field("bind_addr", &self.bind_addr)
+            .field("event_buffer_capacity", &self.event_buffer_capacity)
+            .field("transcript_capacity", &self.transcript_capacity)
+            .field("subscriber_queue_capacity", &self.subscriber_queue_capacity)
+            .field("token_file", &self.token_file)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("idle_tick_interval", &self.idle_tick_interval)
+            .field("client_idle_timeout", &self.client_idle_timeout)
+            .field("client_idle_policy", &self.client_idle_policy)
+            .field("session_ttl", &self.session_ttl)
+            .field("interaction_tick_interval", &self.interaction_tick_interval)
+            .field(
+                "interaction_no_output_threshold",
+                &self.interaction_no_output_threshold,
+            )
+            .field(
+                "interaction_repeat_interval",
+                &self.interaction_repeat_interval,
+            )
+            .field("interaction_enabled", &self.interaction_enabled)
+            .field("max_terminals", &self.max_terminals)
+            .field(
+                "stdio_write_queue_capacity",
+                &self.stdio_write_queue_capacity,
+            )
+            .field("log_enabled", &self.log_enabled)
+            .field("log_dir", &self.log_dir)
+            .field("log_max_days", &self.log_max_days)
+            .field("web_port", &self.web_port)
+            .field("web_allow_remote", &self.web_allow_remote)
+            .field(
+                "web_password",
+                &self.web_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ServiceConfig {
@@ -115,16 +217,26 @@ impl ServiceConfig {
             config_dir,
             bind_addr: DEFAULT_BIND_ADDR,
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
+            transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             subscriber_queue_capacity: DEFAULT_SUBSCRIBER_QUEUE_CAPACITY,
             token_file: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             idle_tick_interval: DEFAULT_IDLE_TICK_INTERVAL,
+            client_idle_timeout: DEFAULT_CLIENT_IDLE_TIMEOUT,
+            client_idle_policy: ClientIdlePolicy::NoChildren,
+            session_ttl: DEFAULT_SESSION_TTL,
             interaction_tick_interval: DEFAULT_INTERACTION_TICK_INTERVAL,
             interaction_no_output_threshold: DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD,
             interaction_repeat_interval: DEFAULT_INTERACTION_REPEAT_INTERVAL,
             interaction_enabled: true,
             max_terminals: None,
             stdio_write_queue_capacity: DEFAULT_STDIO_WRITE_QUEUE_CAPACITY,
+            log_enabled: false,
+            log_dir: None,
+            log_max_days: DEFAULT_LOG_MAX_DAYS,
+            web_port: 0,
+            web_allow_remote: false,
+            web_password: None,
         }
     }
 
@@ -139,6 +251,13 @@ impl ServiceConfig {
     #[must_use]
     pub fn with_event_buffer_capacity(mut self, event_buffer_capacity: usize) -> Self {
         self.event_buffer_capacity = event_buffer_capacity;
+        self
+    }
+
+    /// 覆盖每个终端的命令记录容量；0 会抬到 1。
+    #[must_use]
+    pub fn with_transcript_capacity(mut self, transcript_capacity: usize) -> Self {
+        self.transcript_capacity = transcript_capacity.max(1);
         self
     }
 
@@ -167,6 +286,27 @@ impl ServiceConfig {
     #[must_use]
     pub fn with_idle_tick_interval(mut self, idle_tick_interval: Duration) -> Self {
         self.idle_tick_interval = clamp_non_zero(idle_tick_interval);
+        self
+    }
+
+    /// 覆盖无存活会话超时；`0` 表示关闭（不会抬升为非零）。
+    #[must_use]
+    pub fn with_client_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.client_idle_timeout = timeout;
+        self
+    }
+
+    /// 覆盖无存活会话到期策略。
+    #[must_use]
+    pub fn with_client_idle_policy(mut self, policy: ClientIdlePolicy) -> Self {
+        self.client_idle_policy = policy;
+        self
+    }
+
+    /// 覆盖会话心跳 TTL；0 会抬到 1ms，避免「立即过期」意外终止终端。
+    #[must_use]
+    pub fn with_session_ttl(mut self, ttl: Duration) -> Self {
+        self.session_ttl = clamp_non_zero(ttl);
         self
     }
 
@@ -212,47 +352,86 @@ impl ServiceConfig {
         self
     }
 
-    /// 从进程环境解析配置。
-    ///
-    /// 配置目录优先 `TERMX_CONFIG_DIR`，否则按平台默认：
-    /// - Linux/macOS：`$XDG_CONFIG_HOME/termx` 或 `~/.config/termx`
-    /// - Windows：`%APPDATA%\termx`
+    /// 覆盖 Web 服务端口；`0` 表示不启动 Web 服务。
+    #[must_use]
+    pub fn with_web_port(mut self, web_port: u16) -> Self {
+        self.web_port = web_port;
+        self
+    }
+
+    /// 是否允许 Web 远程访问；默认 `false`（只绑定回环）。
+    #[must_use]
+    pub fn with_web_allow_remote(mut self, allow_remote: bool) -> Self {
+        self.web_allow_remote = allow_remote;
+        self
+    }
+
+    /// 覆盖 Web 登录密码；传 `None` 表示未配置。
+    #[must_use]
+    pub fn with_web_password(mut self, password: Option<String>) -> Self {
+        self.web_password = password;
+        self
+    }
+
+    /// 用显式配置目录构造配置，并读取环境调参。
+    /// 配置目录**只**来自参数，不会从 `TERMX_CONFIG_DIR`、`XDG_CONFIG_HOME`、
+    /// `APPDATA` 或 `HOME` 推导；调用方（命令行入口）负责解析与校验。
     ///
     /// 空闲检查周期可由 `TERMX_IDLE_TICK_MS`（毫秒）覆盖；缺省为
     /// [`DEFAULT_IDLE_TICK_INTERVAL`]，非法或 0 值回退默认。
+    /// 无存活会话超时可由 `TERMX_CLIENT_IDLE_TIMEOUT_MS`（毫秒）覆盖；
+    /// 缺省 [`DEFAULT_CLIENT_IDLE_TIMEOUT`]，`0` 表示关闭，非法值回退默认。
+    /// 策略由 `TERMX_CLIENT_IDLE_POLICY`（`never`/`no_children`/`any`）覆盖；
+    /// 会话 TTL 由 `TERMX_SESSION_TTL_MS`（毫秒）覆盖。
     /// `TERMX_MAX_TERMINALS`（0 或缺失 = 不限制）与
     /// `TERMX_STDIO_WRITE_QUEUE`（0 或缺失 = 默认容量）同理。
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let config_dir = resolve_config_dir(Platform::CURRENT, |key: &str| std::env::var_os(key))?;
+    #[must_use]
+    pub fn from_env(config_dir: PathBuf) -> Self {
+        Self::from_env_with(config_dir, |key: &str| std::env::var_os(key))
+    }
+
+    /// 带可注入环境的 [`ServiceConfig::from_env`]，便于单测。
+    fn from_env_with<F>(config_dir: PathBuf, env: F) -> Self
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
         let mut config = Self::new(config_dir);
-        config.idle_tick_interval = idle_tick_interval_from_env(|key: &str| std::env::var_os(key));
+        config.idle_tick_interval = idle_tick_interval_from_env(&env);
+        config.client_idle_timeout = duration_allow_zero_from_ms_env(
+            TERMX_CLIENT_IDLE_TIMEOUT_MS_ENV,
+            DEFAULT_CLIENT_IDLE_TIMEOUT,
+            &env,
+        );
+        config.client_idle_policy = env(TERMX_CLIENT_IDLE_POLICY_ENV)
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| ClientIdlePolicy::parse(&value))
+            .unwrap_or_default();
+        config.session_ttl =
+            duration_from_ms_env(TERMX_SESSION_TTL_MS_ENV, DEFAULT_SESSION_TTL, &env);
         config.interaction_tick_interval = duration_from_ms_env(
             TERMX_INTERACTION_TICK_MS_ENV,
             DEFAULT_INTERACTION_TICK_INTERVAL,
-            |key: &str| std::env::var_os(key),
+            &env,
         );
         config.interaction_no_output_threshold = duration_from_ms_env(
             TERMX_INTERACTION_NO_OUTPUT_MS_ENV,
             DEFAULT_INTERACTION_NO_OUTPUT_THRESHOLD,
-            |key: &str| std::env::var_os(key),
+            &env,
         );
         config.interaction_repeat_interval = duration_from_ms_env(
             TERMX_INTERACTION_REPEAT_MS_ENV,
             DEFAULT_INTERACTION_REPEAT_INTERVAL,
-            |key: &str| std::env::var_os(key),
+            &env,
         );
-        config.interaction_enabled =
-            bool_from_env(TERMX_INTERACTION_ENABLED_ENV, true, |key: &str| {
-                std::env::var_os(key)
-            });
-        config.max_terminals =
-            positive_usize_from_env(TERMX_MAX_TERMINALS_ENV, |key: &str| std::env::var_os(key));
+        config.interaction_enabled = bool_from_env(TERMX_INTERACTION_ENABLED_ENV, true, &env);
+        config.max_terminals = positive_usize_from_env(TERMX_MAX_TERMINALS_ENV, &env);
+        config.transcript_capacity = positive_usize_from_env(TERMX_TRANSCRIPT_CAPACITY_ENV, &env)
+            .unwrap_or(DEFAULT_TRANSCRIPT_CAPACITY);
         config.stdio_write_queue_capacity =
-            positive_usize_from_env(TERMX_STDIO_WRITE_QUEUE_ENV, |key: &str| {
-                std::env::var_os(key)
-            })
-            .unwrap_or(DEFAULT_STDIO_WRITE_QUEUE_CAPACITY);
-        Ok(config)
+            positive_usize_from_env(TERMX_STDIO_WRITE_QUEUE_ENV, &env)
+                .unwrap_or(DEFAULT_STDIO_WRITE_QUEUE_CAPACITY);
+        config.web_password = web_password_from_env(&env);
+        config
     }
 
     /// token 文件路径；存在 `--token-file` 覆盖时使用覆盖值。
@@ -266,54 +445,10 @@ impl ServiceConfig {
     pub fn port_path(&self) -> PathBuf {
         self.config_dir.join(PORT_FILE_NAME)
     }
-}
 
-/// 配置目录解析规则所属平台。
-///
-/// 独立成枚举是为了在任一平台上都能单测 Unix/Windows 两套规则。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Platform {
-    /// Linux / macOS。
-    Unix,
-    /// Windows。
-    Windows,
-}
-
-impl Platform {
-    /// 编译目标平台。
-    const CURRENT: Self = if cfg!(windows) {
-        Self::Windows
-    } else {
-        Self::Unix
-    };
-}
-
-/// 按平台规则解析配置目录。
-fn resolve_config_dir<F>(platform: Platform, env: F) -> Result<PathBuf, ConfigError>
-where
-    F: Fn(&str) -> Option<OsString>,
-{
-    if let Some(dir) = env(TERMX_CONFIG_DIR_ENV).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
-
-    match platform {
-        Platform::Windows => env(APPDATA_ENV)
-            .filter(|value| !value.is_empty())
-            .map(|appdata| PathBuf::from(appdata).join(TERMX_DIR_NAME))
-            .ok_or(ConfigError::MissingEnv { name: APPDATA_ENV }),
-        Platform::Unix => {
-            let base = env(XDG_CONFIG_HOME_ENV)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    env(HOME_ENV)
-                        .filter(|value| !value.is_empty())
-                        .map(|home| PathBuf::from(home).join(UNIX_CONFIG_SUBDIR))
-                })
-                .ok_or(ConfigError::MissingEnv { name: HOME_ENV })?;
-            Ok(base.join(TERMX_DIR_NAME))
-        }
+    /// 单实例锁文件路径。
+    pub fn service_lock_path(&self) -> PathBuf {
+        self.config_dir.join(SERVICE_LOCK_FILE_NAME)
     }
 }
 
@@ -338,6 +473,17 @@ where
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|millis| *millis > 0);
     parsed.map_or(default, Duration::from_millis)
+}
+
+/// 从环境读取毫秒时长；允许 `0`（表示关闭），缺失或非法时回退默认值。
+fn duration_allow_zero_from_ms_env<F>(name: &str, default: Duration, env: F) -> Duration
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env(name)
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(default, Duration::from_millis)
 }
 
 /// 从环境读取布尔开关；无法识别时回退默认值。
@@ -373,6 +519,17 @@ where
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+/// 从环境读取 Web 登录密码；缺失、空串或无法解码时返回 `None`。
+fn web_password_from_env<F>(env: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env(TERMX_WEB_PASSWORD_ENV)
+        .and_then(|value| value.into_string().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// 读取已有 token；不存在或为空时生成新 token 并写盘。
@@ -436,13 +593,23 @@ fn load_or_create_token_at(path: &Path) -> std::io::Result<String> {
     Ok(token)
 }
 
-/// 写出实际监听端口。
+/// 原子化写出实际监听端口。
+///
+/// 先写同目录临时文件再 `rename` 覆盖：任一步失败只清理临时文件，不会留下
+/// 半写的 port 文件，也不会破坏上一次成功写入的有效内容。
 pub(crate) fn write_port_file(config: &ServiceConfig, port: u16) -> std::io::Result<()> {
-    std::fs::write(config.port_path(), port.to_string())
+    let path = config.port_path();
+    let temp_path = temp_file_path(&path);
+    let result = std::fs::write(&temp_path, port.to_string())
+        .and_then(|()| std::fs::rename(&temp_path, &path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// 生成 32 字节随机 token 的十六进制表示（64 个字符）。
-fn generate_token() -> String {
+pub(crate) fn generate_token() -> String {
     use rand::Rng as _;
     use std::fmt::Write as _;
 
@@ -458,7 +625,7 @@ fn generate_token() -> String {
 
 /// 原子化写入 token 文件：同目录临时文件写完 `rename` 覆盖。
 fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
-    let temp_path = temp_token_path(path);
+    let temp_path = temp_file_path(path);
     let write_result = write_temp_token_file(&temp_path, token);
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temp_path);
@@ -473,7 +640,7 @@ fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
 }
 
 /// 同目录临时文件名；避免跨设备 rename 失败。
-fn temp_token_path(path: &Path) -> PathBuf {
+fn temp_file_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -522,93 +689,23 @@ fn set_token_permissions(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
-    /// 用给定环境变量表调用配置目录解析。
-    fn resolve_with(platform: Platform, pairs: &[(&str, &str)]) -> Result<PathBuf, ConfigError> {
-        let env: BTreeMap<String, String> = pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect();
-        resolve_config_dir(platform, |key| env.get(key).map(OsString::from))
-    }
 
     #[test]
-    fn termx_config_dir_has_highest_priority() {
-        let unix = resolve_with(
-            Platform::Unix,
-            &[
-                (TERMX_CONFIG_DIR_ENV, "/tmp/termx"),
-                (XDG_CONFIG_HOME_ENV, "/xdg"),
-                (HOME_ENV, "/home/user"),
-            ],
-        )
-        .expect("应解析成功");
-        assert_eq!(unix, PathBuf::from("/tmp/termx"));
+    fn from_env_keeps_explicit_config_dir_and_never_derives_one() {
+        // 即使环境里存在 TERMX_CONFIG_DIR / HOME / APPDATA 等变量，
+        // 显式传入的目录也不会被覆盖，更不会回退到平台默认目录。
+        let config = ServiceConfig::from_env_with(PathBuf::from("/explicit/termx"), |key| {
+            matches!(
+                key,
+                "TERMX_CONFIG_DIR" | "HOME" | "APPDATA" | "XDG_CONFIG_HOME"
+            )
+            .then(|| OsString::from("/should/not/be/used"))
+        });
+        assert_eq!(config.config_dir, PathBuf::from("/explicit/termx"));
 
-        let windows = resolve_with(
-            Platform::Windows,
-            &[
-                (TERMX_CONFIG_DIR_ENV, "C:\\termx"),
-                (APPDATA_ENV, "C:\\Users\\user\\AppData\\Roaming"),
-            ],
-        )
-        .expect("应解析成功");
-        assert_eq!(windows, PathBuf::from("C:\\termx"));
-    }
-
-    #[test]
-    fn empty_termx_config_dir_falls_back_to_platform_default() {
-        let unix = resolve_with(
-            Platform::Unix,
-            &[
-                (TERMX_CONFIG_DIR_ENV, ""),
-                (XDG_CONFIG_HOME_ENV, "/xdg"),
-                (HOME_ENV, "/home/user"),
-            ],
-        )
-        .expect("应解析成功");
-        assert_eq!(unix, PathBuf::from("/xdg").join(TERMX_DIR_NAME));
-    }
-
-    #[test]
-    fn unix_uses_xdg_then_home_config() {
-        let xdg = resolve_with(
-            Platform::Unix,
-            &[(XDG_CONFIG_HOME_ENV, "/xdg"), (HOME_ENV, "/home/user")],
-        )
-        .expect("应解析成功");
-        assert_eq!(xdg, PathBuf::from("/xdg").join(TERMX_DIR_NAME));
-
-        let home = resolve_with(Platform::Unix, &[(HOME_ENV, "/home/user")]).expect("应解析成功");
-        assert_eq!(
-            home,
-            PathBuf::from("/home/user")
-                .join(UNIX_CONFIG_SUBDIR)
-                .join(TERMX_DIR_NAME)
-        );
-    }
-
-    #[test]
-    fn unix_reports_missing_home() {
-        let error = resolve_with(Platform::Unix, &[]).expect_err("应缺少 HOME");
-        assert_eq!(error, ConfigError::MissingEnv { name: HOME_ENV });
-    }
-
-    #[test]
-    fn windows_uses_appdata_and_reports_missing() {
-        let appdata = resolve_with(
-            Platform::Windows,
-            &[(APPDATA_ENV, "C:\\Users\\user\\AppData\\Roaming")],
-        )
-        .expect("应解析成功");
-        assert_eq!(
-            appdata,
-            PathBuf::from("C:\\Users\\user\\AppData\\Roaming").join(TERMX_DIR_NAME)
-        );
-
-        let error = resolve_with(Platform::Windows, &[]).expect_err("应缺少 APPDATA");
-        assert_eq!(error, ConfigError::MissingEnv { name: APPDATA_ENV });
+        // 空环境同样不会改变显式目录。
+        let empty_env = ServiceConfig::from_env_with(PathBuf::from("/only/source"), |_| None);
+        assert_eq!(empty_env.config_dir, PathBuf::from("/only/source"));
     }
 
     #[test]
@@ -628,6 +725,62 @@ mod tests {
             });
             assert_eq!(fallback, DEFAULT_IDLE_TICK_INTERVAL, "非法值 {invalid:?}");
         }
+    }
+
+    #[test]
+    fn client_idle_timeout_reads_env_and_allows_zero() {
+        let default = ServiceConfig::new(PathBuf::from("/tmp/termx"));
+        assert_eq!(default.client_idle_timeout, DEFAULT_CLIENT_IDLE_TIMEOUT);
+        assert_eq!(default.client_idle_timeout, Duration::from_secs(5 * 60));
+        assert_eq!(default.client_idle_policy, ClientIdlePolicy::NoChildren);
+        assert_eq!(default.session_ttl, DEFAULT_SESSION_TTL);
+
+        let custom = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_CLIENT_IDLE_TIMEOUT_MS_ENV).then(|| OsString::from("1200"))
+        });
+        assert_eq!(custom.client_idle_timeout, Duration::from_millis(1200));
+
+        // 0 表示关闭，必须保留为 0 而不是回退默认。
+        let disabled = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_CLIENT_IDLE_TIMEOUT_MS_ENV).then(|| OsString::from("0"))
+        });
+        assert!(disabled.client_idle_timeout.is_zero());
+
+        // 非法值回退默认。
+        let invalid = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_CLIENT_IDLE_TIMEOUT_MS_ENV).then(|| OsString::from("abc"))
+        });
+        assert_eq!(invalid.client_idle_timeout, DEFAULT_CLIENT_IDLE_TIMEOUT);
+
+        // builder 对 0 不做非零抬升。
+        assert!(
+            ServiceConfig::new(PathBuf::from("/tmp/termx"))
+                .with_client_idle_timeout(Duration::ZERO)
+                .client_idle_timeout
+                .is_zero()
+        );
+
+        // 策略与 TTL 可分别覆盖；非法策略回退默认。
+        let tuned = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| match key {
+            TERMX_CLIENT_IDLE_POLICY_ENV => Some(OsString::from("any")),
+            TERMX_SESSION_TTL_MS_ENV => Some(OsString::from("250")),
+            _ => None,
+        });
+        assert_eq!(tuned.client_idle_policy, ClientIdlePolicy::Any);
+        assert_eq!(tuned.session_ttl, Duration::from_millis(250));
+
+        let never = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_CLIENT_IDLE_POLICY_ENV).then(|| OsString::from("never"))
+        });
+        assert_eq!(never.client_idle_policy, ClientIdlePolicy::Never);
+
+        let invalid_policy = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_CLIENT_IDLE_POLICY_ENV).then(|| OsString::from("bogus"))
+        });
+        assert_eq!(
+            invalid_policy.client_idle_policy,
+            ClientIdlePolicy::NoChildren
+        );
     }
 
     #[test]
@@ -767,6 +920,12 @@ mod tests {
             "订阅队列容量至少为 1"
         );
         assert!(config.token_file.is_none());
+        assert!(!config.log_enabled);
+        assert!(config.log_dir.is_none());
+        assert_eq!(config.log_max_days, DEFAULT_LOG_MAX_DAYS);
+        assert_eq!(config.web_port, 0, "默认不启动 Web 服务");
+        assert!(!config.web_allow_remote, "默认仅回环");
+        assert!(config.web_password.is_none());
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(
             config.clone().with_max_frame_bytes(0).max_frame_bytes,
@@ -838,5 +997,34 @@ mod tests {
         let token = generate_token();
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn web_password_comes_from_env_and_is_masked_in_debug() {
+        let secret = "s3cret-value";
+        let config = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_WEB_PASSWORD_ENV).then(|| OsString::from(secret))
+        });
+        assert_eq!(config.web_password.as_deref(), Some(secret));
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"), "Debug 应标记已遮蔽");
+        assert!(!debug.contains(secret), "Debug 不得输出密码明文");
+
+        // 空串与空白视为未配置。
+        for empty in ["", "   "] {
+            let config = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+                (key == TERMX_WEB_PASSWORD_ENV).then(|| OsString::from(empty))
+            });
+            assert!(config.web_password.is_none(), "空值 {empty:?} 不应视为密码");
+        }
+
+        let configured = ServiceConfig::new(PathBuf::from("/tmp/termx"))
+            .with_web_port(8138)
+            .with_web_allow_remote(true)
+            .with_web_password(Some("pw".to_string()));
+        assert_eq!(configured.web_port, 8138);
+        assert!(configured.web_allow_remote);
+        assert_eq!(configured.web_password.as_deref(), Some("pw"));
     }
 }

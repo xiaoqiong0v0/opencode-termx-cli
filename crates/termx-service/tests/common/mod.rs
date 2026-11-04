@@ -115,6 +115,28 @@ pub async fn handshake(client: &mut Client, token: &str) {
             "proto": PROTOCOL_VERSION,
             "token": token,
             "client": "io-test",
+            "admin": true,
+        }
+    })
+    .to_string();
+    client
+        .send(Message::Text(request.into()))
+        .await
+        .expect("发送 hello 失败");
+    let response = next_response(client).await;
+    assert!(response.ok, "hello 应成功: {response:?}");
+}
+
+/// 以普通（非管理员）身份完成 `hello`，调用者会话为 `root_session_id`。
+pub async fn handshake_root(client: &mut Client, token: &str, root_session_id: &str) {
+    let request = serde_json::json!({
+        "id": "h-002",
+        "method": "hello",
+        "params": {
+            "proto": PROTOCOL_VERSION,
+            "token": token,
+            "client": "io-test",
+            "root_session_id": root_session_id,
         }
     })
     .to_string();

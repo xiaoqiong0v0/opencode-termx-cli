@@ -16,6 +16,12 @@ pub const PROTOCOL_VERSION: &str = "termx/1";
 /// helper 协议版本标识，对应 `helper.hello.proto`。
 pub const HELPER_PROTOCOL_VERSION: &str = "termx-helper/1";
 
+/// Web 未绑定终端的保留 `root_session_id`。
+///
+/// 该值的终端不参与「无存活会话」超时扫描，只能手动终止；非管理员连接
+/// 不能以它作为自身会话，也不能访问该会话下的终端。见 `docs/PROTOCOL.md` §6。
+pub const WEB_ROOT_SESSION_ID: &str = "@web";
+
 /// 协议 JSON 编解码错误。
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
@@ -391,6 +397,19 @@ pub enum EventKind {
         /// 是否可重试。
         retryable: bool,
     },
+    /// 终端绑定键已迁移到新的 `(root_session_id, name)`。
+    ///
+    /// `terminal_id`、进程与输入 lease 均保持不变；`seq` 继续在同一终端内递增。
+    Rebound {
+        /// 迁移前的 opencode 会话 ID。
+        old_root_session_id: String,
+        /// 迁移后的 opencode 会话 ID。
+        new_root_session_id: String,
+        /// 迁移前的会话内名称。
+        old_name: String,
+        /// 迁移后的会话内名称。
+        new_name: String,
+    },
     /// SSH/helper 能力与降级标识。
     Capabilities {
         /// helper 是否可用。
@@ -425,6 +444,14 @@ pub struct TerminalSnapshot {
     pub state: LifecycleState,
     /// 创建模式。
     pub mode: Mode,
+    /// 启动程序（`terminal.create` 的原始 `cmd`）。
+    pub command: String,
+    /// 启动参数（`terminal.create` 的原始 `args`）。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 启动工作目录（`terminal.create` 的原始 `cwd`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// 主进程 ID（未创建时缺省）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -646,6 +673,10 @@ impl TerminalLocator {
 }
 
 /// `hello` 参数。
+///
+/// 连接级访问身份由 `root_session_id` 或 `admin` 二选一确定：
+/// - 普通客户端必须携带 `root_session_id`，之后只能访问该会话的终端；
+/// - `admin: true` 用于 Web 代理等管理连接，可访问/迁移全部终端。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloParams {
     /// 主协议版本。
@@ -654,6 +685,12 @@ pub struct HelloParams {
     pub token: String,
     /// 客户端标识。
     pub client: String,
+    /// 调用者 opencode 会话 ID；非 admin 连接必填。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<String>,
+    /// 是否为管理员连接（Web 代理使用）。
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// helper / SSH 能力描述。
@@ -738,6 +775,14 @@ pub struct ListItem {
     pub state: LifecycleState,
     /// 创建模式。
     pub mode: Mode,
+    /// 启动程序（`terminal.create` 的原始 `cmd`）。
+    pub command: String,
+    /// 启动参数（`terminal.create` 的原始 `args`）。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 启动工作目录（`terminal.create` 的原始 `cwd`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// 主进程 ID（未创建时缺省）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -749,6 +794,31 @@ pub struct ListItem {
     pub last_activity: Option<String>,
     /// 创建时间（RFC3339 UTC）。
     pub created_at: String,
+}
+
+/// `session.list` 参数；当前不需要任何字段。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListParams {}
+
+/// 已知 opencode 会话的摘要（不含 token 等敏感信息）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// opencode 会话 ID。
+    pub root_session_id: String,
+    /// 是否在会话 TTL 内收到过心跳。
+    pub live: bool,
+    /// 距最近一次心跳的毫秒数；仅存活会话提供。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+    /// 该会话当前关联的终端数。
+    pub terminals: u32,
+}
+
+/// `session.list` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListResult {
+    /// 按 `root_session_id` 升序排列的会话摘要。
+    pub sessions: Vec<SessionInfo>,
 }
 
 /// `terminal.attach` 结果。
@@ -855,6 +925,35 @@ pub struct TerminateParams {
     /// 是否强制终止（跳过优雅退出）。
     #[serde(default)]
     pub force: bool,
+}
+
+/// `terminal.rebind` 参数。
+///
+/// 定位器只接受 `terminal_id`：`root_session_id` 与 `name` 在本方法中表示**目标**
+/// 绑定键，无法再用作旧键定位（旧键可由 `terminal_id` 唯一确定）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebindParams {
+    /// 终端内部 ID（必填）。
+    pub terminal_id: String,
+    /// 目标 opencode 会话 ID。
+    pub root_session_id: String,
+    /// 目标会话内名称；缺省表示保留原名。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 目标键已存在时是否终止目标旧终端后迁移。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `terminal.rebind` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebindResult {
+    /// 终端 ID（迁移前后不变）。
+    pub terminal_id: String,
+    /// 迁移后的 opencode 会话 ID。
+    pub root_session_id: String,
+    /// 迁移后的会话内名称。
+    pub name: String,
 }
 
 /// `{ value, unit }` 形式的时间跨度，用于 `prune.older_than`。
@@ -970,13 +1069,19 @@ mod tests {
                 message: "daemon 重启".to_string(),
                 retryable: true,
             },
+            EventKind::Rebound {
+                old_root_session_id: "ses-1".to_string(),
+                new_root_session_id: "ses-2".to_string(),
+                old_name: "build".to_string(),
+                new_name: "verify".to_string(),
+            },
             EventKind::Capabilities {
                 helper: true,
                 version: HELPER_PROTOCOL_VERSION.to_string(),
                 best_effort: false,
             },
         ];
-        assert_eq!(kinds.len(), 12, "EventKind 变体数量应为 12");
+        assert_eq!(kinds.len(), 13, "EventKind 变体数量应为 13");
 
         for kind in kinds {
             let event = sample_event(kind);
@@ -1256,6 +1361,9 @@ mod tests {
             terminal_id: "01JABCDEF".to_string(),
             state: LifecycleState::Running,
             mode: Mode::Pty,
+            command: "pwsh".to_string(),
+            args: vec!["-NoLogo".to_string()],
+            cwd: Some("C:\\work".to_string()),
             pid: Some(100),
             pgid: Some(100),
             ppid: Some(1),
@@ -1307,10 +1415,14 @@ mod tests {
             proto: PROTOCOL_VERSION.to_string(),
             token: "secret".to_string(),
             client: "termx-cli".to_string(),
+            root_session_id: Some("ses-1".to_string()),
+            admin: false,
         };
         let hello_json: JsonValue =
             serde_json::from_str(&to_json(&hello).expect("序列化失败")).expect("JSON 解析失败");
         assert_eq!(hello_json["proto"], PROTOCOL_VERSION);
+        assert_eq!(hello_json["root_session_id"], "ses-1");
+        assert_eq!(hello_json["admin"], false);
         let hello_back: HelloParams =
             from_json(&to_json(&hello).expect("序列化失败")).expect("反序列化失败");
         assert_eq!(hello, hello_back);
@@ -1410,6 +1522,30 @@ mod tests {
             serde_json::from_str(&to_json(&locator).expect("序列化失败")).expect("JSON 解析失败");
         assert!(json.get("root_session_id").is_none());
         assert!(json.get("name").is_none());
+    }
+
+    #[test]
+    fn rebind_params_round_trip_and_omit_optional_name() {
+        let params: RebindParams =
+            from_json(r#"{"terminal_id":"01JABCDEF","root_session_id":"ses-2","force":true}"#)
+                .expect("rebind 反序列化失败");
+        assert_eq!(params.terminal_id, "01JABCDEF");
+        assert_eq!(params.root_session_id, "ses-2");
+        assert!(params.name.is_none());
+        assert!(params.force);
+
+        let value: JsonValue =
+            serde_json::from_str(&to_json(&params).expect("序列化失败")).expect("JSON 解析失败");
+        assert!(value.get("name").is_none(), "缺省 name 不应出现在 JSON 中");
+        let back: RebindParams =
+            from_json(&to_json(&params).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(params, back);
+
+        let named: RebindParams =
+            from_json(r#"{"terminal_id":"01JABCDEF","root_session_id":"ses-2","name":"verify"}"#)
+                .expect("带 name 的 rebind 反序列化失败");
+        assert_eq!(named.name.as_deref(), Some("verify"));
+        assert!(!named.force);
     }
 
     #[test]
@@ -1613,4 +1749,55 @@ mod tests {
                 .expect("JSON 解析失败");
         assert_eq!(value["all"], JsonValue::Bool(false));
     }
+}
+
+/// 命令记录状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptStatus {
+    /// 已开始、仍在等待输出/结束。
+    Running,
+    /// 命令正常结束（下一条命令到来或静默达到阈值）。
+    Done,
+    /// 终端进程已退出。
+    Exited,
+    /// 终端被信号/终止操作中断。
+    Interrupted,
+    /// 终端进入错误终态。
+    Error,
+}
+
+/// 单条命令记录（信息页使用）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptCommand {
+    /// 用户发送且 `enter=true` 的命令文本（已去掉末尾 CR/LF）。
+    pub command: String,
+    /// 命令开始时间（RFC3339 UTC）。
+    pub started_at: String,
+    /// 命令结束时间（RFC3339 UTC）；`running` 时为 `None`。
+    pub ended_at: Option<String>,
+    /// 命令状态。
+    pub status: TranscriptStatus,
+    /// 已清洗的输出（去 ANSI、命令回显与末尾提示符）。
+    pub output: String,
+}
+
+/// `terminal.transcript` 参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TranscriptParams {
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
+    /// 返回最近多少条命令；缺省/0 表示返回全部保留记录。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `terminal.transcript` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptResult {
+    /// 按时间升序排列的命令记录。
+    pub commands: Vec<TranscriptCommand>,
+    /// 每次记录/追加/结束时递增的修订号，供客户端判断是否需要重渲染。
+    pub revision: u64,
 }

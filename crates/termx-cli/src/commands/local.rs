@@ -1,5 +1,7 @@
 //! `local` 子命令：创建本地 PTY，可选持续跟随事件。
 
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 
 use termx_client::Client;
@@ -12,6 +14,7 @@ use crate::{
     cli::{Cli, LocalArgs},
     commands::{
         closed_error, connect, new_terminal_name, parse_env, resync_events, root_session_id,
+        spawn_heartbeat,
     },
     error::CliError,
     output::{Printer, print_json},
@@ -19,10 +22,11 @@ use crate::{
 
 /// 执行 `local` 子命令。
 pub async fn run(cli: &Cli, args: &LocalArgs) -> Result<i32, CliError> {
-    let client = connect(cli).await?;
+    let client = Arc::new(connect(cli).await?);
+    let root = root_session_id(cli);
     // 先订阅再 create/attach，避免回放事件因无接收者被丢弃。
     let mut events = client.events();
-    let created = client.create(build_params(cli, args)?).await?;
+    let created = client.create(build_params(cli, args, &root)?).await?;
     print_created(&created, cli.json)?;
 
     if !args.follow {
@@ -30,13 +34,19 @@ pub async fn run(cli: &Cli, args: &LocalArgs) -> Result<i32, CliError> {
         return Ok(0);
     }
 
+    let heartbeat = spawn_heartbeat(Arc::clone(&client), root);
     let result = follow(&client, &mut events, &created, cli.json).await;
+    heartbeat.abort();
     client.close().await;
     result
 }
 
-/// 组装 PTY 创建参数。
-fn build_params(cli: &Cli, args: &LocalArgs) -> Result<CreateParams, CliError> {
+/// 组装 PTY 创建参数；`root_session_id` 同时用于 `hello` 与心跳。
+fn build_params(
+    cli: &Cli,
+    args: &LocalArgs,
+    root_session_id: &str,
+) -> Result<CreateParams, CliError> {
     Ok(CreateParams {
         mode: Mode::Pty,
         cmd: args.cmd.clone().unwrap_or_else(default_shell),
@@ -45,7 +55,7 @@ fn build_params(cli: &Cli, args: &LocalArgs) -> Result<CreateParams, CliError> {
         env: parse_env(&args.env)?,
         cols: Some(args.cols),
         rows: Some(args.rows),
-        root_session_id: root_session_id(cli),
+        root_session_id: root_session_id.to_string(),
         name: new_terminal_name(cli, "local"),
         force: cli.force,
         idle_timeout: build_idle_timeout(args),

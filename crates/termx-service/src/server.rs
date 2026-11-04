@@ -1,27 +1,31 @@
 //! 环回 WebSocket 服务、连接级鉴权状态机与 `hello` 握手。
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
+use serde::Deserialize;
 use termx_core::{
-    BackendFactory, CoreError, DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction,
-    InteractionConfig, ModeFactory, Registry, SpawnedBackend, TerminalBackend, TerminalId,
+    BackendFactory, CLIENT_TIMEOUT_SOURCE, ClientlessCandidate, CoreError, DEFAULT_QUIET_FINALIZE,
+    DETACH_REASON_DISCONNECT, ExitOutcome, IdleAction, InteractionConfig, ModeFactory, Registry,
+    SpawnedBackend, TerminalBackend, TerminalId,
 };
 use termx_proc::{OutputStream, ProcEvent};
 use termx_protocol::{
     AttachParams, Capabilities, ClaimParams, CreateParams, DetachParams, ErrorCode, Event,
-    EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListParams, Mode,
-    PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, ReleaseParams, Request, ResizeParams,
-    Response, SendParams, SignalParams, SimpleResult, StatusParams, StatusResult, Stream,
-    SubscribeParams, SubscribeResult, SubscriptionCursor, TerminalLocator, TerminalSnapshot,
-    TerminateParams, UnsubscribeParams, from_json, to_json,
+    EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListItem, ListParams, Mode,
+    PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, RebindParams, ReleaseParams, Request,
+    ResizeParams, Response, SendParams, SessionInfo, SessionListParams, SessionListResult,
+    SignalParams, SimpleResult, StatusParams, StatusResult, Stream, SubscribeParams,
+    SubscribeResult, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TerminateParams,
+    TranscriptParams, UnsubscribeParams, WEB_ROOT_SESSION_ID, from_json, to_json,
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -44,7 +48,9 @@ use tokio_tungstenite::{
 };
 use ulid::Ulid;
 
-use crate::config::{ServiceConfig, load_or_create_token, write_port_file};
+use crate::config::{ClientIdlePolicy, ServiceConfig, load_or_create_token, write_port_file};
+use crate::lock::{LockError, ServiceLock};
+use crate::web::WebServer;
 
 /// 服务端标识，随包版本变化。
 const SERVER_ID: &str = concat!("termx-service/", env!("CARGO_PKG_VERSION"));
@@ -62,13 +68,240 @@ const BEARER_PREFIX: &str = "bearer";
 /// 订阅队列溢出、状态事件无法投递时发给客户端的说明。
 const LIMIT_EXCEEDED_MESSAGE: &str =
     "订阅事件队列已满，状态事件无法保证投递；连接将断开，请重连后按 cursor 补齐";
+/// 控制台辅助进程名（Windows ConPTY/winpty 会随终端附带，不计为用户子进程）。
+const CONSOLE_HELPER_NAMES: &[&str] = &[
+    "conhost.exe",
+    "conhost",
+    "winpty.exe",
+    "winpty",
+    "openconsole.exe",
+    "openconsole",
+];
+
+/// 会话心跳表：`root_session_id -> last_seen`，并记录判定存活的 TTL。
+///
+/// 与 registry 分开加锁；ticker 只在锁内清理过期项并生成存活集合快照，
+/// 不跨 `await` 持锁。`session.list` 复用同一把锁读取心跳快照。
+struct SessionBookState {
+    /// 各会话最近一次心跳时间。
+    entries: Mutex<HashMap<String, Instant>>,
+    /// 心跳超过该时长视为会话不再存活。
+    ttl: Duration,
+}
+
+/// 会话心跳表句柄。
+type SessionBook = Arc<SessionBookState>;
+
+/// 新式 `heartbeat` 参数；旧客户端发送 `{}` 时按连接级心跳处理。
+#[derive(Debug, Default, Deserialize)]
+struct HeartbeatParams {
+    /// 所属 opencode 会话 ID；缺失表示旧的连接级心跳。
+    #[serde(default)]
+    root_session_id: Option<String>,
+}
+
+/// `session_closed` 参数。
+#[derive(Debug, Deserialize)]
+struct SessionClosedParams {
+    /// 已删除的 opencode 会话 ID。
+    root_session_id: String,
+}
+
+/// 连接级调用者身份，来自 `hello.root_session_id` / `hello.admin`。
+///
+/// 普通连接必须携带 `root_session_id`，只能访问同 root 的终端；
+/// 管理员连接（Web 代理）可访问/迁移全部终端。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Caller {
+    /// 调用者 opencode 会话 ID；admin 连接为 `None`。
+    root_session_id: Option<String>,
+    /// 是否为管理员连接。
+    admin: bool,
+}
+
+impl Caller {
+    /// 列表/清理等批量操作的会话范围；`None` 表示不限制（管理员）。
+    fn scope(&self) -> Option<&str> {
+        if self.admin {
+            None
+        } else {
+            self.root_session_id.as_deref()
+        }
+    }
+
+    /// 是否可访问指定会话的终端。
+    ///
+    /// `@web` 是 Web 未绑定终端的保留会话，仅管理员可见/可操作；普通连接
+    /// 即使自称该 root 也不能访问。
+    fn can_access_root(&self, root_session_id: &str) -> bool {
+        self.admin
+            || (root_session_id != WEB_ROOT_SESSION_ID
+                && self.root_session_id.as_deref() == Some(root_session_id))
+    }
+
+    /// 校验可访问指定会话；否则返回 `permission_denied`。
+    fn require_root(&self, root_session_id: &str) -> Result<(), CoreError> {
+        if self.can_access_root(root_session_id) {
+            Ok(())
+        } else {
+            Err(CoreError::PermissionDenied)
+        }
+    }
+}
+
+/// 解析定位器并鉴权，返回只含 `terminal_id` 的定位器。
+///
+/// 调用方必须持有同一把 registry 锁，并在返回后立即执行实际操作。
+fn authorize_locator(
+    registry: &Registry,
+    locator: &TerminalLocator,
+    caller: &Caller,
+) -> Result<TerminalLocator, CoreError> {
+    let id = registry.authorize(locator, caller.admin, caller.root_session_id.as_deref())?;
+    Ok(TerminalLocator {
+        terminal_id: Some(id.to_string()),
+        root_session_id: None,
+        name: None,
+    })
+}
+
+/// 新建空会话表。
+fn new_session_book(ttl: Duration) -> SessionBook {
+    Arc::new(SessionBookState {
+        entries: Mutex::new(HashMap::new()),
+        ttl,
+    })
+}
+
+/// 记录一次会话心跳（覆盖为 `now`）。
+fn record_session_heartbeat(sessions: &SessionBook, root_session_id: &str, now: Instant) {
+    let mut entries = lock_sessions(sessions);
+    entries.insert(root_session_id.to_string(), now);
+}
+
+/// 显式关闭会话；不存在时幂等。
+fn remove_session(sessions: &SessionBook, root_session_id: &str) {
+    let mut entries = lock_sessions(sessions);
+    entries.remove(root_session_id);
+}
+
+/// 心跳是否仍在 TTL 内。
+fn is_session_live(last_seen: Instant, now: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(last_seen) < ttl
+}
+
+/// 清理超过 TTL 的会话，并返回当前存活会话集合。
+///
+/// 在锁内只做 map 增删与克隆，不跨 `await`。调用方用该集合在锁外按
+/// `root_session_id` 判断终端是否仍有会话。
+fn live_sessions(sessions: &SessionBook, now: Instant) -> HashSet<String> {
+    let mut entries = lock_sessions(sessions);
+    entries.retain(|_, last_seen| is_session_live(*last_seen, now, sessions.ttl));
+    entries.keys().cloned().collect()
+}
+
+/// 清理过期心跳后返回存活会话及其最近心跳时间。
+fn live_heartbeats(sessions: &SessionBook, now: Instant) -> HashMap<String, Instant> {
+    let mut entries = lock_sessions(sessions);
+    entries.retain(|_, last_seen| is_session_live(*last_seen, now, sessions.ttl));
+    entries.clone()
+}
+
+/// 获取会话表锁；中毒时取回内部值，避免一次 panic 永久阻断保活判定。
+fn lock_sessions(sessions: &SessionBook) -> MutexGuard<'_, HashMap<String, Instant>> {
+    sessions
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 合并存活心跳与 registry 中所有终端的 `root_session_id`，生成会话摘要。
+///
+/// 排序与去重由 `BTreeMap` 保证；`live` 只反映心跳是否在 TTL 内，终端是否
+/// 运行不影响该标记。调用方需保证 registry 锁已释放。
+fn build_session_list(
+    heartbeats: HashMap<String, Instant>,
+    terminals: Vec<ListItem>,
+    now: Instant,
+) -> SessionListResult {
+    let mut sessions: BTreeMap<String, SessionInfo> = BTreeMap::new();
+    for (root_session_id, last_seen) in heartbeats {
+        let last_seen_ms =
+            u64::try_from(now.saturating_duration_since(last_seen).as_millis()).unwrap_or(u64::MAX);
+        sessions.insert(
+            root_session_id.clone(),
+            SessionInfo {
+                root_session_id,
+                live: true,
+                last_seen_ms: Some(last_seen_ms),
+                terminals: 0,
+            },
+        );
+    }
+    for terminal in terminals {
+        let entry = sessions
+            .entry(terminal.root_session_id.clone())
+            .or_insert_with(|| SessionInfo {
+                root_session_id: terminal.root_session_id.clone(),
+                live: false,
+                last_seen_ms: None,
+                terminals: 0,
+            });
+        entry.terminals = entry.terminals.saturating_add(1);
+    }
+    SessionListResult {
+        sessions: sessions.into_values().collect(),
+    }
+}
+/// 判断进程树里是否存在用户子进程。
+///
+/// 排除终端根进程本身与控制台辅助进程（conhost/winpty/OpenConsole）；
+/// 其余任一节点都视为用户子进程。
+fn has_user_children(root_pid: Option<u32>, tree: &[termx_protocol::ProcNode]) -> bool {
+    tree.iter()
+        .filter(|node| Some(node.pid) != root_pid)
+        .any(|node| !is_console_helper(&node.cmd))
+}
+
+/// 判断命令行是否属于控制台辅助进程（按可执行文件名匹配）。
+fn is_console_helper(cmd: &str) -> bool {
+    let executable = cmd.split_whitespace().next().unwrap_or(cmd);
+    let name = executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    CONSOLE_HELPER_NAMES.contains(&name.as_str())
+}
+
+/// 在锁外采集进程树，判断该终端是否仍有用户子进程。
+///
+/// 采集带超时：`tree()` 卡住时保守地按「有子进程」处理，避免误杀；
+/// 后端返回空树（不支持进程树）时按「无子进程」处理。
+async fn candidate_has_user_children(candidate: &ClientlessCandidate) -> bool {
+    let pid = candidate.pid;
+    let backend = Arc::clone(&candidate.backend);
+    let collected = tokio::time::timeout(
+        INTERACTION_SAMPLE_TIMEOUT,
+        tokio::task::spawn_blocking(move || has_user_children(pid, &backend.tree())),
+    )
+    .await;
+    match collected {
+        Ok(Ok(has_children)) => has_children,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "采集进程树任务失败，按有子进程处理");
+            true
+        }
+        Err(_) => {
+            tracing::warn!(pid = ?pid, "采集进程树超时，按有子进程处理");
+            true
+        }
+    }
+}
 
 /// 服务启动或运行期错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
-    /// 配置目录解析失败。
-    #[error("配置错误: {0}")]
-    Config(#[from] crate::ConfigError),
     /// 文件或网络 I/O 失败。
     #[error("文件或网络 I/O 失败: {0}")]
     Io(#[from] std::io::Error),
@@ -84,6 +317,9 @@ pub enum ServiceError {
     /// 配置要求绑定非环回地址。
     #[error("拒绝绑定非环回地址: {0}")]
     NonLoopbackBind(SocketAddr),
+    /// 同一配置目录已有另一个 service 实例持锁运行。
+    #[error("termx-service 已在运行（单实例锁被占用）: {0}")]
+    AlreadyRunning(PathBuf),
 }
 
 /// 已绑定监听端口的服务实例。
@@ -91,9 +327,13 @@ pub struct Service {
     listener: TcpListener,
     local_addr: SocketAddr,
     config: ServiceConfig,
+    /// 单实例锁；持有到 `Service` 被丢弃，进程退出时由 OS 自动释放。
+    _lock: ServiceLock,
     token: Arc<str>,
     /// 多客户端共享的终端 registry；std Mutex 临界区不跨 `await`。
     registry: Arc<Mutex<Registry>>,
+    /// `web_port > 0` 时预先绑定的 Web 监听器。
+    web: Option<WebServer>,
 }
 
 impl Service {
@@ -119,9 +359,30 @@ impl Service {
 
         // 端口文件始终写到 config_dir；即使 token 走环境变量或自定义文件也要保证目录存在。
         std::fs::create_dir_all(&config.config_dir)?;
+
+        // 顺序契约：先拿单实例锁，再写 token、绑定主监听/Web，最后原子写 port。
+        // 锁获取失败（另一个实例在运行）时绝不触碰 token/port 文件。
+        let lock_path = config.service_lock_path();
+        let lock = ServiceLock::acquire(&lock_path).map_err(|error| match error {
+            LockError::Contended => ServiceError::AlreadyRunning(lock_path.clone()),
+            LockError::Io(error) => ServiceError::Io(error),
+        })?;
+
         let token = load_or_create_token(&config)?;
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
+        let token: Arc<str> = Arc::from(token);
+        // Web 端口在 bind 阶段就占用，端口冲突会直接启动失败，而不是运行期才暴露。
+        let web = if config.web_port > 0 {
+            Some(
+                WebServer::bind(&config, local_addr, Arc::clone(&token))
+                    .await
+                    .map_err(ServiceError::Io)?,
+            )
+        } else {
+            None
+        };
+        // port 是最后一步：主监听与 Web 都成功后才原子替换，失败不会覆盖旧文件。
         write_port_file(&config, local_addr.port())?;
         let mut registry = Registry::with_config(
             config.event_buffer_capacity,
@@ -129,6 +390,7 @@ impl Service {
             factory,
         );
         registry.set_max_terminals(config.max_terminals);
+        registry.set_transcript_capacity(config.transcript_capacity);
         registry.set_interaction_config(InteractionConfig {
             enabled: config.interaction_enabled,
             no_output_threshold: config.interaction_no_output_threshold,
@@ -146,14 +408,21 @@ impl Service {
             listener,
             local_addr,
             config,
-            token: Arc::from(token),
+            _lock: lock,
+            token,
             registry,
+            web,
         })
     }
 
     /// 实际监听地址（包含由 OS 分配的端口）。
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Web 服务实际监听地址；`web_port = 0` 时为 `None`。
+    pub fn web_local_addr(&self) -> Option<SocketAddr> {
+        self.web.as_ref().map(WebServer::local_addr)
     }
 
     /// 服务使用的配置。
@@ -184,12 +453,26 @@ impl Service {
     {
         tokio::pin!(shutdown);
 
+        // Web 服务与主服务同生命周期：run_until 被 abort 时守卫会中止 Web 任务，
+        // 正常停机时在 accept 循环结束后立即中止。
+        let web_guard = self.web.map(|web| {
+            AbortOnDrop(tokio::spawn(async move {
+                if let Err(error) = web.serve().await {
+                    tracing::warn!(%error, "termx web 服务结束");
+                }
+            }))
+        });
+
         // 空闲检查与交互识别 ticker 与 accept 循环同生命周期：shutdown 时先发
         // 停止信号，再等待两个 ticker 退出，避免后台任务悬挂。
         let (stop_tx, stop_rx) = watch::channel(false);
+        let sessions = new_session_book(self.config.session_ttl);
         let idle_ticker = tokio::spawn(run_idle_ticker(
             Arc::clone(&self.registry),
             self.config.idle_tick_interval,
+            self.config.client_idle_timeout,
+            self.config.client_idle_policy,
+            Arc::clone(&sessions),
             stop_rx.clone(),
         ));
         let interaction_ticker = tokio::spawn(run_interaction_ticker(
@@ -216,19 +499,14 @@ impl Service {
                     }
 
                     let token = Arc::clone(&self.token);
-                    let registry = Arc::clone(&self.registry);
-                    let max_frame_bytes = self.config.max_frame_bytes;
-                    let subscriber_queue_capacity = self.config.subscriber_queue_capacity;
+                    let resources = ConnectionResources {
+                        registry: Arc::clone(&self.registry),
+                        sessions: Arc::clone(&sessions),
+                        max_frame_bytes: self.config.max_frame_bytes,
+                        subscriber_queue_capacity: self.config.subscriber_queue_capacity,
+                    };
                     tokio::spawn(async move {
-                        if let Err(error) = handle_connection(
-                            stream,
-                            token,
-                            registry,
-                            max_frame_bytes,
-                            subscriber_queue_capacity,
-                        )
-                        .await
-                        {
+                        if let Err(error) = handle_connection(stream, token, resources).await {
                             tracing::debug!(peer = %peer_addr, %error, "连接处理结束");
                         }
                     });
@@ -239,6 +517,7 @@ impl Service {
         let _ = stop_tx.send(true);
         let _ = idle_ticker.await;
         let _ = interaction_ticker.await;
+        drop(web_guard);
 
         // shutdown：先停止 ticker 与新连接，再在锁外 best-effort 终止所有后端，
         // 确保 stdio/PTY 子进程不会随 service 退出而残留。
@@ -253,13 +532,30 @@ impl Service {
     }
 }
 
-/// 后台空闲检查：周期调用 [`Registry::expire_idle`]。
+/// 任务守卫：离开作用域时中止后台任务，避免主服务退出后 Web 监听残留。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 后台空闲检查：周期处理 `idle_timeout` 与「无存活会话」超时。
 ///
-/// 锁纪律：只在同步块内取 registry 锁调用 `expire_idle`（事件投递为非阻塞
-/// send），`Terminate` 返回的后端在锁外通过阻塞线程池终止。
+/// 锁纪律：
+/// - 会话表锁只用于清理 TTL、生成存活集合快照与记录心跳，绝不跨 `await`；
+/// - registry 锁内只做计时/落终态并取出后端 `Arc`，进程树采集与后端终止
+///   都在锁外执行。
+///
+/// 保活条件：终端的 `root_session_id` 在会话表内且未超过 `session_ttl`。
+/// Web 附着与终端级 `attach`/`subscribe` 均不参与保活。
 async fn run_idle_ticker(
     registry: Arc<Mutex<Registry>>,
     period: Duration,
+    client_idle_timeout: Duration,
+    client_idle_policy: ClientIdlePolicy,
+    sessions: SessionBook,
     mut stop: watch::Receiver<bool>,
 ) {
     let period = period.max(Duration::from_millis(1));
@@ -277,10 +573,27 @@ async fn run_idle_ticker(
                 }
             }
             _ = interval.tick() => {
-                let actions = {
+                let now = OffsetDateTime::now_utc();
+                let now_std = Instant::now();
+                let live = live_sessions(&sessions, now_std);
+
+                let (actions, clientless) = {
                     let mut registry = lock_registry(&registry);
-                    registry.expire_idle(OffsetDateTime::now_utc())
+                    // 信息页命令的静默结束与空闲检查共用同一周期。
+                    registry.finalize_quiet_transcripts(now, DEFAULT_QUIET_FINALIZE);
+                    let actions = registry.expire_idle(now);
+                    let clientless = if client_idle_policy == ClientIdlePolicy::Never
+                        || client_idle_timeout.is_zero()
+                    {
+                        Vec::new()
+                    } else {
+                        registry.candidates_clientless(now_std, client_idle_timeout, |root| {
+                            live.contains(root)
+                        })
+                    };
+                    (actions, clientless)
                 };
+
                 // 每个待终止后端独立 spawn 一个任务：多个终端同时到期时并行执行，
                 // 避免一个慢后端串行拖住整轮扫描，也缩短 shutdown 等待。
                 let mut terminations = Vec::new();
@@ -300,6 +613,54 @@ async fn run_idle_ticker(
                         }
                     }
                 }
+
+                for candidate in clientless {
+                    if client_idle_policy == ClientIdlePolicy::NoChildren
+                        && candidate_has_user_children(&candidate).await
+                    {
+                        // 仍有用户子进程：继续保活，子进程退出后重新按超时计时。
+                        let mut registry = lock_registry(&registry);
+                        let _ = registry.reset_clientless(&candidate.terminal_id, Instant::now());
+                        tracing::debug!(
+                            terminal_id = %candidate.terminal_id,
+                            root_session_id = %candidate.root_session_id,
+                            "无存活会话但仍有用户子进程：继续保活"
+                        );
+                        continue;
+                    }
+
+                    // 锁外判定完成后重新取锁落终态；同 ID 可能已被替换或终止。
+                    let backend = {
+                        let mut registry = lock_registry(&registry);
+                        match registry
+                            .terminate_with_source(&candidate.terminal_id, CLIENT_TIMEOUT_SOURCE)
+                        {
+                            Ok(Some(backend)) => {
+                                tracing::info!(
+                                    terminal_id = %candidate.terminal_id,
+                                    root_session_id = %candidate.root_session_id,
+                                    policy = client_idle_policy.as_str(),
+                                    "无存活会话超时：终止终端"
+                                );
+                                Some(backend)
+                            }
+                            // 已被其它路径落终态：幂等跳过。
+                            Ok(None) => None,
+                            Err(error) => {
+                                tracing::debug!(
+                                    terminal_id = %candidate.terminal_id,
+                                    %error,
+                                    "无存活会话超时终止失败"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    if let Some(backend) = backend {
+                        terminations.push(tokio::spawn(terminate_backend(backend)));
+                    }
+                }
+
                 for handle in terminations {
                     if let Err(error) = handle.await {
                         tracing::debug!(%error, "空闲终止任务失败");
@@ -416,13 +777,23 @@ async fn sample_terminal_interaction(
     }
 }
 
+/// 连接处理共享的资源与上限；在 accept 后按连接克隆引用。
+struct ConnectionResources {
+    /// 共享 registry。
+    registry: Arc<Mutex<Registry>>,
+    /// 共享会话心跳表。
+    sessions: SessionBook,
+    /// 入站帧上限。
+    max_frame_bytes: usize,
+    /// 订阅事件队列容量。
+    subscriber_queue_capacity: usize,
+}
+
 /// 处理单个客户端连接：完成 `hello` 鉴权，成功则保持连接。
 async fn handle_connection(
     stream: TcpStream,
     token: Arc<str>,
-    registry: Arc<Mutex<Registry>>,
-    max_frame_bytes: usize,
-    subscriber_queue_capacity: usize,
+    resources: ConnectionResources,
 ) -> Result<(), ServiceError> {
     let peer_addr = stream.peer_addr().ok();
     let (mut ws, auth_header) = accept_with_auth_header(stream).await?;
@@ -431,7 +802,7 @@ async fn handle_connection(
         return Ok(());
     };
 
-    if frame_len(&first) > max_frame_bytes {
+    if frame_len(&first) > resources.max_frame_bytes {
         let response = error_response(String::new(), ErrorCode::BadRequest, "帧超过上限");
         send_response(&mut ws, &response).await?;
         let _ = ws.close(None).await;
@@ -439,15 +810,16 @@ async fn handle_connection(
     }
 
     match evaluate_handshake(&first, &token, auth_header.as_deref()) {
-        Handshake::Accepted { id, client } => {
+        Handshake::Accepted { id, client, caller } => {
             handle_accepted(
                 ws,
-                peer_addr,
-                id,
-                client,
-                registry,
-                max_frame_bytes,
-                subscriber_queue_capacity,
+                AcceptedConnection {
+                    peer_addr,
+                    id,
+                    client,
+                    caller,
+                    resources,
+                },
             )
             .await
         }
@@ -522,19 +894,30 @@ where
     }
 }
 
-/// 鉴权通过：回 `hello` 结果并保持连接。
-async fn handle_accepted<S>(
-    mut ws: WebSocketStream<S>,
+/// 已完成鉴权、待保持的连接参数（避免过多参数）。
+struct AcceptedConnection {
     peer_addr: Option<SocketAddr>,
     id: String,
     client: String,
-    registry: Arc<Mutex<Registry>>,
-    max_frame_bytes: usize,
-    subscriber_queue_capacity: usize,
+    caller: Caller,
+    resources: ConnectionResources,
+}
+
+/// 鉴权通过：回 `hello` 结果并保持连接。
+async fn handle_accepted<S>(
+    mut ws: WebSocketStream<S>,
+    connection: AcceptedConnection,
 ) -> Result<(), ServiceError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let AcceptedConnection {
+        peer_addr,
+        id,
+        client,
+        caller,
+        resources,
+    } = connection;
     // 每连接生成唯一的连接级 client_id；`hello.client` 只作为日志标签，
     // 不参与订阅键、attached/detached 事件或 lease 归属，避免同名连接撞键。
     let client_id = Ulid::generate().to_string();
@@ -542,19 +925,13 @@ where
         ?peer_addr,
         client = %sanitize_log_value(&client),
         %client_id,
+        root_session_id = %sanitize_log_value(caller.root_session_id.as_deref().unwrap_or("-")),
+        admin = caller.admin,
         "hello 鉴权成功"
     );
     let response = hello_response(id)?;
     send_response(&mut ws, &response).await?;
-    serve_connection(
-        ws,
-        peer_addr,
-        client_id,
-        registry,
-        max_frame_bytes,
-        subscriber_queue_capacity,
-    )
-    .await
+    serve_connection(ws, peer_addr, client_id, caller, resources).await
 }
 
 /// 鉴权失败：回错误响应后主动关闭连接。
@@ -603,13 +980,18 @@ async fn serve_connection<S>(
     ws: WebSocketStream<S>,
     peer_addr: Option<SocketAddr>,
     client_id: String,
-    registry: Arc<Mutex<Registry>>,
-    max_frame_bytes: usize,
-    subscriber_queue_capacity: usize,
+    caller: Caller,
+    resources: ConnectionResources,
 ) -> Result<(), ServiceError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let ConnectionResources {
+        registry,
+        sessions,
+        max_frame_bytes,
+        subscriber_queue_capacity,
+    } = resources;
     let (sink, mut stream) = ws.split();
     let (out_tx, out_rx) = unbounded_channel::<Message>();
     let mut writer = tokio::spawn(write_loop(sink, out_rx));
@@ -634,7 +1016,9 @@ where
     let mut context = ReadContext {
         peer_addr,
         client_id: &client_id,
+        caller: &caller,
         registry: &registry,
+        sessions: &sessions,
         out_tx: &out_tx,
         event_tx: &event_tx,
         shutdown: &mut shutdown_rx,
@@ -747,8 +1131,12 @@ struct ReadContext<'a> {
     peer_addr: Option<SocketAddr>,
     /// 连接级客户端 ID。
     client_id: &'a str,
+    /// 连接级调用者身份。
+    caller: &'a Caller,
     /// 共享 registry。
     registry: &'a Arc<Mutex<Registry>>,
+    /// 共享会话心跳表。
+    sessions: &'a SessionBook,
     /// 连接出站队列。
     out_tx: &'a UnboundedSender<Message>,
     /// 订阅事件发送端。
@@ -802,7 +1190,9 @@ where
                 handle_rpc_text(
                     text.as_str(),
                     context.client_id,
+                    context.caller,
                     context.registry,
+                    context.sessions,
                     context.out_tx,
                     context.event_tx,
                 )
@@ -819,12 +1209,16 @@ where
 async fn handle_rpc_text(
     text: &str,
     client_id: &str,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
+    sessions: &SessionBook,
     out_tx: &UnboundedSender<Message>,
     event_tx: &Sender<Event>,
 ) -> Result<(), ServiceError> {
     let response = match from_json::<Request>(text) {
-        Ok(request) => dispatch_request(request, client_id, registry, event_tx).await?,
+        Ok(request) => {
+            dispatch_request(request, client_id, caller, registry, sessions, event_tx).await?
+        }
         Err(_) => error_response(String::new(), ErrorCode::ProtocolError, "请求 JSON 非法"),
     };
 
@@ -840,12 +1234,44 @@ async fn handle_rpc_text(
 async fn dispatch_request(
     request: Request,
     client_id: &str,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
+    sessions: &SessionBook,
     event_tx: &Sender<Event>,
 ) -> Result<Response, ServiceError> {
     let Request { id, method, params } = request;
 
     match method.as_str() {
+        "session.list" => {
+            if !caller.admin {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::PermissionDenied,
+                    "session.list 仅管理员可用",
+                ));
+            }
+            let _params: SessionListParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("session.list 参数非法: {error}"),
+                    ));
+                }
+            };
+
+            // 会话表与 registry 分别加锁、从不同时持有：先生成心跳快照，
+            // 再在 registry 锁内取终端摘要，最后在锁外合并。
+            let now = Instant::now();
+            let heartbeats = live_heartbeats(sessions, now);
+            let terminals = {
+                let registry = lock_registry(registry);
+                registry.list(&ListParams::default())
+            };
+            let value = serde_json::to_value(build_session_list(heartbeats, terminals, now))?;
+            Ok(ok_response(id, value))
+        }
         "terminal.create" => {
             let params: CreateParams = match serde_json::from_value(params) {
                 Ok(params) => params,
@@ -857,7 +1283,7 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_create(id, params, registry).await
+            handle_create(id, params, caller, registry).await
         }
         "terminal.list" => {
             let params: ListParams = match serde_json::from_value(params) {
@@ -872,7 +1298,7 @@ async fn dispatch_request(
             };
 
             let registry = lock_registry(registry);
-            let value = serde_json::to_value(registry.list(&params))?;
+            let value = serde_json::to_value(registry.list_for(&params, caller.scope()))?;
             Ok(ok_response(id, value))
         }
         "terminal.status" => {
@@ -889,7 +1315,11 @@ async fn dispatch_request(
 
             let (snapshot, backend) = {
                 let registry = lock_registry(registry);
-                match registry.status_parts(&params.locator) {
+                let locator = match authorize_locator(&registry, &params.locator, caller) {
+                    Ok(locator) => locator,
+                    Err(error) => return Ok(response_from_core_error(id, error)),
+                };
+                match registry.status_parts(&locator) {
                     Ok(parts) => parts,
                     Err(error) => return Ok(response_from_core_error(id, error)),
                 }
@@ -925,7 +1355,11 @@ async fn dispatch_request(
                 }
             };
             let mut registry = lock_registry(registry);
-            match registry.attach(&params.locator, client_id, params.cursor, event_tx.clone()) {
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match registry.attach(&locator, client_id, params.cursor, event_tx.clone()) {
                 Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
@@ -943,7 +1377,11 @@ async fn dispatch_request(
             };
 
             let mut registry = lock_registry(registry);
-            match detach_terminal(&mut registry, &params.locator, client_id) {
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match detach_terminal(&mut registry, &locator, client_id) {
                 Ok(()) => Ok(ok_response(
                     id,
                     serde_json::to_value(SimpleResult { ok: true })?,
@@ -964,7 +1402,11 @@ async fn dispatch_request(
             };
 
             let mut registry = lock_registry(registry);
-            match registry.claim(&params.locator, client_id, params.force) {
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match registry.claim(&locator, client_id, params.force) {
                 Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
@@ -982,7 +1424,11 @@ async fn dispatch_request(
             };
 
             let mut registry = lock_registry(registry);
-            match registry.release(&params.locator, client_id) {
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match registry.release(&locator, client_id) {
                 Ok(()) => Ok(ok_response(
                     id,
                     serde_json::to_value(SimpleResult { ok: true })?,
@@ -1004,7 +1450,34 @@ async fn dispatch_request(
 
             // 只读扫描 ring：不注册订阅、不推进消费状态，持锁时间与回放长度成正比。
             let registry = lock_registry(registry);
-            match registry.read(&params.locator, params.cursor, params.max_bytes) {
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match registry.read(&locator, params.cursor, params.max_bytes) {
+                Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
+                Err(error) => Ok(response_from_core_error(id, error)),
+            }
+        }
+        "terminal.transcript" => {
+            let params: TranscriptParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.transcript 参数非法: {error}"),
+                    ));
+                }
+            };
+
+            // 只读有界缓冲，锁内复制返回条目；不做订阅或任何 await。
+            let registry = lock_registry(registry);
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match registry.transcript(&locator, params.limit) {
                 Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
@@ -1020,7 +1493,7 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_send(id, params, client_id, registry).await
+            handle_send(id, params, client_id, caller, registry).await
         }
         "terminal.resize" => {
             let params: ResizeParams = match serde_json::from_value(params) {
@@ -1033,7 +1506,7 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_resize(id, params, registry).await
+            handle_resize(id, params, caller, registry).await
         }
         "terminal.signal" => {
             let params: SignalParams = match serde_json::from_value(params) {
@@ -1046,7 +1519,7 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_signal(id, params, registry).await
+            handle_signal(id, params, caller, registry).await
         }
         "terminal.terminate" => {
             let params: TerminateParams = match serde_json::from_value(params) {
@@ -1059,7 +1532,20 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_terminate(id, params, registry).await
+            handle_terminate(id, params, caller, registry).await
+        }
+        "terminal.rebind" => {
+            let params: RebindParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.rebind 参数非法: {error}"),
+                    ));
+                }
+            };
+            handle_rebind(id, params, caller, registry).await
         }
         "terminal.prune" => {
             let params: PruneParams = match serde_json::from_value(params) {
@@ -1074,7 +1560,7 @@ async fn dispatch_request(
             };
             let result = {
                 let mut registry = lock_registry(registry);
-                registry.prune(&params)
+                registry.prune_for(&params, caller.scope())
             };
             match result {
                 Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
@@ -1099,9 +1585,18 @@ async fn dispatch_request(
                     "terminal.subscribe 需要 terminals 或 all",
                 ));
             }
+            // 全局订阅会跨会话接收事件，仅管理员可用；普通连接只能显式订阅
+            // 本会话终端（下面逐个鉴权）。
+            if params.all == Some(true) && !caller.admin {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::PermissionDenied,
+                    "terminal.subscribe(all=true) 仅管理员可用",
+                ));
+            }
 
             let mut registry = lock_registry(registry);
-            match subscribe_terminals(&mut registry, params, client_id, event_tx) {
+            match subscribe_terminals(&mut registry, params, client_id, caller, event_tx) {
                 Ok(cursors) => Ok(ok_response(
                     id,
                     serde_json::to_value(SubscribeResult { cursors })?,
@@ -1122,13 +1617,73 @@ async fn dispatch_request(
             };
 
             let mut registry = lock_registry(registry);
-            match unsubscribe_terminals(&mut registry, params, client_id) {
+            match unsubscribe_terminals(&mut registry, params, client_id, caller) {
                 Ok(()) => Ok(ok_response(
                     id,
                     serde_json::to_value(SimpleResult { ok: true })?,
                 )),
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
+        }
+        "heartbeat" => {
+            // 新式心跳携带 root_session_id，用于终端保活；旧客户端发送 `{}`
+            // 时只刷新连接级附着时间，不影响终端保活。
+            let params: HeartbeatParams = serde_json::from_value(params).unwrap_or_default();
+            if let Some(root_session_id) = params
+                .root_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|root| !root.is_empty())
+            {
+                if !caller.can_access_root(root_session_id) {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::PermissionDenied,
+                        "heartbeat 的 root_session_id 与连接会话不一致",
+                    ));
+                }
+                record_session_heartbeat(sessions, root_session_id, Instant::now());
+            }
+            {
+                let mut registry = lock_registry(registry);
+                registry.heartbeat(client_id, OffsetDateTime::now_utc());
+            }
+            Ok(ok_response(
+                id,
+                serde_json::to_value(SimpleResult { ok: true })?,
+            ))
+        }
+        "session_closed" => {
+            let params: SessionClosedParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("session_closed 参数非法: {error}"),
+                    ));
+                }
+            };
+            let root_session_id = params.root_session_id.trim();
+            if root_session_id.is_empty() {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::BadRequest,
+                    "session_closed 需要 root_session_id",
+                ));
+            }
+            if !caller.can_access_root(root_session_id) {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::PermissionDenied,
+                    "session_closed 的 root_session_id 与连接会话不一致",
+                ));
+            }
+            remove_session(sessions, root_session_id);
+            Ok(ok_response(
+                id,
+                serde_json::to_value(SimpleResult { ok: true })?,
+            ))
         }
         _ => Ok(error_response(
             id,
@@ -1146,12 +1701,16 @@ async fn dispatch_request(
 async fn handle_create(
     id: String,
     params: CreateParams,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<Response, ServiceError> {
     // 只做参数/冲突预检，不提前终止旧后端：否则旧进程退出的 `exited` 可能
     // 抢在 `register_create` 落 `interrupted` 之前。置换统一在锁内完成。
     let factory = {
         let registry = lock_registry(registry);
+        if let Err(error) = caller.require_root(&params.root_session_id) {
+            return Ok(response_from_core_error(id, error));
+        }
         if let Err(error) = registry.prepare_create(&params) {
             return Ok(response_from_core_error(id, error));
         }
@@ -1193,6 +1752,7 @@ async fn handle_send(
     id: String,
     params: SendParams,
     client_id: &str,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<Response, ServiceError> {
     // 先在无锁阶段解码载荷（保留原有错误优先级），拿到终端模式后再追加换行。
@@ -1201,16 +1761,34 @@ async fn handle_send(
         Err(error) => return Ok(response_from_core_error(id, error)),
     };
 
+    // 只有 `enter=true` 才视为一条命令；按键/密码等原始输入不进 transcript。
+    let command_text = params
+        .enter
+        .then(|| String::from_utf8_lossy(&payload).into_owned());
     let (backend, mode) = {
         let mut registry = lock_registry(registry);
-        let backend = match registry.prepare_send(&params.locator, client_id) {
+        let locator = match authorize_locator(&registry, &params.locator, caller) {
+            Ok(locator) => locator,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        };
+        let backend = match registry.prepare_send(&locator, client_id) {
             Ok(backend) => backend,
             Err(error) => return Ok(response_from_core_error(id, error)),
         };
-        let mode = match registry.mode(&params.locator) {
+        let mode = match registry.mode(&locator) {
             Ok(mode) => mode,
             Err(error) => return Ok(response_from_core_error(id, error)),
         };
+        // 与 prepare_send 同锁记录，保证新命令排在本次写入产生的输出之前；
+        // 鉴权/lease 已通过，因此不会记录被拒绝的输入。
+        if let (Some(text), Some(raw_id)) = (&command_text, &locator.terminal_id) {
+            let terminal_id = TerminalId::new(raw_id.clone());
+            if let Err(error) =
+                registry.record_transcript_command(&terminal_id, text, OffsetDateTime::now_utc())
+            {
+                tracing::debug!(%terminal_id, %error, "记录 transcript 命令失败");
+            }
+        }
         (backend, mode)
     };
     if params.enter {
@@ -1236,12 +1814,17 @@ async fn handle_send(
 async fn handle_resize(
     id: String,
     params: ResizeParams,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<Response, ServiceError> {
     let (cols, rows) = (params.cols, params.rows);
     let backend = {
         let mut registry = lock_registry(registry);
-        match registry.prepare_resize(&params.locator, cols, rows) {
+        let locator = match authorize_locator(&registry, &params.locator, caller) {
+            Ok(locator) => locator,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        };
+        match registry.prepare_resize(&locator, cols, rows) {
             Ok(backend) => backend,
             Err(error) => return Ok(response_from_core_error(id, error)),
         }
@@ -1265,11 +1848,16 @@ async fn handle_resize(
 async fn handle_signal(
     id: String,
     params: SignalParams,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<Response, ServiceError> {
     let prepared = {
         let mut registry = lock_registry(registry);
-        match registry.prepare_signal(&params.locator, &params.signal) {
+        let locator = match authorize_locator(&registry, &params.locator, caller) {
+            Ok(locator) => locator,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        };
+        match registry.prepare_signal(&locator, &params.signal) {
             Ok(prepared) => prepared,
             Err(error) => return Ok(response_from_core_error(id, error)),
         }
@@ -1306,11 +1894,16 @@ async fn handle_signal(
 async fn handle_terminate(
     id: String,
     params: TerminateParams,
+    caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
 ) -> Result<Response, ServiceError> {
     let backend = {
         let mut registry = lock_registry(registry);
-        match registry.prepare_terminate(&params.locator) {
+        let locator = match authorize_locator(&registry, &params.locator, caller) {
+            Ok(locator) => locator,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        };
+        match registry.prepare_terminate(&locator) {
             Ok(backend) => backend,
             Err(error) => return Ok(response_from_core_error(id, error)),
         }
@@ -1323,6 +1916,45 @@ async fn handle_terminate(
         id,
         serde_json::to_value(SimpleResult { ok: true })?,
     ))
+}
+
+/// 处理 `terminal.rebind`：锁内迁移绑定键，锁外终止被 `force` 置换的目标旧终端。
+///
+/// `force` 的目标旧终端在 registry 锁内落 `interrupted{source:"terminate"}` 并
+/// 从索引移除；其真实进程终止必须等锁释放后执行。
+async fn handle_rebind(
+    id: String,
+    params: RebindParams,
+    caller: &Caller,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<Response, ServiceError> {
+    let locator = TerminalLocator {
+        terminal_id: Some(params.terminal_id),
+        root_session_id: None,
+        name: None,
+    };
+    let (result, displaced) = {
+        let mut registry = lock_registry(registry);
+        // 迁移授权是「目标会话拉取」：普通连接只能把终端迁到自己的会话，
+        // 不要求当前已能访问源终端（跨会话搬移由目标会话发起或管理员执行）。
+        if let Err(error) = caller.require_root(&params.root_session_id) {
+            return Ok(response_from_core_error(id, error));
+        }
+        match registry.rebind(
+            &locator,
+            &params.root_session_id,
+            params.name.as_deref(),
+            params.force,
+        ) {
+            Ok(rebound) => rebound,
+            Err(error) => return Ok(response_from_core_error(id, error)),
+        }
+    };
+    if let Some(backend) = displaced {
+        terminate_backend(backend).await;
+    }
+
+    Ok(ok_response(id, serde_json::to_value(result)?))
 }
 
 /// 解码 `terminal.send` 的输入字节（不含 `enter` 换行）。
@@ -1424,11 +2056,19 @@ async fn ingest_proc_events(
                             stream: protocol_stream(stream),
                         },
                     );
-                    // 同一把锁内顺手喂给交互识别器；OSC 等待事件排在 output 之后。
+                    // 同一把锁内写入有界 transcript（短操作），再喂交互识别器。
                     let result = match reported {
-                        Ok(_) => registry
-                            .observe_output(&terminal_id, &data, now)
-                            .map(|_| ()),
+                        Ok(_) => {
+                            let text = String::from_utf8_lossy(&data);
+                            if let Err(error) =
+                                registry.record_transcript_output(&terminal_id, &text, now)
+                            {
+                                tracing::debug!(terminal_id = %terminal_id, %error, "记录 transcript 输出失败");
+                            }
+                            registry
+                                .observe_output(&terminal_id, &data, now)
+                                .map(|_| ())
+                        }
                         Err(error) => Err(error),
                     };
                     (result, false)
@@ -1480,6 +2120,7 @@ fn subscribe_terminals(
     registry: &mut Registry,
     params: SubscribeParams,
     client_id: &str,
+    caller: &Caller,
     event_tx: &Sender<Event>,
 ) -> Result<Vec<SubscriptionCursor>, CoreError> {
     let mut explicit = Vec::new();
@@ -1491,7 +2132,8 @@ fn subscribe_terminals(
                 root_session_id: None,
                 name: None,
             };
-            let id = registry.resolve(&locator)?;
+            let id =
+                registry.authorize(&locator, caller.admin, caller.root_session_id.as_deref())?;
             if seen_targets.insert(id.clone()) {
                 explicit.push((id, target.cursor));
             }
@@ -1529,13 +2171,15 @@ fn unsubscribe_terminals(
     registry: &mut Registry,
     params: UnsubscribeParams,
     client_id: &str,
+    caller: &Caller,
 ) -> Result<(), CoreError> {
     match params.terminals {
         Some(locators) => {
             let mut ids: Vec<TerminalId> = Vec::new();
             let mut seen = BTreeSet::new();
             for locator in &locators {
-                let id = registry.resolve(locator)?;
+                let id =
+                    registry.authorize(locator, caller.admin, caller.root_session_id.as_deref())?;
                 if seen.insert(id.clone()) {
                     ids.push(id);
                 }
@@ -1634,12 +2278,14 @@ fn error_response(id: String, code: ErrorCode, message: impl Into<String>) -> Re
 
 /// 首帧鉴权结论。
 enum Handshake {
-    /// 通过；保留请求 ID 与客户端标识用于日志/响应。
+    /// 通过；保留请求 ID、客户端标识与连接级调用者身份。
     Accepted {
         /// `hello` 请求 ID。
         id: String,
         /// 客户端标识。
         client: String,
+        /// 连接级调用者身份。
+        caller: Caller,
     },
     /// 拒绝；需要回错误响应后关闭连接。
     Rejected {
@@ -1712,9 +2358,35 @@ fn validate_hello(request: Request, expected_token: &str, auth_header: Option<&s
         return Handshake::rejected(request.id, ErrorCode::AuthFailed, "token 校验失败");
     }
 
+    let root_session_id = params
+        .root_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(str::to_string);
+    if !params.admin && root_session_id.is_none() {
+        return Handshake::rejected(
+            request.id,
+            ErrorCode::BadRequest,
+            "hello 需要 root_session_id（或 admin=true）",
+        );
+    }
+    // `@web` 是保留的未绑定会话：普通连接不得冒充，只有管理员可访问其终端。
+    if !params.admin && root_session_id.as_deref() == Some(WEB_ROOT_SESSION_ID) {
+        return Handshake::rejected(
+            request.id,
+            ErrorCode::BadRequest,
+            "root_session_id 不能使用保留值 @web",
+        );
+    }
+
     Handshake::Accepted {
         id: request.id,
         client: params.client,
+        caller: Caller {
+            root_session_id: if params.admin { None } else { root_session_id },
+            admin: params.admin,
+        },
     }
 }
 
@@ -1758,7 +2430,7 @@ fn sanitize_log_value(value: &str) -> String {
 }
 
 /// 是否为环回地址。
-fn is_loopback(addr: SocketAddr) -> bool {
+pub(crate) fn is_loopback(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 

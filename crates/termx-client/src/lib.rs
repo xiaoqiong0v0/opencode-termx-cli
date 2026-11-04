@@ -17,6 +17,8 @@
 //! # async fn example() -> Result<(), termx_client::ClientError> {
 //! use termx_client::{Client, ClientConfig};
 //!
+//! // 配置目录必须显式：`discover()` 只读非空 `TERMX_CONFIG_DIR`，
+//! // 也可用 `discover_from_dir(dir, env)` 直接传入目录。
 //! let client = Client::connect(ClientConfig::discover()?).await?;
 //! let mut events = client.events();
 //! let terminals = client.list(Default::default()).await?;

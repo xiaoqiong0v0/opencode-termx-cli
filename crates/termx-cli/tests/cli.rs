@@ -4,7 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{CliOutput, TestService, run_cli};
+use common::{CliOutput, TestService, run_cli, run_cli_bare};
 
 /// 等待上限内的轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -574,6 +574,66 @@ async fn usage_errors_and_unimplemented_ssh_exit_with_two() {
         ssh.stderr_text()
     );
     service.shutdown().await;
+}
+
+/// 缺少 `--config-dir` / `--endpoint` 时返回用法错误并提示，不再回退平台目录。
+#[tokio::test]
+async fn requires_explicit_config_dir_or_endpoint() {
+    let output = run_cli_bare(&["list", "--json"]).await;
+    assert_eq!(output.code, Some(2), "stderr={}", output.stderr_text());
+    let stderr = output.stderr_text();
+    assert!(stderr.contains("--config-dir"), "stderr={stderr}");
+    assert!(stderr.contains("--endpoint"), "stderr={stderr}");
+    assert!(stderr.contains("不再推导"), "stderr={stderr}");
+}
+
+/// `--config-dir` 单独即可连接（不依赖环境变量）。
+#[tokio::test]
+async fn config_dir_flag_connects_without_env() {
+    let mut service = TestService::start().await;
+    let config_dir = service.config_dir.to_string_lossy().into_owned();
+    let output = run_cli_bare(&["--config-dir", config_dir.as_str(), "list", "--json"]).await;
+    assert_eq!(output.code, Some(0), "stderr={}", output.stderr_text());
+    assert!(
+        output.stdout_json().as_array().is_some(),
+        "list 结果应为数组: {}",
+        output.stdout_text()
+    );
+    service.shutdown().await;
+}
+
+/// `--endpoint` + `--token` 无需配置目录即可连接。
+#[tokio::test]
+async fn endpoint_and_token_work_without_config_dir() {
+    let mut service = TestService::start().await;
+    let endpoint = service.endpoint();
+    let token = service.token.clone();
+    let output = run_cli_bare(&[
+        "--endpoint",
+        endpoint.as_str(),
+        "--token",
+        token.as_str(),
+        "list",
+        "--json",
+    ])
+    .await;
+    assert_eq!(output.code, Some(0), "stderr={}", output.stderr_text());
+    assert!(
+        output.stdout_json().as_array().is_some(),
+        "list 结果应为数组: {}",
+        output.stdout_text()
+    );
+    service.shutdown().await;
+}
+
+/// 只给 `--endpoint` 且没有 token 时返回用法错误。
+#[tokio::test]
+async fn endpoint_without_token_or_config_dir_is_usage_error() {
+    let output = run_cli_bare(&["--endpoint", "ws://127.0.0.1:1", "list", "--json"]).await;
+    assert_eq!(output.code, Some(2), "stderr={}", output.stderr_text());
+    let stderr = output.stderr_text();
+    assert!(stderr.contains("--token"), "stderr={stderr}");
+    assert!(stderr.contains("TERMX_TOKEN"), "stderr={stderr}");
 }
 
 /// 平台相关的 `exec` 参数。

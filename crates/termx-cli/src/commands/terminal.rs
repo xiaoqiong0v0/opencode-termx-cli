@@ -5,7 +5,7 @@ use termx_client::Client;
 use termx_protocol::{
     AttachParams, ClaimParams, ClaimResult, DetachParams, ListParams, PruneParams, ReadParams,
     ReleaseParams, ResizeParams, SendParams, SignalParams, SimpleResult, StatusParams,
-    TerminalLocator, TerminateParams,
+    TerminalLocator, TerminateParams, TranscriptParams,
 };
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     },
     commands::{connect, locator},
     error::CliError,
-    output::{print_json, print_list, print_snapshot, write_stdout},
+    output::{print_json, print_list, print_snapshot, print_transcript, write_stdout},
 };
 
 /// `status`：打印状态快照。
@@ -75,6 +75,25 @@ pub async fn read(cli: &Cli, args: &ReadArgs) -> Result<i32, CliError> {
             write_stdout(&bytes)?;
         }
         eprintln!("cursor={}", result.cursor);
+    }
+    client.close().await;
+    Ok(0)
+}
+
+/// `transcript`：读取信息页命令记录（命令 + 起止时间 + 状态 + 清洗后输出）。
+pub async fn transcript(cli: &Cli, args: &LocatorArgs) -> Result<i32, CliError> {
+    let locator = locator(cli, args.terminal_id.as_deref())?;
+    let client = connect(cli).await?;
+    let result = client
+        .transcript(TranscriptParams {
+            locator,
+            limit: None,
+        })
+        .await?;
+    if cli.json {
+        print_json(&result)?;
+    } else {
+        print_transcript(&result.commands)?;
     }
     client.close().await;
     Ok(0)

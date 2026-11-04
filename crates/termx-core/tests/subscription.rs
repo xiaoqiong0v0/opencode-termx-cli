@@ -6,7 +6,10 @@ use termx_core::{DEFAULT_EVENT_BUFFER_CAPACITY, MockFactory, Registry, TerminalI
 use termx_protocol::{
     CreateParams, Event, EventKind, LifecycleState, Mode, ResetReason, Stream, TerminalLocator,
 };
-use tokio::sync::mpsc::{Receiver, channel};
+use tokio::sync::{
+    mpsc::{Receiver, channel},
+    watch,
+};
 
 /// 构造 pty 创建参数。
 fn params(root_session_id: &str, name: &str) -> CreateParams {
@@ -148,6 +151,89 @@ fn attach_with_cursor_older_than_ring_returns_too_old() {
     assert_eq!(events.len(), 1, "too_old 不回放历史，只发 attached");
     assert!(matches!(events[0].kind, EventKind::Attached { .. }));
     assert_eq!(events[0].seq, 5);
+}
+
+#[test]
+fn attach_skips_oversized_replay_without_disconnect() {
+    // ring 容量 64 足以保留全部历史，但订阅者队列只有 8。
+    let mut registry = Registry::with_config(64, 8, Arc::new(MockFactory));
+    let terminal_id = create_terminal(&mut registry, "build");
+    let id = TerminalId::new(terminal_id.clone());
+    for _ in 0..20 {
+        registry.report_event(&id, output("YQ==")).unwrap();
+    }
+
+    let (tx, mut rx) = channel(8);
+    let (throttle_tx, throttle_rx) = watch::channel(false);
+    registry.register_client("client-a", throttle_tx);
+
+    let result = registry
+        .attach(&locator(&terminal_id), "client-a", Some(0), tx)
+        .expect("attach 应成功");
+
+    assert_eq!(result.reset, Some(ResetReason::BufferOverflow));
+    assert_eq!(result.cursor, 21, "基线为当前 last seq");
+    // 只回放 attached，历史留给 terminal.read；连接不因回放被限流。
+    let events = drain(&mut rx);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].kind, EventKind::Attached { .. }));
+    assert!(!*throttle_rx.borrow(), "回放过大不应触发 limit_exceeded");
+    assert_eq!(
+        registry.subscribed_clients(&id),
+        vec!["client-a".to_string()]
+    );
+
+    // 订阅保持有效，后续实时事件仍能收到。
+    registry.report_event(&id, output("Yg==")).unwrap();
+    let events = drain(&mut rx);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].kind, EventKind::Output { .. }));
+}
+
+#[test]
+fn subscribe_skips_oversized_replay_without_disconnect() {
+    let mut registry = Registry::with_config(64, 8, Arc::new(MockFactory));
+    let terminal_id = create_terminal(&mut registry, "build");
+    let id = TerminalId::new(terminal_id.clone());
+    for _ in 0..20 {
+        registry.report_event(&id, output("YQ==")).unwrap();
+    }
+
+    let (tx, mut rx) = channel(8);
+    let (throttle_tx, throttle_rx) = watch::channel(false);
+    registry.register_client("client-a", throttle_tx);
+
+    let result = registry
+        .subscribe(&locator(&terminal_id), "client-a", Some(0), tx)
+        .expect("subscribe 应成功");
+
+    assert_eq!(result.reset, Some(ResetReason::BufferOverflow));
+    assert_eq!(result.cursor, 21);
+    assert!(drain(&mut rx).is_empty(), "跳过历史回放");
+    assert!(!*throttle_rx.borrow(), "回放过大不应触发 limit_exceeded");
+
+    registry.report_event(&id, output("Yg==")).unwrap();
+    let events = drain(&mut rx);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].kind, EventKind::Output { .. }));
+}
+
+#[test]
+fn attach_replays_when_queue_just_fits_replay_and_attached() {
+    // 队列 2：started 回放占 1，attached 预留 1，正好容纳。
+    let mut registry = Registry::with_config(64, 2, Arc::new(MockFactory));
+    let terminal_id = create_terminal(&mut registry, "build");
+    let (tx, mut rx) = channel(2);
+
+    let result = registry
+        .attach(&locator(&terminal_id), "client-a", Some(0), tx)
+        .expect("attach 应成功");
+
+    assert!(result.reset.is_none());
+    let events = drain(&mut rx);
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0].kind, EventKind::Started { .. }));
+    assert!(matches!(events[1].kind, EventKind::Attached { .. }));
 }
 
 #[test]

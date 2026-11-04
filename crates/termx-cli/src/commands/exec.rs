@@ -1,5 +1,7 @@
 //! `exec` 子命令：一次性执行命令并透传退出码。
 
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 
 use termx_client::Client;
@@ -9,6 +11,7 @@ use crate::{
     cli::{Cli, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, ExecArgs},
     commands::{
         closed_error, connect, new_terminal_name, parse_env, resync_events, root_session_id,
+        spawn_heartbeat,
     },
     error::CliError,
     output::Printer,
@@ -16,10 +19,11 @@ use crate::{
 
 /// 执行 `exec` 子命令。
 pub async fn run(cli: &Cli, args: &ExecArgs) -> Result<i32, CliError> {
-    let client = connect(cli).await?;
+    let client = Arc::new(connect(cli).await?);
+    let root = root_session_id(cli);
     // 先订阅再 create/attach，确保回放事件不会因无接收者丢失。
     let mut events = client.events();
-    let created = client.create(build_params(cli, args)?).await?;
+    let created = client.create(build_params(cli, args, &root)?).await?;
     let terminal_id = created.terminal_id.clone();
     let locator = TerminalLocator {
         terminal_id: Some(terminal_id.clone()),
@@ -29,6 +33,7 @@ pub async fn run(cli: &Cli, args: &ExecArgs) -> Result<i32, CliError> {
     let mut cursor = 0_u64;
     resync_events(&client, &locator, cursor).await?;
 
+    let heartbeat = spawn_heartbeat(Arc::clone(&client), root);
     let code = wait_for_exit(
         &client,
         &mut events,
@@ -38,12 +43,17 @@ pub async fn run(cli: &Cli, args: &ExecArgs) -> Result<i32, CliError> {
         cli.json,
     )
     .await;
+    heartbeat.abort();
     client.close().await;
     code
 }
 
-/// 组装创建参数：首项为程序，其余为参数。
-fn build_params(cli: &Cli, args: &ExecArgs) -> Result<CreateParams, CliError> {
+/// 组装创建参数：首项为程序，其余为参数；`root_session_id` 同时用于 `hello` 与心跳。
+fn build_params(
+    cli: &Cli,
+    args: &ExecArgs,
+    root_session_id: &str,
+) -> Result<CreateParams, CliError> {
     let (program, program_args) = args
         .cmd
         .split_first()
@@ -57,7 +67,7 @@ fn build_params(cli: &Cli, args: &ExecArgs) -> Result<CreateParams, CliError> {
         env: parse_env(&args.env)?,
         cols: pty.then_some(DEFAULT_PTY_COLS),
         rows: pty.then_some(DEFAULT_PTY_ROWS),
-        root_session_id: root_session_id(cli),
+        root_session_id: root_session_id.to_string(),
         name: new_terminal_name(cli, "exec"),
         force: cli.force,
         idle_timeout: None,

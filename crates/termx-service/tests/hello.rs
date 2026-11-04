@@ -14,7 +14,7 @@ use termx_core::{MockFactory, Registry, TerminalId};
 use termx_protocol::{
     AttachResult, ClaimResult, Confidence, CreateResult, ErrorCode, Event, EventKind,
     HELPER_PROTOCOL_VERSION, HelloResult, LifecycleState, ListItem, Mode, PROTOCOL_VERSION,
-    Response, StatusResult, Stream, SubscribeResult, from_json,
+    RebindResult, Response, StatusResult, Stream, SubscribeResult, from_json,
 };
 use termx_service::{PORT_FILE_NAME, Service, ServiceConfig, ServiceError, TOKEN_FILE_NAME};
 use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
@@ -142,6 +142,7 @@ fn hello_request_for(id: &str, token: &str, proto: &str, client: &str) -> String
             "proto": proto,
             "token": token,
             "client": client,
+            "admin": true,
         }
     })
     .to_string()
@@ -552,6 +553,146 @@ async fn force_replaces_terminal_and_keeps_single_entry() {
             .expect("ListItem 解析失败");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].terminal_id, second.terminal_id);
+}
+
+#[tokio::test]
+async fn terminal_rebind_moves_key_and_preserves_terminal_id() {
+    let dir = tempdir().expect("创建临时目录失败");
+    let service = TestService::start(dir.path()).await;
+    let mut client = connect(&service).await;
+    handshake(&mut client, &service.token).await;
+
+    let created_response = call(
+        &mut client,
+        "rb-101",
+        "terminal.create",
+        create_params("ses-1", "build", false),
+    )
+    .await;
+    assert!(created_response.ok, "create 应成功: {created_response:?}");
+    let created: CreateResult =
+        serde_json::from_value(created_response.result.expect("缺少 create result"))
+            .expect("CreateResult 解析失败");
+    let created = created.terminal_id;
+
+    let response = call(
+        &mut client,
+        "rb-102",
+        "terminal.rebind",
+        serde_json::json!({
+            "terminal_id": created,
+            "root_session_id": "ses-2",
+            "name": "verify"
+        }),
+    )
+    .await;
+    assert!(response.ok, "rebind 应成功: {response:?}");
+    let result: RebindResult = serde_json::from_value(response.result.expect("缺少 rebind result"))
+        .expect("RebindResult 解析失败");
+    assert_eq!(result.terminal_id, created);
+    assert_eq!(result.root_session_id, "ses-2");
+    assert_eq!(result.name, "verify");
+
+    let old_status = call(
+        &mut client,
+        "rb-103",
+        "terminal.status",
+        serde_json::json!({ "root_session_id": "ses-1", "name": "build" }),
+    )
+    .await;
+    assert!(!old_status.ok, "旧键应解析失败");
+    assert_eq!(
+        old_status.error.expect("缺少 error").code,
+        ErrorCode::NotFound
+    );
+
+    let new_status = call(
+        &mut client,
+        "rb-104",
+        "terminal.status",
+        serde_json::json!({ "root_session_id": "ses-2", "name": "verify" }),
+    )
+    .await;
+    assert!(new_status.ok, "新键应可解析: {new_status:?}");
+    let snapshot: StatusResult =
+        serde_json::from_value(new_status.result.expect("缺少 status result"))
+            .expect("StatusResult 解析失败");
+    assert_eq!(snapshot.snapshot.terminal_id, created);
+    assert_eq!(snapshot.snapshot.state, LifecycleState::Running);
+}
+
+#[tokio::test]
+async fn terminal_rebind_conflict_and_force() {
+    let dir = tempdir().expect("创建临时目录失败");
+    let service = TestService::start(dir.path()).await;
+    let mut client = connect(&service).await;
+    handshake(&mut client, &service.token).await;
+
+    let source_response = call(
+        &mut client,
+        "rb-201",
+        "terminal.create",
+        create_params("ses-1", "build", false),
+    )
+    .await;
+    assert!(source_response.ok, "create 应成功: {source_response:?}");
+    let source: CreateResult =
+        serde_json::from_value(source_response.result.expect("缺少 create result"))
+            .expect("CreateResult 解析失败");
+    let source = source.terminal_id;
+
+    let target_response = call(
+        &mut client,
+        "rb-202",
+        "terminal.create",
+        create_params("ses-2", "build", false),
+    )
+    .await;
+    assert!(target_response.ok, "create 应成功: {target_response:?}");
+    let target: CreateResult =
+        serde_json::from_value(target_response.result.expect("缺少 create result"))
+            .expect("CreateResult 解析失败");
+    let target = target.terminal_id;
+
+    // 同名且无 force：session_exists 携带目标旧终端 ID。
+    let conflict = call(
+        &mut client,
+        "rb-203",
+        "terminal.rebind",
+        serde_json::json!({ "terminal_id": source, "root_session_id": "ses-2" }),
+    )
+    .await;
+    assert!(!conflict.ok, "目标键已存在且无 force 应失败");
+    let error = conflict.error.expect("缺少 error");
+    assert_eq!(error.code, ErrorCode::SessionExists);
+    assert_eq!(error.terminal_id, Some(target.clone()));
+
+    // force：目标旧终端被终止，源终端迁移到目标键。
+    let forced = call(
+        &mut client,
+        "rb-204",
+        "terminal.rebind",
+        serde_json::json!({ "terminal_id": source, "root_session_id": "ses-2", "force": true }),
+    )
+    .await;
+    assert!(forced.ok, "force rebind 应成功: {forced:?}");
+    let result: RebindResult = serde_json::from_value(forced.result.expect("缺少 rebind result"))
+        .expect("RebindResult 解析失败");
+    assert_eq!(result.terminal_id, source);
+
+    let list = call(
+        &mut client,
+        "rb-205",
+        "terminal.list",
+        serde_json::json!({}),
+    )
+    .await;
+    let items: Vec<ListItem> =
+        serde_json::from_value(list.result.expect("缺少 list result")).expect("ListItem 解析失败");
+    assert_eq!(items.len(), 1, "被置换的目标终端应已移除");
+    assert_eq!(items[0].terminal_id, source);
+    assert_eq!(items[0].root_session_id, "ses-2");
+    assert_eq!(items[0].name, "build");
 }
 
 #[tokio::test]

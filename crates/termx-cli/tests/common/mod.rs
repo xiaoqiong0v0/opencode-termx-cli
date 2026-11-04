@@ -105,6 +105,12 @@ impl TestService {
         start_in_process(temp, config_dir).await
     }
 
+    /// 读取 service 写出的端口并组装本机 endpoint。
+    pub fn endpoint(&self) -> String {
+        let text = fs::read_to_string(self.config_dir.join("port")).expect("读取端口文件失败");
+        format!("ws://127.0.0.1:{}", text.trim())
+    }
+
     /// 优雅停机并等待后台任务退出。
     pub async fn shutdown(&mut self) {
         match &mut self.backend {
@@ -147,12 +153,25 @@ impl Drop for TestService {
     }
 }
 
-/// 运行 CLI 子进程；带超时并保证超时/失败时杀掉子进程。
+/// 运行 CLI 子进程：显式传入 `--config-dir <临时目录>`，不依赖环境变量。
 pub async fn run_cli(service: &TestService, args: &[&str]) -> CliOutput {
+    run_cli_with_config(Some(&service.config_dir), args).await
+}
+
+/// 运行 CLI 子进程且不注入任何配置目录/endpoint，用于验证显式配置要求。
+pub async fn run_cli_bare(args: &[&str]) -> CliOutput {
+    run_cli_with_config(None, args).await
+}
+
+/// 运行 CLI 子进程；带超时并保证超时/失败时杀掉子进程。
+async fn run_cli_with_config(config_dir: Option<&Path>, args: &[&str]) -> CliOutput {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_termx-cli"));
+    if let Some(dir) = config_dir {
+        command.arg("--config-dir").arg(dir);
+    }
     command
         .args(args)
-        .env("TERMX_CONFIG_DIR", &service.config_dir)
+        .env_remove("TERMX_CONFIG_DIR")
         .env_remove("TERMX_TOKEN")
         .env_remove("TERMX_ROOT_SESSION_ID")
         .stdin(Stdio::null())

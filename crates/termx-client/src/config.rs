@@ -1,9 +1,10 @@
 //! 客户端配置与发现规则。
 //!
-//! 发现优先级与服务端保持一致（`docs/PROTOCOL.md` §3）：配置目录取
-//! `TERMX_CONFIG_DIR`，否则按平台默认；token 取 `TERMX_TOKEN`（非空覆盖），
-//! 否则读配置目录下的 `token` 文件；端口读配置目录下的 `port` 文件后组装
-//! `ws://127.0.0.1:<port>`。
+//! 客户端**不推导平台默认配置目录**：配置目录只能来自显式参数
+//! （[`ClientConfig::discover_from_dir`]）或非空 `TERMX_CONFIG_DIR`
+//! （[`ClientConfig::discover_with`]），缺失即报错。token 取 `TERMX_TOKEN`
+//! （非空覆盖），否则读配置目录下的 `token` 文件；端口读配置目录下的 `port`
+//! 文件后组装 `ws://127.0.0.1:<port>`。
 
 use std::{
     ffi::OsString,
@@ -27,21 +28,6 @@ pub const DEFAULT_CLIENT_NAME: &str = "termx-client";
 /// 单次请求默认超时；可通过 [`ClientConfig::with_request_timeout`] 覆盖。
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 平台配置目录名。
-const TERMX_DIR_NAME: &str = "termx";
-/// Unix 缺省配置子目录。
-#[cfg(not(windows))]
-const UNIX_CONFIG_SUBDIR: &str = ".config";
-/// Windows 用户配置根变量。
-#[cfg(windows)]
-const APPDATA_ENV: &str = "APPDATA";
-/// XDG 配置根变量。
-#[cfg(not(windows))]
-const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
-/// 用户主目录变量。
-#[cfg(not(windows))]
-const HOME_ENV: &str = "HOME";
-
 /// 客户端连接配置。
 ///
 /// `Debug` 为手写实现：token 只显示是否已设置，绝不写入日志。
@@ -53,6 +39,10 @@ pub struct ClientConfig {
     pub token: String,
     /// `hello.client` 标签；仅用于服务端日志，不参与归属判断。
     pub client: String,
+    /// 调用者 opencode 会话 ID（`hello.root_session_id`）；普通连接必填。
+    pub root_session_id: Option<String>,
+    /// 是否为管理员连接（`hello.admin`）；仅供 Web 代理与测试使用。
+    pub admin: bool,
     /// 单次请求等待响应的超时；超时返回 [`ClientError::Timeout`]。
     pub request_timeout: Duration,
 }
@@ -70,6 +60,8 @@ impl fmt::Debug for ClientConfig {
             .field("endpoint", &self.endpoint)
             .field("token", &token)
             .field("client", &self.client)
+            .field("root_session_id", &self.root_session_id)
+            .field("admin", &self.admin)
             .field("request_timeout", &self.request_timeout)
             .finish()
     }
@@ -86,6 +78,8 @@ impl ClientConfig {
             endpoint: endpoint.into(),
             token: token.into(),
             client: client.into(),
+            root_session_id: None,
+            admin: false,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -96,34 +90,57 @@ impl ClientConfig {
         self
     }
 
+    /// 设置调用者 opencode 会话 ID（`hello.root_session_id`）。
+    ///
+    /// 空串会被视为未设置；非 admin 连接缺失该值会被服务端拒绝。
+    pub fn with_root_session_id(mut self, root_session_id: impl Into<String>) -> Self {
+        let value = root_session_id.into().trim().to_string();
+        self.root_session_id = (!value.is_empty()).then_some(value);
+        self
+    }
+
+    /// 标记为管理员连接（`hello.admin: true`）。
+    pub fn with_admin(mut self, admin: bool) -> Self {
+        self.admin = admin;
+        self
+    }
+
     /// 按当前进程环境发现配置。
     ///
-    /// 端口/token 文件缺失或格式非法时按 [`ClientError::Connect`] 返回，
-    /// 因为发现阶段属于「建立连接」的一部分。
+    /// 配置目录只接受非空 `TERMX_CONFIG_DIR`；缺失或端口/token 文件缺失、
+    /// 格式非法时按 [`ClientError::Connect`] 返回，因为发现阶段属于
+    /// 「建立连接」的一部分。**不会回退到平台默认目录**。
     pub fn discover() -> Result<Self, ClientError> {
         Self::discover_with(|key| std::env::var_os(key))
     }
 
-    /// 使用可注入的环境源发现配置（便于测试，也可供上层复用自定义环境源）。
+    /// 使用可注入的环境源发现配置；配置目录仍只来自非空
+    /// `TERMX_CONFIG_DIR`（便于测试与上层复用自定义环境源）。
     pub fn discover_with<F>(env: F) -> Result<Self, ClientError>
     where
         F: Fn(&str) -> Option<OsString>,
     {
         let config_dir = resolve_config_dir(&env)?;
-        let port = read_port(&config_dir)?;
-        let token = read_token(&config_dir, &env)?;
-        Ok(Self {
-            endpoint: format!("ws://127.0.0.1:{port}"),
-            token,
-            client: DEFAULT_CLIENT_NAME.to_string(),
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-        })
+        Self::build_from_dir(&config_dir, &env)
+    }
+
+    /// 从调用方显式给出的配置目录发现配置。
+    ///
+    /// `env` 只用于读取非空 `TERMX_TOKEN`；配置目录本身不再从环境或平台
+    /// 默认推导，避免隐式读取非预期目录。
+    pub fn discover_from_dir<D, F>(config_dir: D, env: F) -> Result<Self, ClientError>
+    where
+        D: AsRef<Path>,
+        F: Fn(&str) -> Option<OsString>,
+    {
+        Self::build_from_dir(config_dir.as_ref(), &env)
     }
 
     /// 只按优先级发现 token：非空 `TERMX_TOKEN` > token 文件。
     ///
     /// 供显式 `--endpoint` 场景使用：地址由调用方给出时不需要 `port` 文件，
     /// 但 token 仍遵循同一优先级，避免与文档不一致的回退行为。
+    /// 配置目录只来自非空 `TERMX_CONFIG_DIR`，缺失即报错。
     pub fn discover_token_with<F>(env: F) -> Result<String, ClientError>
     where
         F: Fn(&str) -> Option<OsString>,
@@ -131,44 +148,50 @@ impl ClientConfig {
         let config_dir = resolve_config_dir(&env)?;
         read_token(&config_dir, &env)
     }
+
+    /// 从调用方显式给出的配置目录发现 token（优先级同
+    /// [`ClientConfig::discover_token_with`]）。
+    pub fn discover_token_from_dir<D, F>(config_dir: D, env: F) -> Result<String, ClientError>
+    where
+        D: AsRef<Path>,
+        F: Fn(&str) -> Option<OsString>,
+    {
+        read_token(config_dir.as_ref(), &env)
+    }
+
+    /// 用给定配置目录组装配置；供 `discover_with` 与 `discover_from_dir` 复用。
+    fn build_from_dir<F>(config_dir: &Path, env: &F) -> Result<Self, ClientError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let port = read_port(config_dir)?;
+        let token = read_token(config_dir, env)?;
+        Ok(Self {
+            endpoint: format!("ws://127.0.0.1:{port}"),
+            token,
+            client: DEFAULT_CLIENT_NAME.to_string(),
+            root_session_id: None,
+            admin: false,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        })
+    }
 }
 
-/// 解析配置目录：`TERMX_CONFIG_DIR` 优先，否则按平台默认。
+/// 解析配置目录：只接受非空 `TERMX_CONFIG_DIR`，缺失即报错。
+///
+/// 不再参考 `XDG_CONFIG_HOME`、`HOME`、`APPDATA` 等平台默认位置。
 fn resolve_config_dir<F>(env: &F) -> Result<PathBuf, ClientError>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    if let Some(dir) = env(TERMX_CONFIG_DIR_ENV).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
-
-    #[cfg(windows)]
-    {
-        env(APPDATA_ENV)
-            .filter(|value| !value.is_empty())
-            .map(|appdata| PathBuf::from(appdata).join(TERMX_DIR_NAME))
-            .ok_or_else(|| {
-                ClientError::Connect(format!("无法确定配置目录：环境变量 {APPDATA_ENV} 缺失"))
-            })
-    }
-
-    #[cfg(not(windows))]
-    {
-        let base = env(XDG_CONFIG_HOME_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                env(HOME_ENV)
-                    .filter(|value| !value.is_empty())
-                    .map(|home| PathBuf::from(home).join(UNIX_CONFIG_SUBDIR))
-            })
-            .ok_or_else(|| {
-                ClientError::Connect(format!(
-                    "无法确定配置目录：{XDG_CONFIG_HOME_ENV} 与 {HOME_ENV} 均缺失"
-                ))
-            })?;
-        Ok(base.join(TERMX_DIR_NAME))
-    }
+    env(TERMX_CONFIG_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            ClientError::Connect(format!(
+                "未提供配置目录：请显式设置非空 {TERMX_CONFIG_DIR_ENV}，或直接传入配置目录（不再推导平台默认配置目录）"
+            ))
+        })
 }
 
 /// 读取端口文件并校验为有效非零端口。
@@ -301,6 +324,57 @@ mod tests {
 
         let config = config.with_request_timeout(Duration::from_millis(250));
         assert_eq!(config.request_timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn discover_without_explicit_dir_fails_even_with_platform_env() {
+        // 平台默认目录变量即使存在也不再被采用。
+        let mut env = HashMap::new();
+        env.insert(
+            "APPDATA",
+            OsString::from("C:\\Users\\test\\AppData\\Roaming"),
+        );
+        env.insert("HOME", OsString::from("/home/test"));
+        env.insert("XDG_CONFIG_HOME", OsString::from("/home/test/.config"));
+
+        let error = ClientConfig::discover_with(env_from(&env)).expect_err("缺少显式目录应失败");
+        match error {
+            ClientError::Connect(message) => {
+                assert!(
+                    message.contains(TERMX_CONFIG_DIR_ENV),
+                    "错误信息应提示显式目录: {message}"
+                );
+                assert!(
+                    message.contains("不再推导"),
+                    "错误信息应说明不再推导平台默认: {message}"
+                );
+            }
+            other => panic!("应返回 Connect 错误，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_from_dir_uses_given_dir_without_env_dir() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        fs::write(dir.path().join(PORT_FILE_NAME), "2468").expect("写端口文件");
+        fs::write(dir.path().join(TOKEN_FILE_NAME), "file-token").expect("写 token 文件");
+
+        let env = HashMap::new();
+        let config =
+            ClientConfig::discover_from_dir(dir.path(), env_from(&env)).expect("显式目录发现配置");
+        assert_eq!(config.endpoint, "ws://127.0.0.1:2468");
+        assert_eq!(config.token, "file-token");
+    }
+
+    #[test]
+    fn discover_token_from_dir_reads_token_file() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        fs::write(dir.path().join(TOKEN_FILE_NAME), "file-token").expect("写 token 文件");
+
+        let env = HashMap::new();
+        let token = ClientConfig::discover_token_from_dir(dir.path(), env_from(&env))
+            .expect("显式目录发现 token");
+        assert_eq!(token, "file-token");
     }
 
     #[test]

@@ -160,6 +160,7 @@ async fn handshake(client: &mut Client, token: &str) {
             "proto": PROTOCOL_VERSION,
             "token": token,
             "client": "pty-test",
+            "root_session_id": "ses-pty",
         }
     })
     .to_string();

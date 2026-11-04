@@ -1,3 +1,5 @@
+# opencode 生成目录（插件产物/依赖）
+/.opencode/
 # Rust 构建产物
 /target/
 **/*.rs.bk
@@ -16,3 +18,10 @@ Thumbs.db
 # 交叉编译/独立 target 目录
 /target-linux/
 /target-*/
+
+# 插件依赖
+node_modules/
+.opencode/node_modules/
+
+# 插件构建产物
+/opencode-plugin/termx/dist/

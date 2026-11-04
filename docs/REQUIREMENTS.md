@@ -15,7 +15,7 @@
 ## 2. 核心原则（不可违背）
 1. **服务拥有终端**：会话、PTY、进程树、缓冲、事件全部在 service；客户端不持有终端对象。
 2. **opencode 重启不杀终端**：客户端断开只是 `detach`，重连按 `terminal_id` re-attach。
-3. **默认永不超时**：`idle_timeout = 0`；配正数时行为必须显式（`detach` 或 `terminate`）。
+3. **默认按活动时间永不超时**：`idle_timeout = 0`；配正数时行为必须显式（`detach` 或 `terminate`）。另有**无存活 opencode 会话超时**：默认 **5 分钟**（`TERMX_CLIENT_IDLE_TIMEOUT_MS` 覆盖，`0` 关闭），以 `root_session_id` 的会话心跳为准（TTL 90s）；默认策略 `no_children`：到期时仍有用户子进程则继续保活，子进程退出后重新计时；`any` 到期即终止；`never` 永不因无会话终止。Web/终端附着不参与保活。
 4. **进程状态优先**：退出/信号以 OS wait/进程状态为准；文本提示符只辅助交互判定。
 5. **PTY 只是字节通道**：直接绑 Linux PTY / Windows ConPTY；VT/ANSI 解析、屏幕缓冲、键盘编码、前台进程组、事件状态机自研。
 6. **控制终端隔离**：service 不继承 opencode 的 stdin/stdout/控制终端。
@@ -44,8 +44,8 @@
 - opencode adapter（薄层）+ Web 客户端仅消费同一协议。
 
 **不做（v0）**
-- 不替换 `opencode-ssh-tool` 插件、Web transcript/raw、SFTP、传输任务、权限系统。
-- 不做完整终端模拟器 UI；不做跨平台安装器/自动升级。
+- 不替换 `opencode-ssh-tool` 插件、SFTP、传输任务、权限系统。
+- Web 双视图（信息 transcript / 原始控制台）已纳入 v0；不做完整终端模拟器 UI（多标签、分屏等）；不做跨平台安装器/自动升级。
 - 不承诺无 helper 时的远端精确进程树。
 - 不做 service 重启后的终端接管/恢复（v0 明确 `service_lost`）。
 
@@ -55,6 +55,7 @@
 - FR-S2 `attach`/`detach` 为客户端动作，支持同一终端多客户端；输入冲突用 `claim`/`release` 的 owner/lease 解决（同一时刻单一 lease owner，`force` 可抢占）。
 - FR-S3 `detach` 仅断开该客户端，不杀终端；`terminate` 杀进程树并落终态；`prune` 清理终态/孤儿。
 - FR-S4 `idle_timeout` 默认 0；正数时按配置 `detach`/`terminate`，事件可区分。
+- FR-S4b 无存活 opencode 会话默认 **5 分钟** → 按 `no_children` 策略处理（仍有用户子进程则续期，否则终止并杀进程树），终止事件 `interrupted{signal:"SIGTERM", source:"client_timeout"}`；`TERMX_CLIENT_IDLE_TIMEOUT_MS=0` 关闭，`TERMX_CLIENT_IDLE_POLICY=never|no_children|any` 可切换；会话心跳 TTL 默认 90s。与 `idle_timeout` 独立。
 - FR-S5 `prune` 清理已终态/孤儿会话（默认按最后活动时间）；设最大会话数与资源上限。
 - FR-S6 会话键为 `(root_session_id, name)`（主会话 id + 会话名称）；`terminal_id` 为内部全局唯一标识。同名且无 `--force` 时拒绝并返回说明；带 `--force` 时覆盖（终止旧同名终端后新建）。
 
@@ -88,7 +89,7 @@
 | NFR-1 | 并发/运行时 | async 运行时（推荐 `tokio`），每终端独立任务；多终端并发不互相阻塞 |
 | NFR-2 | 性能 | 输出吞吐满足交互程序实时性；PTY 读→事件推送有界延迟；写与读解耦 |
 | NFR-3 | 资源上限 | 可配置最大终端数、每终端输出缓冲上限、事件队列上限；超限按策略拒绝/截断并告警 |
-| NFR-4 | 安全 | 仅本机 WebSocket（绑定 `127.0.0.1`/`::1` 环回），不监听外部；token 鉴权；不记录原始输入/输出与密钥；日志脱敏 |
+| NFR-4 | 安全 | 主 service 默认仅本机 WebSocket（绑定 `127.0.0.1`/`::1` 环回）；Web 默认仅本机，远程需显式开启并密码登录；WebSocket 校验 Host/Origin；token 鉴权；不记录原始输入/输出与密钥；日志脱敏 |
 | NFR-5 | 可观测 | 结构化日志（不含载荷）、会话/进程/事件度量、`status`/诊断命令 |
 | NFR-6 | 跨平台 | Windows（ConPTY/Job）与 Linux（PTY/进程组）为 v0 必做；macOS 后补 |
 | NFR-7 | 可靠性 | 终态唯一；service 崩溃客户端收敛；无孤儿进程；断线不悬挂 |
@@ -99,7 +100,7 @@
 | ID | 问题 | 决策 | 理由 |
 | --- | --- | --- | --- |
 | OQ-1 | SSH 库 | 嵌入 `russh`，**不用系统 `ssh`** | 避免不同系统行为不一致；可控 PTY/exit/helper channel |
-| OQ-2 | 传输/鉴权 | **仅本机 WebSocket**（绑定 `127.0.0.1`/`::1` 环回）+ token 校验；不监听外部、不做跨机 | 安全（仅本地）+ WebSocket 兼容性好（Web/CLI/adapter 统一） |
+| OQ-2 | 传输/鉴权 | **主 service 默认仅本机 WebSocket**（绑定 `127.0.0.1`/`::1` 环回）+ token 校验；Web 默认仅本机，远程需显式开启并密码登录，并校验 Host/Origin | 默认安全 + WebSocket 兼容性好（Web/CLI/adapter 统一）；远程为显式 opt-in |
 | OQ-3 | helper 安装 | 随宿主同版本二进制，经 SSH 传临时目录 + sha256 校验 + 协议版本握手；失败回退；不改远端 shell 配置 | 版本强绑定、可校验、可回退 |
 | OQ-4 | 等待输入判定 | 组合信号（前台进程状态/阻塞、无输出窗口、prompt/OSC133、stdin 读），输出 `confidence+reason` | 单信号误报高；组合 + 置信度最稳 |
 | OQ-5 | 会话标识/同名 | 会话键 `(root_session_id, name)`；`terminal_id` 内部全局唯一；同名无 `--force` 拒绝并说明，带 `--force` 覆盖（终止旧终端） | 与 opencode 主会话对齐，避免误覆盖 |
@@ -127,6 +128,7 @@
 | AC-15 | 错误 token 握手 | 返回 `auth_failed` 并断开；不建立会话 |
 | AC-16 | 超资源上限 | 新建/缓冲/队列超限返回 `limit_exceeded`（`retryable=true`），不崩溃 |
 | AC-17 | 同名会话重复创建 | 无 `--force` 返回 `session_exists` + 说明（含旧 `terminal_id`）；带 `--force` 旧终端终止、新终端 `started` |
+| AC-18 | 无存活会话 ≥ 5 分钟（可配短超时） | 按策略处理：`no_children` 有用户子进程则保活、子进程退出后重新计时并终止；`any` 直接终止；`never` 不终止。终止落 `interrupted{signal:"SIGTERM", source:"client_timeout"}`；会话心跳可阻止终止 |
 
 ## 9. 参考
 - 实现路线：`docs/DEV_PLAN.md`

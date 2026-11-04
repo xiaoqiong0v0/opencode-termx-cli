@@ -1,0 +1,398 @@
+:root {
+  color-scheme: dark;
+  --termx-bg: #0b0e12;
+  --termx-panel: #131820;
+  --termx-border: #2a3340;
+  --termx-fg: #e6e6e6;
+  --termx-muted: #9aa4b2;
+  --termx-accent: #4da3ff;
+  --termx-danger: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--termx-bg);
+  color: var(--termx-fg);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body.termx-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.termx-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 16px;
+  background: var(--termx-panel);
+  border-bottom: 1px solid var(--termx-border);
+}
+
+.termx-brand {
+  font-size: 16px;
+  letter-spacing: 0.02em;
+}
+
+.termx-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.termx-field {
+  color: var(--termx-muted);
+  font-size: 13px;
+}
+
+.termx-select,
+.termx-input,
+.termx-button {
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--termx-fg);
+  background: #1b2230;
+  border: 1px solid var(--termx-border);
+  border-radius: 6px;
+}
+
+.termx-select {
+  min-width: 220px;
+  max-width: 42vw;
+}
+
+.termx-select-session {
+  min-width: 180px;
+  max-width: 26vw;
+}
+
+.termx-input {
+  min-width: 160px;
+}
+
+.termx-textarea {
+  min-height: 64px;
+  resize: vertical;
+  font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+}
+
+.termx-check {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  color: var(--termx-muted);
+  font-size: 13px;
+}
+
+.termx-button {
+  cursor: pointer;
+}
+
+.termx-button:hover:not(:disabled) {
+  border-color: var(--termx-accent);
+}
+
+.termx-button:disabled,
+.termx-select:disabled,
+.termx-input:disabled,
+.termx-check input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.termx-danger:hover:not(:disabled) {
+  border-color: var(--termx-danger);
+  color: var(--termx-danger);
+}
+
+.termx-status {
+  margin-left: auto;
+  color: var(--termx-muted);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.termx-tabs {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: #1b2230;
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+.termx-tab {
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--termx-muted);
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+}
+
+.termx-tab:hover {
+  color: var(--termx-fg);
+}
+
+.termx-tab.is-active {
+  color: var(--termx-fg);
+  background: #2a3340;
+}
+
+.termx-main {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 8px;
+}
+
+.termx-view {
+  position: absolute;
+  inset: 8px;
+  min-height: 0;
+}
+
+.termx-view-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.termx-info-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.termx-info-notice {
+  margin: 0;
+  padding: 6px 10px;
+  color: #ffcf70;
+  font-size: 13px;
+  background: #2a2415;
+  border: 1px solid #5a4a20;
+  border-radius: 6px;
+}
+
+.termx-info-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  padding: 8px 12px;
+  font-size: 13px;
+  background: var(--termx-panel);
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+.termx-meta-row {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.termx-meta-label {
+  color: var(--termx-muted);
+  white-space: nowrap;
+}
+
+.termx-meta-value {
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+}
+
+.termx-transcript {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--termx-fg);
+  background: #05070a;
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+.termx-info-form {
+  display: flex;
+  gap: 8px;
+}
+
+.termx-info-input {
+  flex: 1;
+  min-width: 0;
+  font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+}
+
+.termx-term {
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  overflow: hidden;
+  background: #05070a;
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+.termx-term .xterm {
+  height: 100%;
+}
+
+.termx-term .xterm-viewport {
+  background-color: transparent !important;
+}
+
+.termx-dialog {
+  width: min(460px, 92vw);
+  padding: 0;
+  color: var(--termx-fg);
+  background: var(--termx-panel);
+  border: 1px solid var(--termx-border);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+
+.termx-dialog-wide {
+  width: min(660px, 94vw);
+  max-height: 90vh;
+  overflow: auto;
+}
+
+.termx-form-section {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  background: #0f141b;
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+.termx-form-hidden {
+  display: none;
+}
+
+.termx-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.termx-form-grid > div {
+  display: grid;
+  gap: 6px;
+}
+
+.termx-dialog::backdrop {
+  background: rgba(3, 5, 8, 0.68);
+}
+
+.termx-dialog-form {
+  display: grid;
+  gap: 10px;
+  padding: 18px 20px;
+}
+
+.termx-dialog-title {
+  margin: 0 0 2px;
+  font-size: 16px;
+}
+
+.termx-dialog-hint {
+  margin: 0;
+  color: var(--termx-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.termx-dialog .termx-select,
+.termx-dialog .termx-input {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+
+.termx-dialog-error {
+  margin: 0;
+  color: var(--termx-danger);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.termx-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.termx-primary {
+  color: #06121f;
+  background: var(--termx-accent);
+  border-color: var(--termx-accent);
+}
+
+.termx-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+code {
+  color: var(--termx-accent);
+}
+
+.termx-login-body {
+  display: grid;
+  place-items: center;
+}
+
+.termx-login {
+  width: min(320px, 90vw);
+  padding: 24px;
+  border: 1px solid var(--termx-border);
+  border-radius: 10px;
+}
+
+.termx-login form {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.termx-login input,
+.termx-login button {
+  padding: 9px 11px;
+  font-size: 15px;
+  border-radius: 6px;
+  border: 1px solid #3a424c;
+}
+
+.termx-login button {
+  background: var(--termx-accent);
+  color: #06121f;
+  border: none;
+  cursor: pointer;
+}
+

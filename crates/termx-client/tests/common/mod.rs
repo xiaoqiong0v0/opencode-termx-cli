@@ -90,7 +90,8 @@ impl TestService {
 
     /// 指向本服务的客户端配置。
     pub fn client_config(&self) -> ClientConfig {
-        ClientConfig::new(self.endpoint(), self.token.clone(), "client-test")
+        // 集成测试会创建多个不同 root 的终端：用管理员连接避免逐个绑定会话。
+        ClientConfig::new(self.endpoint(), self.token.clone(), "client-test").with_admin(true)
     }
 
     /// 优雅停机并等待服务线程退出。

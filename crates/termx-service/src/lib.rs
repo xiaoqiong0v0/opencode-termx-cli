@@ -10,11 +10,17 @@
 //! 入口分两层：本 crate（`lib`）承载可测试的服务实现，`main.rs` 只做配置加载、
 //! tracing 初始化与事件循环启动。
 
+pub mod cli;
 mod config;
+mod lock;
+pub mod logging;
 mod server;
+mod web;
 
+pub use cli::{CliError, Command, ServiceArgs, USAGE};
 pub use config::{
-    ConfigError, DEFAULT_EVENT_BUFFER_CAPACITY, DEFAULT_IDLE_TICK_INTERVAL,
-    DEFAULT_MAX_FRAME_BYTES, PORT_FILE_NAME, ServiceConfig, TOKEN_FILE_NAME,
+    ClientIdlePolicy, DEFAULT_CLIENT_IDLE_TIMEOUT, DEFAULT_EVENT_BUFFER_CAPACITY,
+    DEFAULT_IDLE_TICK_INTERVAL, DEFAULT_LOG_MAX_DAYS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_SESSION_TTL,
+    PORT_FILE_NAME, SERVICE_LOCK_FILE_NAME, ServiceConfig, TOKEN_FILE_NAME,
 };
 pub use server::{Service, ServiceError};

@@ -1,6 +1,6 @@
 //! 终端标识与运行时条目。
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc, time::Instant};
 
 use termx_protocol::{
     Capabilities, Confidence, EventKind, IdleTimeout, InteractionState, LifecycleState, Mode,
@@ -9,7 +9,7 @@ use termx_protocol::{
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::{EventBuffer, EventRecord, InteractionAnalyzer, TerminalBackend};
+use crate::{EventBuffer, EventRecord, InteractionAnalyzer, TerminalBackend, TranscriptBuffer};
 
 /// 终端内部全局唯一标识；使用 26 字符 ULID 表示。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -71,6 +71,12 @@ pub struct TerminalEntry {
     pub name: String,
     /// 创建模式。
     pub mode: Mode,
+    /// 启动程序（`CreateParams.cmd` 原值）。
+    pub command: String,
+    /// 启动参数（`CreateParams.args` 原值）。
+    pub args: Vec<String>,
+    /// 启动工作目录（`CreateParams.cwd` 原值）。
+    pub cwd: Option<String>,
     /// 生命周期状态。
     pub state: LifecycleState,
     /// 交互状态。
@@ -101,12 +107,30 @@ pub struct TerminalEntry {
     pub idle_timeout: Option<IdleTimeout>,
     /// 输入 lease 的持有者（连接级 `client_id`）；`None` 表示空闲。
     pub lease: Option<String>,
+    /// 当前附着该终端的连接级 `client_id` 集合。
+    ///
+    /// 只统计终端级 `attach`/`subscribe`；`subscribe_all` 的全局订阅不计入。
+    /// 与订阅簿 `by_terminal` 同步维护，用于无客户端附着超时判定。
+    pub clients: BTreeSet<String>,
+    /// 最近一次客户端附着时间（RFC3339 UTC）。
+    ///
+    /// 仅保留为连接级诊断信息；终端保活改由所属 `root_session_id` 的
+    /// 会话心跳决定（见 [`TerminalEntry::clientless_since`]）。
+    pub last_client_seen: Option<String>,
+    /// 无存活会话的计时起点；`None` 表示当前视为有会话存活或尚未开始计时。
+    ///
+    /// service 的 idle ticker 在每个周期根据会话心跳表更新该值：
+    /// 会话存活时清空，不存活时首次写入当前时刻；超过
+    /// `client_idle_timeout` 后由策略决定是否终止。
+    pub clientless_since: Option<Instant>,
     /// 已发出但尚未在退出事件中结算的中断意图。
     pub pending_interrupt: Option<PendingInterrupt>,
     /// 每终端一份的交互识别状态机。
     pub(crate) analyzer: InteractionAnalyzer,
     /// 后端能力；SSH fallback 为 `Some(helper=false, bestEffort=true)`。
     pub capabilities: Option<Capabilities>,
+    /// 信息页 transcript（命令 + 原始输出文本，有界）。
+    pub transcript: TranscriptBuffer,
     /// 后端进程句柄。
     pub backend: Arc<dyn TerminalBackend>,
 }
@@ -158,6 +182,27 @@ impl TerminalEntry {
             .or_else(|| crate::parse_rfc3339(&self.created_at))
     }
 
+    /// 记录一个客户端附着：加入集合并刷新 `last_client_seen`。
+    pub fn add_client(&mut self, client_id: &str, at: OffsetDateTime) {
+        self.clients.insert(client_id.to_string());
+        self.last_client_seen = Some(crate::format_rfc3339(at));
+    }
+
+    /// 移除一个客户端附着；集合变为空时记录 `at` 作为无客户端计时起点。
+    pub fn remove_client(&mut self, client_id: &str, at: OffsetDateTime) {
+        if self.clients.remove(client_id) && self.clients.is_empty() {
+            self.last_client_seen = Some(crate::format_rfc3339(at));
+        }
+    }
+
+    /// 无客户端计时起点；缺失或格式非法时回退到创建时间。
+    pub fn client_seen_time(&self) -> Option<OffsetDateTime> {
+        self.last_client_seen
+            .as_deref()
+            .and_then(crate::parse_rfc3339)
+            .or_else(|| crate::parse_rfc3339(&self.created_at))
+    }
+
     /// 生成协议快照。
     ///
     /// 基础快照不查询后端；`terminal.status` 由 registry 在锁外补入
@@ -167,6 +212,9 @@ impl TerminalEntry {
             terminal_id: self.id.0.clone(),
             state: self.state,
             mode: self.mode,
+            command: self.command.clone(),
+            args: self.args.clone(),
+            cwd: self.cwd.clone(),
             pid: self.pid,
             pgid: self.pgid,
             ppid: self.ppid,
@@ -216,6 +264,9 @@ mod tests {
             root_session_id: "ses-1".to_string(),
             name: "build".to_string(),
             mode: Mode::Pty,
+            command: "mock".to_string(),
+            args: Vec::new(),
+            cwd: None,
             state: LifecycleState::Running,
             interaction: InteractionState::None,
             confidence: Confidence::Low,
@@ -231,8 +282,12 @@ mod tests {
             events: EventBuffer::default(),
             idle_timeout: None,
             lease: None,
+            clients: BTreeSet::new(),
+            last_client_seen: None,
+            clientless_since: None,
             pending_interrupt: None,
             capabilities: None,
+            transcript: TranscriptBuffer::default(),
             analyzer: InteractionAnalyzer::with_start_time(
                 crate::InteractionConfig::default(),
                 OffsetDateTime::now_utc(),

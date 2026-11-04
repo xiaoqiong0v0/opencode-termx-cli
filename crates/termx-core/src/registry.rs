@@ -13,13 +13,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use termx_protocol::{
     AttachResult, ClaimResult, Confidence, CreateParams, CreateResult, Event, EventKind,
     IdleTimeout, IdleTimeoutAction, IdleTimeoutUnit, InteractionState, LifecycleState, ListItem,
     ListParams, Mode, ProcNode, PruneBasis, PruneParams, PruneResult, ReadChunk, ReadResult,
-    ResetReason, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
+    RebindResult, ResetReason, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
+    TranscriptResult, TranscriptStatus, WEB_ROOT_SESSION_ID,
 };
 use time::OffsetDateTime;
 use tokio::sync::{
@@ -29,8 +31,9 @@ use tokio::sync::{
 
 use crate::{
     BackendFactory, CoreError, DEFAULT_EVENT_BUFFER_CAPACITY, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS,
-    EventBuffer, EventRecord, InteractionAnalyzer, InteractionConfig, InteractionUpdate,
-    ModeFactory, PendingInterrupt, TerminalBackend, TerminalEntry, TerminalId, now_rfc3339,
+    DEFAULT_TRANSCRIPT_CAPACITY, EventBuffer, EventRecord, InteractionAnalyzer, InteractionConfig,
+    InteractionUpdate, ModeFactory, PendingInterrupt, TerminalBackend, TerminalEntry, TerminalId,
+    TranscriptBuffer, now_rfc3339,
 };
 
 /// 会话内名称最大长度（按 Unicode 字符计数）。
@@ -51,6 +54,8 @@ pub const DETACH_REASON_DISCONNECT: &str = "disconnect";
 pub const IDLE_DETACH_REASON: &str = "idle_timeout";
 /// `idle_timeout` 到期、终止后端时写入的事件来源。
 pub const TIMEOUT_SOURCE: &str = "timeout";
+/// 连续无客户端附着超时、终止后端时写入的事件来源。
+pub const CLIENT_TIMEOUT_SOURCE: &str = "client_timeout";
 /// `terminal.create` 返回的初始游标：`started`（seq=1）之前的位置。
 pub const INITIAL_CURSOR: u64 = 0;
 /// 订阅者事件队列的默认容量（条）。
@@ -99,6 +104,32 @@ impl fmt::Debug for IdleAction {
                 .field(&backend.pid())
                 .finish(),
         }
+    }
+}
+
+/// 超过「无存活会话」超时的候选终端。
+///
+/// 由 [`Registry::candidates_clientless`] 在锁内产生；携带后端 `Arc`，
+/// service 可在锁外查询进程树（`no_children` 策略）或直接终止。
+pub struct ClientlessCandidate {
+    /// 到期终端。
+    pub terminal_id: TerminalId,
+    /// 所属 opencode 会话 ID。
+    pub root_session_id: String,
+    /// 终端根进程 PID；用于从进程树中排除根进程。
+    pub pid: Option<u32>,
+    /// 后端句柄，供锁外采集进程树或终止。
+    pub backend: Arc<dyn TerminalBackend>,
+}
+
+impl fmt::Debug for ClientlessCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientlessCandidate")
+            .field("terminal_id", &self.terminal_id)
+            .field("root_session_id", &self.root_session_id)
+            .field("pid", &self.pid)
+            .finish()
     }
 }
 
@@ -167,6 +198,8 @@ enum Delivery {
 pub struct Registry {
     /// 新建终端使用的事件缓冲容量。
     event_buffer_capacity: usize,
+    /// 新建终端使用的 transcript 容量（条）。
+    transcript_capacity: usize,
     /// 每个订阅者的有界事件队列容量。
     subscriber_queue_capacity: usize,
     /// 运行中终端数量上限；`None` 表示不限制。
@@ -216,6 +249,7 @@ impl Registry {
     ) -> Self {
         Self {
             event_buffer_capacity: event_buffer_capacity.max(1),
+            transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             subscriber_queue_capacity: subscriber_queue_capacity.max(1),
             max_terminals: None,
             factory,
@@ -234,6 +268,11 @@ impl Registry {
     /// 设置运行中终端数量上限；`None` 表示不限制。
     pub fn set_max_terminals(&mut self, max_terminals: Option<usize>) {
         self.max_terminals = max_terminals;
+    }
+
+    /// 设置新建终端的 transcript 容量；只影响之后创建的终端。
+    pub fn set_transcript_capacity(&mut self, capacity: usize) {
+        self.transcript_capacity = capacity.max(1);
     }
 
     /// 设置新建终端使用的交互识别配置；只影响之后创建的终端。
@@ -413,6 +452,10 @@ impl Registry {
             root_session_id: params.root_session_id,
             name: params.name,
             mode: params.mode,
+            // 保存创建时的启动信息原值，供 status/list 展示（SSH 也保留原始 cmd/args）。
+            command: params.cmd,
+            args: params.args,
+            cwd: params.cwd,
             state: LifecycleState::Running,
             interaction: InteractionState::None,
             confidence: Confidence::Low,
@@ -422,14 +465,20 @@ impl Registry {
             foreground_pgrp,
             cols,
             rows,
-            created_at,
+            created_at: created_at.clone(),
             last_activity: None,
             seq: 0,
             events: EventBuffer::new(self.event_buffer_capacity),
             idle_timeout: params.idle_timeout,
             lease: None,
+            clients: BTreeSet::new(),
+            // 仅作连接级诊断；终端保活由 clientless_since 与会话心跳决定。
+            last_client_seen: Some(created_at.clone()),
+            // 创建时视为无会话：首个 ticker 周期开始计时。
+            clientless_since: None,
             pending_interrupt: None,
             capabilities: backend.capabilities(),
+            transcript: TranscriptBuffer::new(self.transcript_capacity),
             analyzer: InteractionAnalyzer::with_start_time(
                 self.interaction_config,
                 OffsetDateTime::now_utc(),
@@ -455,14 +504,37 @@ impl Registry {
 
     /// 按状态过滤并限制条数。
     pub fn list(&self, params: &ListParams) -> Vec<ListItem> {
+        self.list_for(params, None)
+    }
+
+    /// 按状态过滤并限制条数；`root_session_id` 为 `Some` 时只返回该会话的终端。
+    ///
+    /// 会话隔离只应在服务端按连接身份传入；`None` 表示不限制（管理员）。
+    pub fn list_for(&self, params: &ListParams, root_session_id: Option<&str>) -> Vec<ListItem> {
         let limit = params.limit.map_or(usize::MAX, |limit| limit as usize);
 
-        self.by_id
+        let mut entries: Vec<_> = self
+            .by_id
             .values()
+            .filter(|entry| match root_session_id {
+                Some(root) => entry.root_session_id == root,
+                None => true,
+            })
             .filter(|entry| match &params.states {
                 Some(states) => states.contains(&entry.state),
                 None => true,
             })
+            .collect();
+        // `limit` 取最近活动的 N 条；ID 作为稳定兜底，避免 HashMap 顺序导致结果不确定。
+        entries.sort_by(|left, right| {
+            right
+                .activity_time()
+                .cmp(&left.activity_time())
+                .then_with(|| right.id.0.cmp(&left.id.0))
+        });
+
+        entries
+            .into_iter()
             .take(limit)
             .map(|entry| ListItem {
                 terminal_id: entry.id.0.clone(),
@@ -470,6 +542,9 @@ impl Registry {
                 name: entry.name.clone(),
                 state: entry.state,
                 mode: entry.mode,
+                command: entry.command.clone(),
+                args: entry.args.clone(),
+                cwd: entry.cwd.clone(),
                 pid: entry.pid,
                 idle_timeout: entry.idle_timeout,
                 last_activity: entry.last_activity.clone(),
@@ -525,6 +600,55 @@ impl Registry {
         Ok(read_after(entry, cursor, max_bytes))
     }
 
+    /// 记录一条新命令（status=running，输出清空）。
+    ///
+    /// 调用方只应在 `terminal.send` 通过鉴权/lease 且 `enter=true` 后调用；
+    /// 按键/密码等 `enter=false` 的输入不得记录。
+    pub fn record_transcript_command(
+        &mut self,
+        id: &TerminalId,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<u64, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.record_command(text, now))
+    }
+
+    /// 追加一段原始输出文本（保留 ANSI）；空文本或尚无命令时跳过。
+    pub fn record_transcript_output(
+        &mut self,
+        id: &TerminalId,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, CoreError> {
+        if text.is_empty() {
+            return Ok(false);
+        }
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.record_output(text, now))
+    }
+
+    /// 对所有终端执行静默结束判定，返回被标记为 `done` 的命令数。
+    pub fn finalize_quiet_transcripts(&mut self, now: OffsetDateTime, quiet: Duration) -> usize {
+        let mut finalized = 0;
+        for entry in self.by_id.values_mut() {
+            if entry.transcript.finalize_quiet(now, quiet) {
+                finalized += 1;
+            }
+        }
+        finalized
+    }
+
+    /// 读取最近命令记录；`limit` 为 `None`/0 时返回全部保留记录。
+    pub fn transcript(
+        &self,
+        locator: &TerminalLocator,
+        limit: Option<u32>,
+    ) -> Result<TranscriptResult, CoreError> {
+        let id = self.resolve(locator)?;
+        let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.read(limit))
+    }
     /// 终止终端：落 `interrupted` 终态并调用后端；已终态时幂等返回 `Ok`。
     ///
     /// 同步便捷入口。service 应先调用 [`Registry::prepare_terminate`] 取后端
@@ -547,6 +671,118 @@ impl Registry {
     ) -> Result<Option<Arc<dyn TerminalBackend>>, CoreError> {
         let id = self.resolve(locator)?;
         self.mark_interrupted(&id)
+    }
+
+    /// 把终端绑定键迁移到新的 `(root_session_id, name)`。
+    ///
+    /// `terminal_id`、进程、lease、订阅与事件缓冲均保持不变，只改写
+    /// `root_session_id` / `name` 与 `by_key`，并重置 `clientless_since`（新会话
+    /// 从下一轮 ticker 重新计时）。终态终端返回 `already_terminal`。
+    ///
+    /// 目标键已存在时：
+    /// - `force=false`：返回 `session_exists`，错误携带目标旧终端 ID；
+    /// - `force=true`：目标旧终端先落 `interrupted{source:"terminate"}` 并从索引
+    ///   移除，返回的后端 `Arc` 由调用方在 registry 锁外终止。
+    ///
+    /// `name=None` 表示保留原名；目标键与当前键相同时只重置计时，不产生事件。
+    pub fn rebind(
+        &mut self,
+        locator: &TerminalLocator,
+        root_session_id: &str,
+        name: Option<&str>,
+        force: bool,
+    ) -> Result<(RebindResult, Option<Arc<dyn TerminalBackend>>), CoreError> {
+        if root_session_id.is_empty() {
+            return Err(CoreError::BadRequest(
+                "root_session_id 不能为空".to_string(),
+            ));
+        }
+
+        let id = self.resolve(locator)?;
+        let (old_root_session_id, old_name, state) = {
+            let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
+            (
+                entry.root_session_id.clone(),
+                entry.name.clone(),
+                entry.state,
+            )
+        };
+        if state.is_terminal() {
+            return Err(CoreError::AlreadyTerminal);
+        }
+
+        let new_name = match name {
+            Some(name) => {
+                validate_name(name)?;
+                name.to_string()
+            }
+            None => old_name.clone(),
+        };
+        let old_key = (old_root_session_id.clone(), old_name.clone());
+        let new_key = (root_session_id.to_string(), new_name.clone());
+
+        // 目标键与当前键相同：无实际迁移，只重置无会话计时。
+        if old_key == new_key {
+            if let Some(entry) = self.by_id.get_mut(&id) {
+                entry.clientless_since = None;
+            }
+            return Ok((
+                RebindResult {
+                    terminal_id: id.0,
+                    root_session_id: root_session_id.to_string(),
+                    name: new_name,
+                },
+                None,
+            ));
+        }
+
+        let mut displaced = None;
+        if let Some(target_id) = self.by_key.get(&new_key).cloned() {
+            if target_id != id {
+                if !force {
+                    return Err(CoreError::SessionExists {
+                        terminal_id: target_id.0.clone(),
+                    });
+                }
+                // force：目标旧终端先落终态并从索引/订阅簿移除；
+                // 后端由调用方在锁外终止（与 register_create 的置换语义一致）。
+                displaced = self.mark_interrupted(&target_id)?;
+                self.by_id.remove(&target_id);
+                self.by_key.remove(&new_key);
+                self.subscriptions.by_terminal.remove(&target_id);
+                for excluded in self.subscriptions.excluded.values_mut() {
+                    excluded.remove(&target_id);
+                }
+            }
+        }
+
+        self.by_key.remove(&old_key);
+        {
+            let entry = self.by_id.get_mut(&id).ok_or(CoreError::NotFound)?;
+            entry.root_session_id = root_session_id.to_string();
+            entry.name = new_name.clone();
+            // 新会话的心跳/超时从下一轮 ticker 重新判断。
+            entry.clientless_since = None;
+        }
+        self.by_key.insert(new_key, id.clone());
+        self.publish(
+            &id,
+            EventKind::Rebound {
+                old_root_session_id,
+                new_root_session_id: root_session_id.to_string(),
+                old_name,
+                new_name: new_name.clone(),
+            },
+        )?;
+
+        Ok((
+            RebindResult {
+                terminal_id: id.0,
+                root_session_id: root_session_id.to_string(),
+                name: new_name,
+            },
+            displaced,
+        ))
     }
 
     /// 申请输入 lease。
@@ -864,6 +1100,103 @@ impl Registry {
         actions
     }
 
+    /// 扫描「所属 opencode 会话已不存活」的运行中终端。
+    ///
+    /// `is_session_live` 由 service 根据会话心跳表提供（core 不维护会话 map）。
+    /// 每个周期：
+    /// - 会话存活：清空 `clientless_since`；
+    /// - 会话不存活：首次记录 `now`，超过 `timeout` 时加入返回值。
+    ///
+    /// `timeout` 为 0 表示关闭该检查，直接返回空列表。返回的候选携带后端
+    /// `Arc`，供调用方在锁外查询进程树或终止；registry 本身不调用后端。
+    pub fn candidates_clientless<F>(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+        mut is_session_live: F,
+    ) -> Vec<ClientlessCandidate>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        if timeout.is_zero() {
+            return Vec::new();
+        }
+
+        let mut due = Vec::new();
+        for (id, entry) in &mut self.by_id {
+            if entry.state != LifecycleState::Running {
+                continue;
+            }
+            // Web 未绑定终端（保留 root）没有 opencode 会话，豁免无会话超时；
+            // 只能由管理员手动 terminate。
+            if entry.root_session_id == WEB_ROOT_SESSION_ID {
+                entry.clientless_since = None;
+                continue;
+            }
+            if is_session_live(&entry.root_session_id) {
+                entry.clientless_since = None;
+                continue;
+            }
+            match entry.clientless_since {
+                None => entry.clientless_since = Some(now),
+                Some(since) if now.saturating_duration_since(since) >= timeout => {
+                    due.push(ClientlessCandidate {
+                        terminal_id: id.clone(),
+                        root_session_id: entry.root_session_id.clone(),
+                        pid: entry.pid,
+                        backend: Arc::clone(&entry.backend),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        due
+    }
+
+    /// 重新开始无会话计时（`now` 为新的起点）。
+    ///
+    /// `no_children` 策略到期时若仍存在用户子进程，用该方法续期，避免
+    /// 下一 tick 立即重复判定。终端不存在或已终态时返回 `false`。
+    pub fn reset_clientless(&mut self, id: &TerminalId, now: Instant) -> bool {
+        let Some(entry) = self.by_id.get_mut(id) else {
+            return false;
+        };
+        if entry.state != LifecycleState::Running {
+            return false;
+        }
+        entry.clientless_since = Some(now);
+        true
+    }
+
+    /// 按指定来源终止终端：锁内落 `interrupted{signal:"SIGTERM", source}` 终态。
+    ///
+    /// 返回需要在锁外终止的后端；已终态返回 `None`（幂等），未知终端返回
+    /// `not_found`。本方法不调用后端，可在持有 registry 锁时安全调用。
+    pub fn terminate_with_source(
+        &mut self,
+        id: &TerminalId,
+        source: &str,
+    ) -> Result<Option<Arc<dyn TerminalBackend>>, CoreError> {
+        if !self.by_id.contains_key(id) {
+            return Err(CoreError::NotFound);
+        }
+        self.mark_interrupted_with(id, TERMINATE_SIGNAL, source)
+    }
+
+    /// 刷新该客户端已附着终端的 `last_client_seen`（仅诊断）。
+    ///
+    /// 兼容旧的无参 `heartbeat`：连接存活即刷新附着时间，但**不参与终端
+    /// 保活**。终端保活只看 `root_session_id` 的会话心跳，见
+    /// [`Registry::candidates_clientless`]。
+    pub fn heartbeat(&mut self, client_id: &str, now: OffsetDateTime) {
+        let at = crate::format_rfc3339(now);
+        for entry in self.by_id.values_mut() {
+            if entry.clients.contains(client_id) {
+                entry.last_client_seen = Some(at.clone());
+            }
+        }
+    }
+
     /// 清理终态终端。
     ///
     /// 仅删除 `state` 为终态的条目。**必须显式给出过滤或 `all=true`**：空过滤且
@@ -873,6 +1206,20 @@ impl Registry {
     /// 其余过滤，清理全部终态。删除时同步移除会话键、终端级订阅与全局订阅排除项，
     /// 返回被删除的 `terminal_id` 列表。
     pub fn prune<P>(&mut self, params: P) -> Result<PruneResult, CoreError>
+    where
+        P: Borrow<PruneParams>,
+    {
+        self.prune_for(params, None)
+    }
+
+    /// 清理终态终端；`root_session_id` 为 `Some` 时只清理该会话的终端。
+    ///
+    /// 过滤与 `prune` 相同；会话隔离由调用方按连接身份传入。
+    pub fn prune_for<P>(
+        &mut self,
+        params: P,
+        root_session_id: Option<&str>,
+    ) -> Result<PruneResult, CoreError>
     where
         P: Borrow<PruneParams>,
     {
@@ -893,6 +1240,11 @@ impl Registry {
 
         let mut removed = Vec::new();
         for (id, entry) in &self.by_id {
+            if let Some(root) = root_session_id {
+                if entry.root_session_id != root {
+                    continue;
+                }
+            }
             if !entry.state.is_terminal() {
                 continue;
             }
@@ -955,6 +1307,29 @@ impl Registry {
                 "定位参数需要 terminal_id 或 (root_session_id, name)".to_string(),
             )),
         }
+    }
+
+    /// 解析定位器并校验调用者是否有权访问该终端。
+    ///
+    /// `admin=true` 直接放行；否则要求终端 `root_session_id` 与调用者一致。
+    /// 终端不存在返回 `not_found`，存在但归属不同返回 `permission_denied`
+    /// （不携带终端内容）。调用方应在同一把 registry 锁内继续执行实际操作，
+    /// 避免鉴权与操作之间的迁移竞态。
+    pub fn authorize(
+        &self,
+        locator: &TerminalLocator,
+        admin: bool,
+        root_session_id: Option<&str>,
+    ) -> Result<TerminalId, CoreError> {
+        let id = self.resolve(locator)?;
+        if admin {
+            return Ok(id);
+        }
+        let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
+        if root_session_id != Some(entry.root_session_id.as_str()) {
+            return Err(CoreError::PermissionDenied);
+        }
+        Ok(id)
     }
 
     /// 返回指定终端的终端级订阅客户端列表（按 `client_id` 排序）。
@@ -1021,6 +1396,11 @@ impl Registry {
             // 终态不再接受输入，lease 与未结算的中断意图随之失效。
             entry.lease = None;
             entry.pending_interrupt = None;
+            if let Some(status) = transcript_status_for(state) {
+                entry
+                    .transcript
+                    .finalize_terminal(status, OffsetDateTime::now_utc());
+            }
         }
 
         self.publish(id, kind)
@@ -1142,7 +1522,9 @@ impl Registry {
     ///
     /// 返回的 `cursor` 是**不含本次 `attached` 事件**的基线；`attached` 作为
     /// 首个实时事件紧随其后。`cursor` 早于 ring 下界时返回 `reset: too_old` +
-    /// 基线游标，不回放历史；无 `cursor` 时只回快照，不回放历史。
+    /// 基线游标，不回放历史；待回放事件超出订阅者队列剩余容量时返回
+    /// `reset: buffer_overflow` + 基线游标，同样跳过历史但保持订阅；无
+    /// `cursor` 时只回快照，不回放历史。
     pub fn attach(
         &mut self,
         locator: &TerminalLocator,
@@ -1153,13 +1535,18 @@ impl Registry {
         let id = self.resolve(locator)?;
         let (snapshot, baseline, reset, replay) = {
             let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
-            let (reset, replay) = replay_after(entry, cursor);
+            // 为紧随回放之后的 `attached` 预留一个队列位置，避免回放刚好填满
+            // 后 `attached` 投递失败触发 `limit_exceeded`。
+            let available = tx.capacity().saturating_sub(1);
+            let (reset, replay) = replay_after(entry, cursor, available);
             (entry.snapshot(), entry.seq, reset, replay)
         };
 
         // 先注册再回放：与 report_event 同受 registry 锁保护，不会出现空窗或重复。
         self.subscribe_terminal(&id, client_id, tx.clone());
         self.clear_exclusion(&id, client_id);
+        // 终端级附着计入客户端集合，并刷新无客户端计时起点。
+        self.mark_client_attached(&id, client_id, OffsetDateTime::now_utc());
         let delivery = self.deliver_replay(&tx, replay);
         if delivery == Delivery::Throttled {
             self.throttle_client(client_id);
@@ -1179,6 +1566,9 @@ impl Registry {
     }
 
     /// 显式订阅单个终端；有 `cursor` 时按 ring 回放，但不 emit `attached`。
+    ///
+    /// 待回放事件超出订阅者队列剩余容量时返回 `reset: buffer_overflow` + 基线
+    /// 游标并跳过历史回放；订阅仍然生效，后续实时事件正常投递。
     pub fn subscribe(
         &mut self,
         locator: &TerminalLocator,
@@ -1189,12 +1579,14 @@ impl Registry {
         let id = self.resolve(locator)?;
         let (baseline, reset, replay) = {
             let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
-            let (reset, replay) = replay_after(entry, cursor);
+            let (reset, replay) = replay_after(entry, cursor, tx.capacity());
             (entry.seq, reset, replay)
         };
 
         self.subscribe_terminal(&id, client_id, tx.clone());
         self.clear_exclusion(&id, client_id);
+        // 终端级订阅同样计入附着；`subscribe_all` 不计入。
+        self.mark_client_attached(&id, client_id, OffsetDateTime::now_utc());
         let delivery = self.deliver_replay(&tx, replay);
         if delivery == Delivery::Throttled {
             self.throttle_client(client_id);
@@ -1245,6 +1637,8 @@ impl Registry {
             .is_some_and(|clients| clients.remove(client_id).is_some());
         // 即使此前没有终端级订阅，detach 也把该终端从全局订阅中排除。
         self.exclude_terminal(id, client_id);
+        // 最后一个客户端 detach 时记录当前时间，作为无客户端超时起点。
+        self.mark_client_detached(id, client_id, OffsetDateTime::now_utc());
         if removed {
             self.publish(
                 id,
@@ -1275,6 +1669,12 @@ impl Registry {
         self.subscriptions.all.remove(client_id);
         self.subscriptions.excluded.remove(client_id);
 
+        // 同步清理条目的附着集合；最后一个客户端断开时刷新计时起点。
+        let now = OffsetDateTime::now_utc();
+        for entry in self.by_id.values_mut() {
+            entry.remove_client(client_id, now);
+        }
+
         for id in targets {
             if self.by_id.contains_key(&id) {
                 self.publish(
@@ -1299,6 +1699,7 @@ impl Registry {
             clients.remove(client_id);
         }
         self.exclude_terminal(id, client_id);
+        self.mark_client_detached(id, client_id, OffsetDateTime::now_utc());
         Ok(())
     }
 
@@ -1309,6 +1710,11 @@ impl Registry {
         }
         self.subscriptions.all.remove(client_id);
         self.subscriptions.excluded.remove(client_id);
+
+        let now = OffsetDateTime::now_utc();
+        for entry in self.by_id.values_mut() {
+            entry.remove_client(client_id, now);
+        }
     }
 
     /// 空闲超时的 detach 动作：向该终端订阅者投递 `detached` 并移除订阅。
@@ -1340,6 +1746,9 @@ impl Registry {
         self.subscriptions.by_terminal.remove(id);
         for client_id in &clients {
             self.exclude_terminal(id, client_id);
+            if let Some(entry) = self.by_id.get_mut(id) {
+                entry.remove_client(client_id, now);
+            }
         }
         if let Some(entry) = self.by_id.get_mut(id) {
             entry.touch(now);
@@ -1354,6 +1763,20 @@ impl Registry {
             .entry(id.clone())
             .or_default()
             .insert(client_id.to_string(), tx);
+    }
+
+    /// 把客户端计入终端附着集合并刷新无客户端计时起点。
+    fn mark_client_attached(&mut self, id: &TerminalId, client_id: &str, at: OffsetDateTime) {
+        if let Some(entry) = self.by_id.get_mut(id) {
+            entry.add_client(client_id, at);
+        }
+    }
+
+    /// 从终端附着集合移除客户端；集合清空时记录 `at`。
+    fn mark_client_detached(&mut self, id: &TerminalId, client_id: &str, at: OffsetDateTime) {
+        if let Some(entry) = self.by_id.get_mut(id) {
+            entry.remove_client(client_id, at);
+        }
     }
 
     /// 把终端加入该客户端的全局订阅排除集。
@@ -1461,8 +1884,15 @@ impl Registry {
         }
 
         if let Some(clients) = self.subscriptions.by_terminal.get_mut(id) {
-            for client_id in remove_terminal {
-                clients.remove(&client_id);
+            for client_id in &remove_terminal {
+                clients.remove(client_id);
+            }
+        }
+        // 投递失败（接收端关闭/限流）同样清理条目的附着集合。
+        let now = OffsetDateTime::now_utc();
+        if let Some(entry) = self.by_id.get_mut(id) {
+            for client_id in &remove_terminal {
+                entry.remove_client(client_id, now);
             }
         }
         for client_id in remove_all {
@@ -1496,6 +1926,12 @@ impl Registry {
             clients.remove(client_id);
         }
         self.subscriptions.all.remove(client_id);
+
+        // 发送端关闭/限流时同步移除条目上的附着，避免残留客户端让无客户端超时失效。
+        let now = OffsetDateTime::now_utc();
+        for entry in self.by_id.values_mut() {
+            entry.remove_client(client_id, now);
+        }
     }
 
     /// 把终端置为 `interrupted` 终态、清 lease 并广播事件。
@@ -1534,6 +1970,9 @@ impl Registry {
                 signal: signal.to_string(),
                 source: source.to_string(),
             });
+            entry
+                .transcript
+                .finalize_terminal(TranscriptStatus::Interrupted, OffsetDateTime::now_utc());
         }
         self.publish(
             id,
@@ -1620,6 +2059,16 @@ fn signal_name(signal: i32) -> String {
     name.to_string()
 }
 
+/// 终态生命周期状态对应的命令记录状态；非终态返回 `None`。
+fn transcript_status_for(state: LifecycleState) -> Option<TranscriptStatus> {
+    match state {
+        LifecycleState::Exited => Some(TranscriptStatus::Exited),
+        LifecycleState::Interrupted => Some(TranscriptStatus::Interrupted),
+        LifecycleState::Error => Some(TranscriptStatus::Error),
+        _ => None,
+    }
+}
+
 /// 终态事件对应的生命周期状态；非终态事件返回 `None`。
 fn terminal_state_for(kind: &EventKind) -> Option<LifecycleState> {
     match kind {
@@ -1631,13 +2080,31 @@ fn terminal_state_for(kind: &EventKind) -> Option<LifecycleState> {
 }
 
 /// 按游标从 ring 取出可回放事件；游标所需历史不可用时返回 `too_old`。
-fn replay_after(entry: &TerminalEntry, cursor: Option<u64>) -> (Option<ResetReason>, Vec<Event>) {
+///
+/// `available` 是订阅者队列当前可容纳的事件数。待回放事件超过该值时返回
+/// `buffer_overflow` 并**不构造回放**：逐条 `try_send` 会把队列填满并触发
+/// `limit_exceeded` 断连，客户端应按基线游标改用 `terminal.read` 分段取历史。
+fn replay_after(
+    entry: &TerminalEntry,
+    cursor: Option<u64>,
+    available: usize,
+) -> (Option<ResetReason>, Vec<Event>) {
     let Some(cursor) = cursor else {
         return (None, Vec::new());
     };
 
     if output_history_missing(entry, cursor) {
         return (Some(ResetReason::TooOld), Vec::new());
+    }
+
+    let pending = entry
+        .events
+        .records()
+        .iter()
+        .filter(|record| record.seq > cursor)
+        .count();
+    if pending > available {
+        return (Some(ResetReason::BufferOverflow), Vec::new());
     }
 
     let events = entry
@@ -1814,6 +2281,19 @@ mod tests {
             force,
             idle_timeout: None,
             ssh: None,
+        }
+    }
+
+    /// 解包 rebind 失败结果；成功时按预期失败信息 panic。
+    ///
+    /// `rebind` 成功值含 `Arc<dyn TerminalBackend>`（未实现 `Debug`），不能直接用
+    /// `expect_err`。
+    fn expect_rebind_err(
+        result: Result<(RebindResult, Option<Arc<dyn TerminalBackend>>), CoreError>,
+    ) -> CoreError {
+        match result {
+            Ok(_) => panic!("rebind 本应失败"),
+            Err(error) => error,
         }
     }
 
@@ -2081,6 +2561,353 @@ mod tests {
             CoreError::BadRequest(
                 "定位参数需要 terminal_id 或 (root_session_id, name)".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn clientless_expiry_tracks_session_liveness_and_resets() {
+        let mut registry = mock_registry();
+        let created = registry
+            .create(params("ses-1", "build", false))
+            .expect("create 应成功");
+        let id = TerminalId::new(created.terminal_id.clone());
+        let timeout = Duration::from_millis(100);
+        let start = Instant::now();
+
+        // 会话存活时不计时。
+        assert!(
+            registry
+                .candidates_clientless(start, timeout, |_| true)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get(&id)
+                .expect("终端应存在")
+                .clientless_since
+                .is_none()
+        );
+
+        // 首轮无会话只记录起点，未到超时不返回。
+        assert!(
+            registry
+                .candidates_clientless(start, timeout, |_| false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get(&id)
+                .expect("终端应存在")
+                .clientless_since
+                .is_some()
+        );
+
+        // 超过超时返回候选；即使仍有 attach 也不影响（附着不算客户端）。
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        registry
+            .attach(&by_id(&created.terminal_id), "c1", None, tx)
+            .expect("attach 应成功");
+        let due =
+            registry.candidates_clientless(start + Duration::from_millis(200), timeout, |_| false);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].terminal_id, id);
+
+        // 会话恢复存活后清空计时。
+        assert!(
+            registry
+                .candidates_clientless(start + Duration::from_millis(250), timeout, |_| true)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get(&id)
+                .expect("终端应存在")
+                .clientless_since
+                .is_none()
+        );
+
+        // no_children 续期后重新计时，未到超时不返回。
+        let resumed = start + Duration::from_millis(300);
+        assert!(
+            registry
+                .candidates_clientless(resumed, timeout, |_| false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .candidates_clientless(resumed + Duration::from_millis(50), timeout, |_| false)
+                .is_empty()
+        );
+        assert!(registry.reset_clientless(&id, resumed + Duration::from_millis(60)));
+        assert!(
+            registry
+                .candidates_clientless(resumed + Duration::from_millis(100), timeout, |_| false)
+                .is_empty()
+        );
+        let due =
+            registry
+                .candidates_clientless(resumed + Duration::from_millis(200), timeout, |_| false);
+        assert_eq!(due.len(), 1);
+
+        // 终止来源必须为 client_timeout。
+        let backend = registry
+            .terminate_with_source(&id, CLIENT_TIMEOUT_SOURCE)
+            .expect("终止应成功")
+            .expect("运行中终端应返回后端");
+        drop(backend);
+        let entry = registry.get(&id).expect("终态仍可只读");
+        assert_eq!(entry.state, LifecycleState::Interrupted);
+        let last = entry.events.records().back().expect("应有终态事件");
+        match &last.kind {
+            EventKind::Interrupted { signal, source } => {
+                assert_eq!(signal, "SIGTERM");
+                assert_eq!(source, CLIENT_TIMEOUT_SOURCE);
+            }
+            other => panic!("期望 interrupted 事件，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clientless_scan_skips_web_root_terminal() {
+        let mut registry = mock_registry();
+        let created = registry
+            .create(params(WEB_ROOT_SESSION_ID, "web", false))
+            .expect("create 应成功");
+        let id = TerminalId::new(created.terminal_id.clone());
+        let timeout = Duration::from_millis(10);
+        let start = Instant::now();
+
+        // 即使没有任何存活会话，@web 终端也不参与无会话超时。
+        assert!(
+            registry
+                .candidates_clientless(start, timeout, |_| false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .candidates_clientless(start + Duration::from_millis(100), timeout, |_| false)
+                .is_empty()
+        );
+        let entry = registry.get(&id).expect("终端应存在");
+        assert_eq!(entry.state, LifecycleState::Running);
+        assert!(
+            entry.clientless_since.is_none(),
+            "@web 终端不应记录无会话计时"
+        );
+    }
+
+    #[test]
+    fn rebind_moves_key_and_preserves_id_lease_and_process() {
+        let mut registry = mock_registry();
+        let backend = Arc::new(MockBackend::new());
+        let created = registry
+            .create_with_backend(params("ses-1", "build", false), backend.clone())
+            .expect("create 应成功");
+        let id = TerminalId::new(created.terminal_id.clone());
+        registry
+            .claim(&by_id(&created.terminal_id), "client-a", false)
+            .expect("claim 应成功");
+        let pid = registry.get(&id).expect("终端应存在").pid;
+
+        let (result, displaced) = registry
+            .rebind(&by_id(&created.terminal_id), "ses-2", Some("verify"), false)
+            .expect("rebind 应成功");
+        assert!(displaced.is_none());
+        assert_eq!(result.terminal_id, created.terminal_id);
+        assert_eq!(result.root_session_id, "ses-2");
+        assert_eq!(result.name, "verify");
+
+        let old_key = TerminalLocator {
+            terminal_id: None,
+            root_session_id: Some("ses-1".to_string()),
+            name: Some("build".to_string()),
+        };
+        assert_eq!(registry.status(&old_key), Err(CoreError::NotFound));
+
+        let new_key = TerminalLocator {
+            terminal_id: None,
+            root_session_id: Some("ses-2".to_string()),
+            name: Some("verify".to_string()),
+        };
+        assert_eq!(
+            registry.status(&new_key).expect("新键应可解析").terminal_id,
+            created.terminal_id
+        );
+        let entry = registry.get(&id).expect("终端应存在");
+        assert_eq!(entry.root_session_id, "ses-2");
+        assert_eq!(entry.name, "verify");
+        assert_eq!(entry.pid, pid, "进程保持不变");
+        assert_eq!(entry.lease.as_deref(), Some("client-a"), "lease 保持不变");
+        assert_eq!(entry.state, LifecycleState::Running);
+        assert_eq!(backend.terminate_calls(), 0, "迁移不应终止进程");
+
+        let rebound = entry.events.records().back().expect("应有 rebound 事件");
+        match &rebound.kind {
+            EventKind::Rebound {
+                old_root_session_id,
+                new_root_session_id,
+                old_name,
+                new_name,
+            } => {
+                assert_eq!(old_root_session_id, "ses-1");
+                assert_eq!(new_root_session_id, "ses-2");
+                assert_eq!(old_name, "build");
+                assert_eq!(new_name, "verify");
+            }
+            other => panic!("期望 rebound 事件，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebind_conflict_without_force_reports_target_terminal_id() {
+        let mut registry = mock_registry();
+        let source = registry
+            .create(params("ses-1", "build", false))
+            .expect("create 应成功");
+        let target = registry
+            .create(params("ses-2", "build", false))
+            .expect("create 应成功");
+
+        let error =
+            expect_rebind_err(registry.rebind(&by_id(&source.terminal_id), "ses-2", None, false));
+        assert_eq!(
+            error,
+            CoreError::SessionExists {
+                terminal_id: target.terminal_id.clone()
+            }
+        );
+        // 失败时两个终端都保持原键。
+        assert_eq!(
+            registry
+                .status(&TerminalLocator {
+                    terminal_id: None,
+                    root_session_id: Some("ses-1".to_string()),
+                    name: Some("build".to_string()),
+                })
+                .expect("源键仍应存在")
+                .terminal_id,
+            source.terminal_id
+        );
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn rebind_force_terminates_target_and_keeps_source() {
+        let mut registry = mock_registry();
+        let source = registry
+            .create(params("ses-1", "build", false))
+            .expect("create 应成功");
+        let target_backend = Arc::new(MockBackend::new());
+        let target = registry
+            .create_with_backend(params("ses-2", "build", false), target_backend.clone())
+            .expect("create 应成功");
+
+        let (result, displaced) = registry
+            .rebind(&by_id(&source.terminal_id), "ses-2", None, true)
+            .expect("force rebind 应成功");
+        // 目标旧终端在锁内落终态、锁外由调用方终止。
+        displaced.expect("应返回目标旧后端").terminate();
+        assert!(target_backend.was_terminated(), "目标旧后端应被终止");
+        assert_eq!(result.terminal_id, source.terminal_id);
+        assert_eq!(result.root_session_id, "ses-2");
+        assert_eq!(result.name, "build");
+
+        assert_eq!(
+            registry.status(&by_id(&target.terminal_id)),
+            Err(CoreError::NotFound)
+        );
+        assert_eq!(
+            registry
+                .status(&TerminalLocator {
+                    terminal_id: None,
+                    root_session_id: Some("ses-2".to_string()),
+                    name: Some("build".to_string()),
+                })
+                .expect("新键应指向源终端")
+                .terminal_id,
+            source.terminal_id
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn rebind_rejects_terminal_and_resets_clientless_timer() {
+        let mut registry = mock_registry();
+        let created = registry
+            .create(params("ses-1", "build", false))
+            .expect("create 应成功");
+        let id = TerminalId::new(created.terminal_id.clone());
+        let timeout = Duration::from_millis(100);
+        let start = Instant::now();
+
+        // 首轮无会话写入计时起点。
+        assert!(
+            registry
+                .candidates_clientless(start, timeout, |_| false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get(&id)
+                .expect("终端应存在")
+                .clientless_since
+                .is_some()
+        );
+
+        registry
+            .rebind(&by_id(&created.terminal_id), "ses-2", None, false)
+            .expect("rebind 应成功");
+        assert!(
+            registry
+                .get(&id)
+                .expect("终端应存在")
+                .clientless_since
+                .is_none(),
+            "迁移后应重置无会话计时"
+        );
+
+        // 改名同样允许；非法名称被拒绝。
+        registry
+            .rebind(
+                &by_id(&created.terminal_id),
+                "ses-2",
+                Some("renamed"),
+                false,
+            )
+            .expect("改名应成功");
+        assert_eq!(
+            expect_rebind_err(registry.rebind(
+                &by_id(&created.terminal_id),
+                "ses-2",
+                Some("a/b"),
+                false
+            )),
+            CoreError::InvalidName
+        );
+
+        registry
+            .terminate(&by_id(&created.terminal_id))
+            .expect("terminate 应成功");
+        assert_eq!(
+            expect_rebind_err(registry.rebind(&by_id(&created.terminal_id), "ses-3", None, false)),
+            CoreError::AlreadyTerminal
+        );
+    }
+
+    #[test]
+    fn subscribe_all_does_not_count_as_terminal_attachment() {
+        let mut registry = mock_registry();
+        let created = registry
+            .create(params("ses-1", "build", false))
+            .expect("create 应成功");
+        let id = TerminalId::new(created.terminal_id);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        registry.subscribe_all("global", tx);
+
+        assert!(
+            registry.get(&id).expect("终端应存在").clients.is_empty(),
+            "subscribe_all 的全局订阅不计入单终端附着"
         );
     }
 }

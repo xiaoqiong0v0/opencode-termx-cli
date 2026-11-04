@@ -22,9 +22,10 @@ use futures_util::{
 use termx_protocol::{
     AttachParams, AttachResult, ClaimParams, ClaimResult, CreateParams, CreateResult, DetachParams,
     ErrorCode, Event, HelloParams, HelloResult, ListItem, ListParams, PROTOCOL_VERSION,
-    ProtocolError, PruneParams, PruneResult, ReadParams, ReadResult, ReleaseParams, Request,
-    ResizeParams, Response, SendParams, SignalParams, SimpleResult, StatusParams, StatusResult,
-    SubscribeParams, SubscribeResult, TerminateParams, UnsubscribeParams,
+    ProtocolError, PruneParams, PruneResult, ReadParams, ReadResult, RebindParams, RebindResult,
+    ReleaseParams, Request, ResizeParams, Response, SendParams, SignalParams, SimpleResult,
+    StatusParams, StatusResult, SubscribeParams, SubscribeResult, TerminateParams,
+    TranscriptParams, TranscriptResult, UnsubscribeParams,
 };
 use tokio::{
     net::TcpStream,
@@ -246,6 +247,8 @@ impl Client {
             proto: PROTOCOL_VERSION.to_string(),
             token: config.token,
             client: config.client,
+            root_session_id: config.root_session_id,
+            admin: config.admin,
         };
         let request = Request {
             id: HELLO_REQUEST_ID.to_string(),
@@ -388,12 +391,16 @@ impl Client {
         status => "terminal.status", StatusParams, StatusResult;
         /// 增量读取 output（`terminal.read`）。
         read => "terminal.read", ReadParams, ReadResult;
+        /// 读取命令记录（`terminal.transcript`）。
+        transcript => "terminal.transcript", TranscriptParams, TranscriptResult;
         /// 向终端写入（`terminal.send`）。
         send => "terminal.send", SendParams, SimpleResult;
         /// 调整终端尺寸（`terminal.resize`）。
         resize => "terminal.resize", ResizeParams, SimpleResult;
         /// 发送信号（`terminal.signal`）。
         signal => "terminal.signal", SignalParams, SimpleResult;
+        /// 迁移终端绑定键（`terminal.rebind`），保留 `terminal_id`、进程与 lease。
+        rebind => "terminal.rebind", RebindParams, RebindResult;
         /// 终止终端（`terminal.terminate`）。
         terminate => "terminal.terminate", TerminateParams, SimpleResult;
         /// 清理终态终端（`terminal.prune`）；空过滤需显式 `PruneParams::all = true`。

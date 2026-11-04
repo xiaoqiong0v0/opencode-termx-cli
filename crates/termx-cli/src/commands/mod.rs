@@ -4,16 +4,22 @@ mod exec;
 mod local;
 mod terminal;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use termx_client::{Client, ClientError};
 use termx_protocol::{AttachParams, TerminalLocator};
+use tokio::{task::JoinHandle, time::MissedTickBehavior};
 
 use crate::{
     cli::{Cli, Command},
     config::{ConnectionOverrides, resolve_client_config, resolve_root_session_id},
     error::CliError,
 };
+
+/// CLI 长连接会话心跳周期。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// 会话心跳 RPC 方法名。
+const HEARTBEAT_METHOD: &str = "heartbeat";
 
 /// 按子命令分发，返回进程退出码。
 pub async fn run(cli: &Cli) -> Result<i32, CliError> {
@@ -23,6 +29,7 @@ pub async fn run(cli: &Cli) -> Result<i32, CliError> {
         Command::Status(args) => terminal::status(cli, args).await,
         Command::List(args) => terminal::list(cli, args).await,
         Command::Read(args) => terminal::read(cli, args).await,
+        Command::Transcript(args) => terminal::transcript(cli, args).await,
         Command::Send(args) => terminal::send(cli, args).await,
         Command::Resize(args) => terminal::resize(cli, args).await,
         Command::Signal(args) => terminal::signal(cli, args).await,
@@ -44,6 +51,7 @@ pub(crate) async fn connect(cli: &Cli) -> Result<Client, CliError> {
         config_dir: cli.config_dir.as_deref(),
         token: cli.token.as_deref(),
         endpoint: cli.endpoint.as_deref(),
+        root_session_id: cli.root_session_id.as_deref(),
     })?;
     Ok(Client::connect(config).await?)
 }
@@ -51,6 +59,32 @@ pub(crate) async fn connect(cli: &Cli) -> Result<Client, CliError> {
 /// 解析当前 root session id。
 pub(crate) fn root_session_id(cli: &Cli) -> String {
     resolve_root_session_id(cli.root_session_id.as_deref())
+}
+
+/// 构造 `heartbeat` 参数；`root_session_id` 必须与 `hello` 保持一致。
+pub(crate) fn heartbeat_params(root_session_id: &str) -> serde_json::Value {
+    serde_json::json!({ "root_session_id": root_session_id })
+}
+
+/// 长连接期间每 30s 后台发送一次会话心跳。
+///
+/// 心跳失败只停止本任务，不影响命令/输出；调用方在命令结束时 abort 即可。
+pub(crate) fn spawn_heartbeat(client: Arc<Client>, root_session_id: String) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // interval 的首个 tick 立即完成，先消费掉，保证第一次心跳在 30s 后。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let result = client
+                .request(None, HEARTBEAT_METHOD, heartbeat_params(&root_session_id))
+                .await;
+            if result.is_err() {
+                return;
+            }
+        }
+    })
 }
 
 /// 新建终端使用的名称：显式 `--name`，否则 `<prefix>-<pid>`。
@@ -130,4 +164,18 @@ pub(crate) async fn resync_events(
         eprintln!("事件回放不完整({reset:?})，已从服务端当前基线继续");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_uses_root_session_id_param() {
+        assert_eq!(HEARTBEAT_METHOD, "heartbeat");
+        assert_eq!(
+            heartbeat_params("ses-cli"),
+            serde_json::json!({ "root_session_id": "ses-cli" })
+        );
+    }
 }

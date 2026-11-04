@@ -224,6 +224,8 @@ pub enum Command {
     List(ListArgs),
     /// 增量读取 output。
     Read(ReadArgs),
+    /// 读取信息页命令记录（命令、起止时间、状态、清洗后输出）。
+    Transcript(LocatorArgs),
     /// 向终端写入文本或字节。
     Send(SendArgs),
     /// 调整 PTY 尺寸。
@@ -259,13 +261,13 @@ pub struct Cli {
     /// 同名终端已存在时强制重建；`claim`/`terminate` 时强制操作。
     #[arg(long, global = true)]
     pub force: bool,
-    /// 配置目录（含 `port`/`token`），覆盖 `TERMX_CONFIG_DIR`。
+    /// 配置目录（含 `port`/`token`）；与 `--endpoint` 至少给一个，不推导平台默认。
     #[arg(long, global = true, value_name = "DIR")]
     pub config_dir: Option<PathBuf>,
     /// 直接提供 token，覆盖 `TERMX_TOKEN` 与 token 文件。
     #[arg(long, global = true, value_name = "TOKEN")]
     pub token: Option<String>,
-    /// 直接指定 WebSocket 地址，覆盖端口文件发现。
+    /// 直接指定 WebSocket 地址；与 `--config-dir` 至少给一个，不推导平台默认。
     #[arg(long, global = true, value_name = "URL")]
     pub endpoint: Option<String>,
     /// 事件/结果输出为单行 JSON。

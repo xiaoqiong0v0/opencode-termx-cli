@@ -30,6 +30,22 @@
 ## 实现顺序
 见 `docs/DEV_PLAN.md` 的里程碑 M0–M6：工程骨架 → service 骨架 → 本地 PTY → stdio/流控 → 交互识别 → CLI/adapter → SSH/helper。
 
+## opencode 插件（项目内）
+- **包名**：`@xiaoqiong0v0/opencode-termx`（`private: true`，当前为本地插件，不发布）。
+- **源码（跟踪）**：`opencode-plugin/termx/`（`src/termx.ts` + `src/termx-rpc.mjs` + `package.json` + `tsconfig.json`）。
+- **生成**：`node scripts/build-opencode-plugin.mjs` → 用 esbuild 打包为 `.opencode/plugins/termx.js`，并写 `.opencode/package.json`。
+- **全局配置**：`~/.config/opencode/termx.jsonc`（首次生成模板；语言、service autostart/端口/token、web 端口、日志保留、限额）。详见 `docs/CONFIG.md`。
+- **自动启动**：service 不可连时插件按配置拉起 `termx-service`，显式传 configDir/port/token/日志目录与开关；日志落 `~/.opencode/plugins-cache/@xiaoqiong0v0/opencode-termx/termx-service/`。
+- **类型检查/构建**：`cd opencode-plugin/termx && npm run typecheck`、`npm run build`（产出 `dist/`，`npm pack --dry-run` 校验发布内容）。
+- **日志**：使用 `@xiaoqiong0v0/opencode-plugin-logger`；开关见 `~/.config/opencode/plugin-logger.jsonc` 的 `enabled`（默认关）。
+- **Web**：默认仅本机 `http://127.0.0.1:<web.port>`（回环免登录）；远程需 `web.allowRemote=true` + `web.password` 并在 `/login` 登录；`web.port=0` 不启动。
+- `.opencode/` 由 opencode 管理并已 gitignore（插件产物与 `node_modules` 不入库）；源码改动后需重新生成。
+- 加载：opencode 自动发现 `.opencode/plugins/`；本项目**不需要根 `opencode.json`**（`plugin` 数组仅用于 npm/远程 spec，勿登记本地文件）。
+- 前置：先显式启动 `termx-service --config-dir <DIR> [--log-dir <DIR> --log-enabled true]`（配置目录不再推导平台默认；`TERMX_CONFIG_DIR` 仅作为显式来源）。
+- 工具：`termx_exec` / `termx_local` / `termx_ssh` / `termx_list` / `termx_status` / `termx_read` / `termx_send` / `termx_resize` / `termx_signal` / `termx_terminate` / `termx_prune` / `termx_attach` / `termx_detach` / `termx_claim` / `termx_release`。
+- 加载时机：opencode 启动时加载；修改插件/配置或重新生成后需重启 opencode。
+- 自测：`node scripts/termx-plugin-selftest.mjs`（需 service 运行，直接引用跟踪源码）。
+
 ## 实现边界：自研终端，不把 PTY 当黑盒
 - **不引入 node-pty**；也不把 `portable-pty` 之类的现成封装当终端实现。
 - Linux/macOS：直接调用 PTY 系统接口（`/dev/ptmx`、`grantpt/unlockpt`、termios/ioctl）管理主从端。
@@ -39,7 +55,7 @@
 - 如果连 OS PTY/ConPTY 都不允许：只能支持普通程序的 stdin/stdout 管道模式，无法可靠支持 vim/top/ssh 密码提示等全屏交互程序；这是范围裁剪，不是实现细节。
 
 ## CLI 用法（M5b）
-`termx-cli` 默认从 `TERMX_CONFIG_DIR`（否则平台配置目录）读取 `port` 与 `token` 自动连接本机 service；也可用 `--endpoint` / `--token` / `--config-dir` 覆盖。`--endpoint` 只替换地址，token 仍按 `--token` > `TERMX_TOKEN` > token 文件解析；endpoint 必须是 `ws://127.0.0.1:<port>` 或 `ws://[::1]:<port>`。全局参数 `--root-session-id`（默认 `TERMX_ROOT_SESSION_ID` 或 `default`）、`--name`、`--force`、`--json` 在子命令前后都可写。
+`termx-cli` 必须显式给出 `--config-dir <DIR>` 或 `--endpoint <URL>` 之一（也可用非空 `TERMX_CONFIG_DIR`），**不再推导平台默认配置目录**。只给 `--config-dir` 时读取其中的 `port` 与 `token` 自动连接；只给 `--endpoint` 时必须提供 `--token` 或非空 `TERMX_TOKEN`（或同时给 `--config-dir` 读取 token 文件）。token 优先级：`--token` > `TERMX_TOKEN` > `<config-dir>/token`；endpoint 必须是 `ws://127.0.0.1:<port>` 或 `ws://[::1]:<port>`。全局参数 `--root-session-id`（默认 `TERMX_ROOT_SESSION_ID` 或 `default`）、`--name`、`--force`、`--json` 在子命令前后都可写。
 
 ```sh
 # 创建并跟随一个命名 PTY（默认 %COMSPEC% / $SHELL）

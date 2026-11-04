@@ -1,0 +1,55 @@
+{
+  "name": "@xiaoqiong0v0/opencode-termx",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "opencode 插件：通过 termx-service 提供本地/SSH 终端工具",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/termx.js",
+  "types": "./dist/termx.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/termx.d.ts",
+      "default": "./dist/termx.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-runtime.mjs",
+    "build:opencode": "node scripts/build-opencode.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoqiong0v0/opencode-termx.git"
+  },
+  "homepage": "https://github.com/xiaoqiong0v0/opencode-termx#readme",
+  "bugs": {
+    "url": "https://github.com/xiaoqiong0v0/opencode-termx/issues"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "terminal",
+    "pty",
+    "ssh",
+    "termx"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.6"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.19.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.0"
+  }
+}
