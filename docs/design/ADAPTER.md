@@ -53,7 +53,8 @@ adapter 是**薄层**：只把模型工具调用映射为 `termx-service` 的 RP
 - `exited{exit_code}` / `interrupted{signal,source}` / `error{code}`：终态唯一。
 - 断线重连带最后已处理 `cursor`；服务端可返回 `reset`（清本地视图后继续）。
 - `rebound{old_root_session_id,new_root_session_id,old_name,new_name}`：绑定键已迁移；本地若缓存旧键应更新，`terminal_id` 不变。
-- Web 默认「信息」Tab 展示 service 记录的命令（起止时间、`running`/`done`/`exited`/`interrupted`/`error` 状态、清洗后输出；无提示符/回显，轮询 `terminal.transcript`），「原始控制台」Tab 保留 xterm/ANSI；两视图共用同一终端与输入 lease。
+- Web 默认「信息」Tab 展示 service 记录的命令（轮询 `terminal.transcript`）：每条命令与输出为一组，命令行左侧显示开始时间，输出末行左侧显示 `+耗时` 与退出状态；有 `exit_code` 显示 `✓ 0`/`✗ N`，无退出码的静默降级显示 `~`；无输出时补一行空白行承载状态。不显示提示符/回显。「原始控制台」Tab 保留 xterm/ANSI；两视图共用同一终端与输入 lease。
+- Web 所有状态/错误消息使用底部状态栏，跨「信息/原始控制台」常驻，四色区分，点击关闭；同一消息关闭后重复上报不再自动弹回，重连成功清除。**不使用 toast**；不再写入标题栏右侧状态位。
 - Web header 采用两级选择（`session.list` 会话 + `@web` 其他/未绑定，再按 `root_session_id` 过滤 `terminal.list`）；信息页顶部展示 `state`/`pid`/`mode`/启动命令/`cwd`。
 - Web「新建终端」提交 `terminal.create`（`mode:"pty"`，local 或 ssh）；绑定「其他/未绑定」时 `root_session_id` 为 `@web`。成功刷新两级选择并选中新终端，失败在弹窗内提示；密码只随请求发送，不落页面/日志/localStorage。
 

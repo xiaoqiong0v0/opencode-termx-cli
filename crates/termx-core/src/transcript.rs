@@ -7,7 +7,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use termx_protocol::{TranscriptCommand, TranscriptResult, TranscriptStatus};
+use termx_protocol::{TranscriptCommand, TranscriptResult, TranscriptSource, TranscriptStatus};
+use termx_terminal::{OscEvent, OscScanner};
 use time::OffsetDateTime;
 
 /// 默认 transcript 容量（命令条数）。
@@ -39,6 +40,14 @@ struct CommandRecord {
     truncated: bool,
     /// 最后一次收到输出的时间；用于静默判定。
     last_output_at: OffsetDateTime,
+    /// 命令退出码；未结束或无法确定时为 `None`。
+    exit_code: Option<i32>,
+    /// 结束证据来源；未结束时为 `None`。
+    source: Option<TranscriptSource>,
+    /// 结束判定是否为 best-effort（静默推断等）。
+    best_effort: bool,
+    /// 单调递增的命令代次；用于带外事件按代次结束命令。
+    generation: u64,
 }
 
 impl CommandRecord {
@@ -50,6 +59,9 @@ impl CommandRecord {
             ended_at: self.ended_at.map(crate::format_rfc3339),
             status: self.status,
             output: clean_output(&self.command, &self.output),
+            exit_code: self.exit_code,
+            source: self.source,
+            best_effort: self.best_effort,
         }
     }
 }
@@ -61,30 +73,148 @@ pub struct TranscriptBuffer {
     capacity: usize,
     /// 每次变更递增的修订号。
     revision: u64,
+    /// 最近一次命令分配到的代次；无命令时为 0。
+    last_generation: u64,
+    /// `terminal.send` 记录但尚未被宿主的 `C` 事件认领的代次。
+    pending_generation: Option<u64>,
     /// 已保留命令，按时间升序。
     commands: VecDeque<CommandRecord>,
+    /// 当前命令输出的 OSC 133/633 增量扫描器（跨输出分块保持状态）。
+    scanner: OscScanner,
+    /// 是否解析 stdout 上的 in-band OSC 133/633。
+    ///
+    /// 使用带外事件通道的运行时（如 `termx-pwsh`）必须关闭该开关，
+    /// 否则子程序仍可通过 stdout 伪造命令结束。
+    in_band_osc: bool,
 }
 
 impl TranscriptBuffer {
     /// 以给定容量创建；容量为 0 时按 1 处理。
+    ///
+    /// 默认解析 stdout 上的 in-band OSC 133/633，保持既有 shell 行为。
     pub fn new(capacity: usize) -> Self {
+        Self::with_in_band_osc(capacity, true)
+    }
+
+    /// 以给定容量与 in-band OSC 开关创建；容量为 0 时按 1 处理。
+    ///
+    /// `in_band_osc=false` 时 `record_output` 不再把输出喂给 OSC 扫描器，
+    /// 事件只能来自带外通道。
+    pub fn with_in_band_osc(capacity: usize, in_band_osc: bool) -> Self {
         Self {
             capacity: capacity.max(1),
             revision: 0,
+            last_generation: 0,
+            pending_generation: None,
             commands: VecDeque::new(),
+            scanner: OscScanner::new(),
+            in_band_osc,
         }
+    }
+
+    /// 当前是否解析 in-band OSC。
+    pub fn in_band_osc(&self) -> bool {
+        self.in_band_osc
     }
 
     /// 开始一条新命令：上一条仍在运行的命令先标记为 `done`。
     ///
-    /// 返回变更后的修订号。
+    /// 每次分配一个新的单调代次，供 [`Self::record_command_end_for_generation`]
+    /// 精确结束“当时最后一条”命令。返回变更后的修订号。
+    ///
+    /// 该记录同时登记为 pending：紧随其后的宿主 `C` 事件应通过
+    /// [`Self::take_pending_generation`] 认领它并更新命令/开始时间，而不是
+    /// 再插入一条重复记录。
     pub fn record_command(&mut self, command: &str, now: OffsetDateTime) -> u64 {
+        let generation = self.push_command(command, now);
+        self.pending_generation = Some(generation);
+        self.revision
+    }
+
+    /// 记录宿主 `C` 事件新建的命令（没有 `terminal.send` 前置记录）。
+    ///
+    /// 返回新记录的命令代次，供 `D` 事件精确结束该命令。
+    pub fn record_command_at(&mut self, command: &str, now: OffsetDateTime) -> u64 {
+        self.push_command(command, now)
+    }
+
+    /// 取出并清除 `terminal.send` 留下的 pending 代次；无 pending 时返回 `None`。
+    pub fn take_pending_generation(&mut self) -> Option<u64> {
+        self.pending_generation.take()
+    }
+
+    /// 撤销 pending 命令记录（多行输入未执行时使用）。
+    ///
+    /// 仅当 `pending_generation` 指向最后一条记录、该记录仍为 `running` 且
+    /// 尚无 `ended_at` 时删除它并清除 pending，同时递增修订号；其余情况
+    /// 保持不变。返回是否删除了记录。
+    pub fn cancel_pending(&mut self) -> bool {
+        let Some(pending) = self.pending_generation else {
+            return false;
+        };
+        let Some(last) = self.commands.back() else {
+            return false;
+        };
+        if last.generation != pending
+            || last.status != TranscriptStatus::Running
+            || last.ended_at.is_some()
+        {
+            return false;
+        }
+        self.commands.pop_back();
+        self.pending_generation = None;
+        self.bump();
+        true
+    }
+
+    /// 按代次更新已记录命令的文本与开始时间（宿主 `C` 事件携带的值）。
+    ///
+    /// `command`/`started_at` 为 `None` 时保持原值（旧探针不填这些字段）。
+    /// 仅当记录仍存在且字段确实变化时才递增修订号；返回是否发生变更。
+    pub fn update_command_for_generation(
+        &mut self,
+        generation: u64,
+        command: Option<&str>,
+        started_at: Option<OffsetDateTime>,
+    ) -> bool {
+        let Some(record) = self
+            .commands
+            .iter_mut()
+            .find(|record| record.generation == generation)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(command) = command {
+            let command = command.trim_end_matches(['\r', '\n']);
+            if record.command != command {
+                record.command = command.to_string();
+                changed = true;
+            }
+        }
+        if let Some(started_at) = started_at {
+            if record.started_at != started_at {
+                record.started_at = started_at;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// 插入一条新命令并分配代次；返回代次。
+    fn push_command(&mut self, command: &str, now: OffsetDateTime) -> u64 {
+        // 上一条命令可能留下半截 OSC；新命令从干净状态开始扫描。
+        self.scanner.reset();
         if let Some(last) = self.commands.back_mut() {
             if last.status == TranscriptStatus::Running {
                 last.status = TranscriptStatus::Done;
                 last.ended_at = Some(now);
             }
         }
+        self.last_generation = self.last_generation.saturating_add(1);
         self.commands.push_back(CommandRecord {
             command: command.trim_end_matches(['\r', '\n']).to_string(),
             started_at: now,
@@ -93,11 +223,16 @@ impl TranscriptBuffer {
             output: String::new(),
             truncated: false,
             last_output_at: now,
+            exit_code: None,
+            source: None,
+            best_effort: false,
+            generation: self.last_generation,
         });
         while self.commands.len() > self.capacity {
             self.commands.pop_front();
         }
-        self.bump()
+        self.bump();
+        self.last_generation
     }
 
     /// 追加一段输出到当前（最后一条）命令。
@@ -106,44 +241,141 @@ impl TranscriptBuffer {
     /// 重新回到 `running`。空文本或尚无命令时忽略。单条输出最多保留
     /// [`MAX_OUTPUT_BYTES`] 字节：超限时按 UTF-8 字符边界截断并追加一次
     /// [`OUTPUT_TRUNCATED_MARKER`]，后续输出不再增长。
+    ///
+    /// 若启用 in-band OSC（默认），输出同时喂给 OSC 扫描器：识别到
+    /// `133;D;<exit_code>` / `633;D;<exit_code>` 时立即以 `shell_integration`
+    /// 结束当前命令。marker 本身仍进入原始输出，读取时由 [`clean_output`]
+    /// 的 ANSI 清洗去掉。使用带外事件通道的终端应关闭 in-band OSC。
     pub fn record_output(&mut self, text: &str, now: OffsetDateTime) -> bool {
         if text.is_empty() {
             return false;
         }
+        let command_end = self
+            .in_band_osc
+            .then(|| {
+                self.scanner
+                    .push(text.as_bytes())
+                    .into_iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        OscEvent::CommandEnd { exit_code, .. } => Some(exit_code),
+                        _ => None,
+                    })
+            })
+            .flatten();
+
+        let output_changed = self.append_output(text, now);
+        let end_applied = command_end.is_some_and(|exit_code| {
+            self.record_command_end(exit_code, TranscriptSource::ShellIntegration, now)
+        });
+        if end_applied {
+            return true;
+        }
+        if output_changed {
+            self.bump();
+            return true;
+        }
+        false
+    }
+
+    /// 把输出追加到当前命令并刷新活动时间；不改变修订号。
+    fn append_output(&mut self, text: &str, now: OffsetDateTime) -> bool {
         let Some(last) = self.commands.back_mut() else {
             return false;
         };
         if matches!(
             last.status,
             TranscriptStatus::Exited | TranscriptStatus::Interrupted | TranscriptStatus::Error
-        ) {
+        ) || (last.status == TranscriptStatus::Done && !last.best_effort)
+        {
+            // 真实结束（shell-integration D）之后到达的输出属于
+            // 下一个 prompt/续行，不应复活上一条命令；只有静默
+            // best-effort 结束的记录允许被迟到输出复活。
             return false;
         }
         if last.truncated {
             // 已截断：只刷新活动时间，内容不再增长。
             last.last_output_at = now;
-            if last.status == TranscriptStatus::Done {
-                last.status = TranscriptStatus::Running;
-                last.ended_at = None;
-                self.bump();
-                return true;
-            }
-            return false;
+            return revive_done(last);
         }
 
         append_output_limited(last, text);
         last.last_output_at = now;
-        if last.status == TranscriptStatus::Done {
-            last.status = TranscriptStatus::Running;
-            last.ended_at = None;
-        }
-        self.bump();
+        revive_done(last);
         true
+    }
+
+    /// 以结构化命令结束事件结束当前命令。
+    ///
+    /// 当前（最后一条）命令处于 `running` 时生效：写入 `done`、
+    /// `ended_at=now`、`exit_code` 与结束证据来源，返回是否发生变更。
+    /// 已被静默判定结束（`best_effort=true`）的命令允许被真实 marker 覆盖；
+    /// 其他终态不重复结束，也不覆盖既有记录。
+    pub fn record_command_end(
+        &mut self,
+        exit_code: Option<i32>,
+        source: TranscriptSource,
+        now: OffsetDateTime,
+    ) -> bool {
+        let Some(last) = self.commands.back_mut() else {
+            return false;
+        };
+        let changed = finish_command(last, exit_code, source, now);
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// 按代次结束命令：仅当当前最后一条命令的 generation 匹配时生效。
+    ///
+    /// 供带外事件通道使用：`C` 事件绑定“当时最后一条命令”的代次，`D` 只
+    /// 结束该代次，避免旧命令的迟到 `D` 结束后来记录的新命令。结束语义与
+    /// [`Self::record_command_end`] 完全一致。
+    pub fn record_command_end_for_generation(
+        &mut self,
+        exit_code: Option<i32>,
+        source: TranscriptSource,
+        generation: u64,
+        now: OffsetDateTime,
+    ) -> bool {
+        self.record_command_end_for_generation_at(exit_code, source, generation, now)
+    }
+
+    /// 按代次结束命令，并使用宿主 `D` 提供的结束时间。
+    ///
+    /// 代次不匹配时不生效；其余语义与
+    /// [`Self::record_command_end_for_generation`] 相同。
+    pub fn record_command_end_for_generation_at(
+        &mut self,
+        exit_code: Option<i32>,
+        source: TranscriptSource,
+        generation: u64,
+        ended_at: OffsetDateTime,
+    ) -> bool {
+        let Some(last) = self.commands.back_mut() else {
+            return false;
+        };
+        if last.generation != generation {
+            return false;
+        }
+        let changed = finish_command(last, exit_code, source, ended_at);
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// 当前最后一条命令的代次；没有命令时为 0。
+    pub fn current_generation(&self) -> u64 {
+        self.last_generation
     }
 
     /// 静默结束判定：当前命令超过 `quiet` 没有新输出时标记 `done`。
     ///
-    /// `ended_at` 取最后一次输出时间（无输出时即开始时间）。返回是否发生变更。
+    /// `ended_at` 取最后一次输出时间（无输出时即开始时间）。静默推断
+    /// 来源标为 `process_group` 且 `best_effort=true`；不伪造退出码。
+    /// 返回是否发生变更。
     pub fn finalize_quiet(&mut self, now: OffsetDateTime, quiet: Duration) -> bool {
         let Some(last) = self.commands.back_mut() else {
             return false;
@@ -157,6 +389,8 @@ impl TranscriptBuffer {
         }
         last.status = TranscriptStatus::Done;
         last.ended_at = Some(last.last_output_at);
+        last.source = Some(TranscriptSource::ProcessGroup);
+        last.best_effort = true;
         self.bump();
         true
     }
@@ -232,6 +466,46 @@ impl Default for TranscriptBuffer {
     }
 }
 
+/// 结束一条命令记录：`running` 或可升级的 `best_effort done` 才生效。
+///
+/// 返回是否发生变更；不触碰修订号，由调用方统一 bump。
+fn finish_command(
+    record: &mut CommandRecord,
+    exit_code: Option<i32>,
+    source: TranscriptSource,
+    now: OffsetDateTime,
+) -> bool {
+    let upgradeable = record.status == TranscriptStatus::Done && record.best_effort;
+    if record.status != TranscriptStatus::Running && !upgradeable {
+        return false;
+    }
+    record.status = TranscriptStatus::Done;
+    record.ended_at = Some(now);
+    record.exit_code = exit_code;
+    record.source = Some(source);
+    record.best_effort = false;
+    true
+}
+
+/// 已结束命令收到新输出时回到 `running`，并清除上一次结束留下的证据。
+///
+/// `shell_integration` 结束的命令不复活：marker 之后的提示符/尾部输出属于
+/// shell，不应把已确定的状态与退出码改回 `running`/`None`。
+fn revive_done(record: &mut CommandRecord) -> bool {
+    if record.status != TranscriptStatus::Done {
+        return false;
+    }
+    if record.source == Some(TranscriptSource::ShellIntegration) {
+        return false;
+    }
+    record.status = TranscriptStatus::Running;
+    record.ended_at = None;
+    record.exit_code = None;
+    record.source = None;
+    record.best_effort = false;
+    true
+}
+
 /// 按上限追加输出；超限时保留不超过 [`MAX_OUTPUT_BYTES`] 的内容并追加一次标记。
 ///
 /// 截断点始终落在 UTF-8 字符边界上；必要时回退已有内容末尾为标记腾出空间。
@@ -276,7 +550,10 @@ fn floor_char_boundary(text: &str, max: usize) -> usize {
 pub fn clean_output(command: &str, raw: &str) -> String {
     let stripped = strip_ansi(raw);
     let normalized = normalize_controls(&stripped);
-    let mut lines: Vec<String> = normalized.split('\n').map(str::to_string).collect();
+    let mut lines: Vec<String> = normalized
+        .split('\n')
+        .filter_map(strip_marker_echo)
+        .collect();
 
     let command = command.trim();
     // 终端回显可能带提示符/启动横幅（ConPTY 常见），在前几行里找到命令并删到它为止。
@@ -297,10 +574,23 @@ pub fn clean_output(command: &str, raw: &str) -> String {
         }
     }
 
-    // 提示符可能粘在输出末尾（ConPTY），先剥离最后几行。
-    for line in lines.iter_mut().rev().take(3) {
-        *line = strip_trailing_prompt(line);
+    // 启动横幅不属于命令输出。
+    lines.retain(|line| !is_shell_noise(line));
+
+    // 提示符可能粘在输出末尾，也可能在行中间（PowerShell 启动慢时尤其常见）；
+    // 命中提示符后，其后的横幅/下一命令都属于 shell，不属于本命令。
+    let mut cleaned = Vec::with_capacity(lines.len());
+    for line in lines {
+        let Some(line) = strip_marker_echo(&line) else {
+            continue;
+        };
+        let stripped = strip_prompt_anywhere(&line);
+        if stripped.trim().is_empty() && !line.trim().is_empty() {
+            continue;
+        }
+        cleaned.push(stripped);
     }
+    let mut lines = cleaned;
 
     while lines
         .last()
@@ -316,6 +606,69 @@ pub fn clean_output(command: &str, raw: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// 判断 shell 启动横幅/版权行（这些不是命令输出）。
+fn is_shell_noise(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("PowerShell ")
+        || trimmed.starts_with("Windows PowerShell")
+        || trimmed.starts_with("加载个人和系统配置文件耗时")
+        || trimmed.starts_with("Loading personal and system profiles")
+        || trimmed.starts_with("版权所有")
+        || trimmed.starts_with("Copyright (C) Microsoft")
+}
+
+/// 去掉 termx 注入的 marker 命令回显（shell 会把整条包装命令回显出来）。
+///
+/// marker 本体是 OSC，`strip_ansi` 会删掉；这里只处理回显里的**命令文本**。
+/// 命中 marker 后缀时保留命令前的输出；纯 marker 行返回 `None`。
+fn strip_marker_echo(line: &str) -> Option<String> {
+    let trimmed = line.trim_end();
+    // marker 回显可能被 PSReadLine 重绘成多行；整行丢弃，避免命令文本
+    // 在输出里重复出现。正常输出不会包含这些 termx 私有标记。
+    if trimmed.contains("__termx_ec")
+        || trimmed.contains("]133;D;")
+        || trimmed.contains("]133;D\u{7}")
+    {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+/// 剥离行内任意位置的 shell 提示符，保留提示符之前的输出。
+fn strip_prompt_anywhere(line: &str) -> String {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // PowerShell：`PS C:\path>`；提示符后可能紧跟横幅或下一条命令。
+    if let Some(pos) = trimmed.rfind("PS ") {
+        let rest = &trimmed[pos + 3..];
+        if let Some(end) = rest.find('>') {
+            let path = &rest[..end];
+            if path.contains('\\') || path.contains('/') {
+                return trimmed[..pos].trim_end().to_string();
+            }
+        }
+    }
+
+    // cmd：`C:\path>` / `\\server\share>`。
+    if let Some(pos) = trimmed.rfind(":\\") {
+        let start = pos.saturating_sub(1);
+        if trimmed[start..].contains('>') {
+            return trimmed[..start].trim_end().to_string();
+        }
+    }
+    if let Some(pos) = trimmed.rfind("\\\\") {
+        if trimmed[pos..].contains('>') {
+            return trimmed[..pos].trim_end().to_string();
+        }
+    }
+
+    // Unix：`user@host:path$` / `#`（通常粘在行尾）。
+    strip_trailing_prompt(trimmed)
 }
 
 /// 剥离行尾粘着的 shell 提示符（cmd/PowerShell/Unix），保留前面的输出。
@@ -372,13 +725,20 @@ fn strip_ansi(input: &str) -> String {
             continue;
         }
         match chars.peek() {
-            // CSI：ESC [ ... 终止字节 0x40..=0x7e
+            // CSI：ESC [ ... 终止字节 0x40..=0x7e。
+            // PowerShell 表格常用 `ESC[row;colH` 绝对定位代替换行；转成换行，
+            // 否则删除转义后会把上一行末尾和下一行开头粘在一起。
             Some('[') => {
                 chars.next();
+                let mut final_byte = None;
                 for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
+                        final_byte = Some(next);
                         break;
                     }
+                }
+                if matches!(final_byte, Some('H' | 'f')) && !out.ends_with('\n') {
+                    out.push('\n');
                 }
             }
             // OSC：ESC ] ... BEL 或 ST(ESC \)
@@ -501,6 +861,62 @@ mod tests {
     }
 
     #[test]
+    fn output_after_real_command_end_is_not_appended() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        let t1 = t0 + time::Duration::seconds(1);
+
+        buffer.record_command("ls", t0);
+        assert!(buffer.record_command_end(Some(0), TranscriptSource::ShellIntegration, t0));
+
+        // 续行提示 `>>` 属于下一个 prompt，不能挂到已结束的 ls。
+        assert!(!buffer.record_output(">>\r\n", t1));
+
+        let result = buffer.read(None);
+        assert_eq!(result.commands.len(), 1);
+        assert_eq!(result.commands[0].status, TranscriptStatus::Done);
+        assert!(
+            result.commands[0].output.is_empty(),
+            "已真实结束的命令不应接收后续输出"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_removes_only_pending_last_record() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+
+        // 无 pending：no-op。
+        assert!(!buffer.cancel_pending());
+        assert_eq!(buffer.len(), 0);
+
+        buffer.record_command("multiline", t0);
+        let revision = buffer.revision();
+        assert!(buffer.cancel_pending());
+        assert!(buffer.is_empty(), "pending 记录应被删除");
+        assert!(buffer.revision() > revision, "删除记录应递增修订号");
+        // 再次取消没有 pending，不再变更。
+        assert!(!buffer.cancel_pending());
+    }
+
+    #[test]
+    fn cancel_pending_ignores_non_pending_or_finished_records() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+
+        // 宿主 C 新建的记录不是 pending：不得删除。
+        buffer.record_command_at("from host", t0);
+        assert!(!buffer.cancel_pending());
+        assert_eq!(buffer.len(), 1);
+
+        // send 记录但已被 D 结束：不得删除。
+        buffer.record_command("sent", t0);
+        assert!(buffer.record_command_end(Some(0), TranscriptSource::ShellIntegration, t0));
+        assert!(!buffer.cancel_pending());
+        assert_eq!(buffer.len(), 2);
+    }
+
+    #[test]
     fn quiet_finalize_uses_last_output_time() {
         let mut buffer = TranscriptBuffer::new(8);
         let t0 = base();
@@ -522,6 +938,264 @@ mod tests {
             command.ended_at.as_deref(),
             Some(crate::format_rfc3339(t0 + time::Duration::milliseconds(200)).as_str())
         );
+    }
+
+    #[test]
+    fn generation_scoped_end_ignores_stale_generation() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        let t1 = t0 + time::Duration::seconds(1);
+
+        assert_eq!(buffer.current_generation(), 0, "无命令时代次为 0");
+        buffer.record_command("first", t0);
+        let first_generation = buffer.current_generation();
+        assert_eq!(first_generation, 1);
+
+        buffer.record_command("second", t1);
+        assert_eq!(buffer.current_generation(), 2);
+
+        // 旧命令代次的迟到结束不得影响新命令。
+        assert!(!buffer.record_command_end_for_generation(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            first_generation,
+            t1,
+        ));
+        let commands = buffer.read(None).commands;
+        assert_eq!(commands[1].status, TranscriptStatus::Running);
+        assert_eq!(commands[1].exit_code, None);
+
+        // 当前代次的结束照常生效。
+        assert!(buffer.record_command_end_for_generation(
+            Some(7),
+            TranscriptSource::ShellIntegration,
+            2,
+            t1,
+        ));
+        let commands = buffer.read(None).commands;
+        assert_eq!(commands[1].status, TranscriptStatus::Done);
+        assert_eq!(commands[1].exit_code, Some(7));
+        assert_eq!(commands[1].source, Some(TranscriptSource::ShellIntegration));
+    }
+
+    #[test]
+    fn command_end_records_exit_code_and_source() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        let t1 = t0 + time::Duration::seconds(2);
+        buffer.record_command("false", t0);
+
+        assert!(buffer.record_command_end(Some(1), TranscriptSource::ShellIntegration, t1));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(
+            command.ended_at.as_deref(),
+            Some(crate::format_rfc3339(t1).as_str())
+        );
+        assert_eq!(command.exit_code, Some(1));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+        assert!(!command.best_effort);
+    }
+
+    #[test]
+    fn command_end_without_exit_code_keeps_none() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("interactive", t0);
+
+        assert!(buffer.record_command_end(None, TranscriptSource::Unknown, t0));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, None);
+        assert_eq!(command.source, Some(TranscriptSource::Unknown));
+        assert!(!command.best_effort);
+    }
+
+    #[test]
+    fn command_end_does_not_repeat_on_terminal_state() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        let t1 = t0 + time::Duration::seconds(1);
+        buffer.record_command("false", t0);
+        assert!(buffer.record_command_end(Some(2), TranscriptSource::ShellIntegration, t1));
+
+        let revision = buffer.revision();
+        assert!(!buffer.record_command_end(Some(9), TranscriptSource::ProcessGroup, t0));
+        assert_eq!(buffer.revision(), revision, "终态不应再次计费");
+
+        // 终端终态也不覆盖已记录的退出码。
+        assert!(!buffer.finalize_terminal(TranscriptStatus::Exited, t0));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.exit_code, Some(2));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+        assert_eq!(
+            command.ended_at.as_deref(),
+            Some(crate::format_rfc3339(t1).as_str())
+        );
+    }
+
+    #[test]
+    fn osc_command_end_marks_done_with_exit_code_and_source() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        let t1 = t0 + time::Duration::seconds(2);
+        buffer.record_command("false", t0);
+
+        assert!(buffer.record_output("false\r\n\u{1b}]133;D;7\u{7}\r\n", t1));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(7));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+        assert!(!command.best_effort);
+        assert_eq!(
+            command.ended_at.as_deref(),
+            Some(crate::format_rfc3339(t1).as_str())
+        );
+        assert!(
+            !command.output.contains("133;D"),
+            "marker 应被清洗: {:?}",
+            command.output
+        );
+    }
+
+    #[test]
+    fn marker_split_across_output_chunks_is_parsed() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("false", t0);
+
+        assert!(buffer.record_output("out\r\n\u{1b}]133;D", t0));
+        assert_eq!(
+            buffer.read(None).commands[0].status,
+            TranscriptStatus::Running,
+            "半个 marker 不应结束命令"
+        );
+
+        assert!(buffer.record_output(";5\u{7}", t0 + time::Duration::seconds(1)));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(5));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+    }
+
+    #[test]
+    fn in_band_osc_disabled_ignores_fake_command_end() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false);
+        let t0 = base();
+        buffer.record_command("echo hi", t0);
+
+        assert!(buffer.record_output("\u{1b}]133;D;0\u{7}\r\n", t0));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Running);
+        assert_eq!(
+            command.exit_code, None,
+            "带外模式下 stdout OSC 不得结束命令"
+        );
+        assert_eq!(command.source, None);
+        assert!(!buffer.in_band_osc());
+    }
+
+    #[test]
+    fn in_band_osc_enabled_still_parses_marker() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, true);
+        let t0 = base();
+        buffer.record_command("false", t0);
+
+        assert!(buffer.record_output("\u{1b}]133;D;7\u{7}", t0));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(7));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+        assert!(buffer.in_band_osc());
+    }
+
+    #[test]
+    fn quiet_finalize_does_not_override_marker_result() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("false", t0);
+        buffer.record_output("\u{1b}]133;D;3\u{7}", t0);
+
+        assert!(
+            !buffer.finalize_quiet(t0 + time::Duration::seconds(10), DEFAULT_QUIET_FINALIZE),
+            "已由 marker 结束的命令不应再被静默判定改写"
+        );
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(3));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+    }
+
+    #[test]
+    fn marker_upgrades_previous_quiet_finalize() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("sleep 5", t0);
+        buffer.record_output("tick\n", t0);
+        assert!(buffer.finalize_quiet(t0 + time::Duration::seconds(2), DEFAULT_QUIET_FINALIZE));
+
+        buffer.record_output("\u{1b}]133;D;9\u{7}", t0 + time::Duration::seconds(3));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(9));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+        assert!(!command.best_effort);
+    }
+
+    #[test]
+    fn output_after_marker_does_not_revive_command() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("false", t0);
+        buffer.record_output("\u{1b}]133;D;4\u{7}", t0);
+
+        buffer.record_output("prompt$ ", t0 + time::Duration::seconds(1));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(4));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+    }
+
+    #[test]
+    fn command_start_defaults_clear_completion_fields() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("first", t0);
+        assert!(buffer.record_command_end(Some(0), TranscriptSource::ShellIntegration, t0));
+
+        buffer.record_command("second", t0 + time::Duration::seconds(1));
+        let commands = buffer.read(None).commands;
+        assert_eq!(commands[0].exit_code, Some(0), "上一条已记录的证据应保留");
+        assert_eq!(commands[1].exit_code, None);
+        assert_eq!(commands[1].source, None);
+        assert!(!commands[1].best_effort);
+    }
+
+    #[test]
+    fn quiet_finalize_is_best_effort_without_exit_code() {
+        let mut buffer = TranscriptBuffer::new(8);
+        let t0 = base();
+        buffer.record_command("ping", t0);
+        buffer.record_output("tick\n", t0 + time::Duration::milliseconds(100));
+
+        assert!(buffer.finalize_quiet(
+            t0 + time::Duration::milliseconds(1200),
+            DEFAULT_QUIET_FINALIZE
+        ));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.exit_code, None, "静默结束不得伪造退出码");
+        assert_eq!(command.source, Some(TranscriptSource::ProcessGroup));
+        assert!(command.best_effort);
     }
 
     #[test]
@@ -574,6 +1248,33 @@ mod tests {
         assert_eq!(clean_output("echo hi", raw), "hi");
 
         let raw = "echo hi\r\nhi\r\nuser@host:~/proj$";
+        assert_eq!(clean_output("echo hi", raw), "hi");
+    }
+
+    #[test]
+    fn clean_output_handles_powershell_cursor_positioning_and_banner() {
+        let raw = "PS C:\\proj> pwd\r\nPath\r\n----\r\nD:\\proj\u{1b}[12;1HMode                 LastWriteTime\r\n----                 -------------\r\nPowerShell 7.6.9\r\n加载个人和系统配置文件耗时 728 毫秒。\r\nPS C:\\proj> ls\r\n";
+        let cleaned = clean_output("pwd", raw);
+        assert!(cleaned.contains("D:\\proj"));
+        assert!(cleaned.contains("Mode"));
+        assert!(!cleaned.contains("PowerShell"));
+        assert!(!cleaned.contains("加载个人"));
+        assert!(!cleaned.contains("PS C:"));
+        assert!(!cleaned.contains("ls"));
+    }
+
+    #[test]
+    fn clean_output_strips_inline_powershell_prompt_and_next_command() {
+        let raw = "pwd\r\nD:\\projPS C:\\proj> PowerShell 7.6.9\r\n加载个人和系统配置文件耗时 728 毫秒。\r\nPS C:\\proj> ls\r\n";
+        assert_eq!(clean_output("pwd", raw), "D:\\proj");
+    }
+
+    #[test]
+    fn clean_output_strips_marker_command_echo() {
+        let raw = "Write-Output hi; $__termx_ec = if ($?) {0} elseif ($LASTEXITCODE -is [int]) {$LASTEXITCODE} else {1}; [Console]::Write(\"$([char]27)]133;D;$__termx_ec$([char]7)\")\r\nhi\r\n";
+        assert_eq!(clean_output("Write-Output hi", raw), "hi");
+
+        let raw = "echo hi; __termx_ec=$?; printf '\\033]133;D;%s\\007' \"$__termx_ec\"\r\nhi\r\n";
         assert_eq!(clean_output("echo hi", raw), "hi");
     }
 

@@ -5,6 +5,24 @@
   var RECONNECT_MIN_MS = 500;
   var RECONNECT_MAX_MS = 10000;
   var RPC_TIMEOUT_MS = 15000;
+  // SSH 创建可能包含建连、预检、安装与 helper 握手，单独放宽超时。
+  var SSH_CREATE_TIMEOUT_MS = 90000;
+  // 确认弹窗中展示的 sha256 前缀长度。
+  var CONSENT_SHA_PREFIX = 12;
+  // 注入写入枚举的中文说明（保留原值便于与服务端/日志对照）。
+  var CONSENT_KIND_LABELS = {
+    helper: "helper（辅助程序）",
+    runtime: "runtime（运行环境）"
+  };
+  var CONSENT_ACTION_LABELS = {
+    install: "安装 install",
+    replace: "替换 replace（备份旧文件）"
+  };
+  var CONSENT_REASON_LABELS = {
+    missing: "目标不存在 missing",
+    checksum_mismatch: "摘要不一致 checksum_mismatch",
+    not_executable: "不可执行 not_executable"
+  };
   var RESIZE_DEBOUNCE_MS = 120;
   var FALLBACK_FONT_SIZE = 14;
   var WEB_HELLO_ID = "web-hello";
@@ -49,19 +67,29 @@
   var lastTerminals = [];
   // 最近一次 session.list 结果（已含 @web），用于两级选择与新建表单。
   var lastSessions = [];
+  // 最近一次 runtime.list 结果；失败时为空数组，表单保持自定义模式。
+  var lastRuntimes = [];
   // 当前选中的 opencode 会话（两级选择的第一级）。
   var selectedSession = null;
   // 迁移请求在飞时禁用弹窗提交/取消。
   var rebindBusy = false;
   // 新建请求在飞时禁用弹窗提交/取消。
   var createBusy = false;
+  // 用户是否手动改过「接受任意主机密钥」；否则按主机地址自动给默认值。
+  var anyHostKeyTouched = false;
+  // 远端注入授权只保存在内存：{ params, injection, retried }；关闭新建弹窗即丢弃。
+  var pendingConsent = null;
+  // 授权重试在飞时禁用确认/取消，避免重复提交。
+  var consentBusy = false;
   // 当前视图：默认信息页；raw 保持现有 xterm。
   var viewMode = "info";
   // 最近一次渲染的 transcript 修订号；null 表示尚未渲染。
   var transcriptRevision = null;
   var transcriptTimer = null;
   var transcriptInFlight = false;
-  var transcriptNotice = "";
+  // 底部状态栏：同一消息被点击关闭后，重复上报不再自动弹回。
+  var statusBarKey = "";
+  var statusBarDismissed = false;
   // 终端进入终态后信息页输入禁用并显示提示。
   var terminalEnded = false;
 
@@ -79,6 +107,8 @@
     elements.createType = document.getElementById("termx-create-type");
     elements.createLocal = document.getElementById("termx-create-local");
     elements.createSsh = document.getElementById("termx-create-ssh");
+    elements.createRuntime = document.getElementById("termx-create-runtime");
+    elements.createCustom = document.getElementById("termx-create-custom");
     elements.createCmd = document.getElementById("termx-create-cmd");
     elements.createArgs = document.getElementById("termx-create-args");
     elements.createCwd = document.getElementById("termx-create-cwd");
@@ -92,18 +122,21 @@
     elements.createKeyGroup = document.getElementById("termx-create-key-group");
     elements.createKeyPath = document.getElementById("termx-create-key-path");
     elements.createKeyPassphrase = document.getElementById("termx-create-key-passphrase");
-    elements.createSshCmd = document.getElementById("termx-create-ssh-cmd");
-    elements.createHelperPath = document.getElementById("termx-create-helper-path");
-    elements.createUploadHelper = document.getElementById("termx-create-upload-helper");
-    elements.createUploadGroup = document.getElementById("termx-create-upload-group");
-    elements.createHelperLocal = document.getElementById("termx-create-helper-local");
-    elements.createHelperSha = document.getElementById("termx-create-helper-sha");
+    elements.createSshRuntime = document.getElementById("termx-create-ssh-runtime");
     elements.createAnyHostKey = document.getElementById("termx-create-any-host-key");
     elements.createCols = document.getElementById("termx-create-cols");
     elements.createRows = document.getElementById("termx-create-rows");
     elements.createError = document.getElementById("termx-create-error");
     elements.createCancel = document.getElementById("termx-create-cancel");
     elements.createSubmit = document.getElementById("termx-create-submit");
+    elements.consentDialog = document.getElementById("termx-consent-dialog");
+    elements.consentForm = document.getElementById("termx-consent-form");
+    elements.consentHost = document.getElementById("termx-consent-host");
+    elements.consentWrites = document.getElementById("termx-consent-writes");
+    elements.consentNotes = document.getElementById("termx-consent-notes");
+    elements.consentError = document.getElementById("termx-consent-error");
+    elements.consentConfirm = document.getElementById("termx-consent-confirm");
+    elements.consentCancel = document.getElementById("termx-consent-cancel");
     elements.infoMeta = document.getElementById("termx-info-meta");
     elements.terminate = document.getElementById("termx-terminate");
     elements.rebindOpen = document.getElementById("termx-rebind-open");
@@ -116,13 +149,15 @@
     elements.rebindError = document.getElementById("termx-rebind-error");
     elements.rebindSubmit = document.getElementById("termx-rebind-submit");
     elements.rebindCancel = document.getElementById("termx-rebind-cancel");
-    elements.status = document.getElementById("termx-status");
+    elements.statusbar = document.getElementById("termx-statusbar");
+    if (elements.statusbar) {
+      elements.statusbar.addEventListener("click", dismissStatusBar);
+    }
     elements.tabInfo = document.getElementById("termx-tab-info");
     elements.tabRaw = document.getElementById("termx-tab-raw");
     elements.viewInfo = document.getElementById("termx-view-info");
     elements.viewRaw = document.getElementById("termx-view-raw");
     elements.transcript = document.getElementById("termx-transcript");
-    elements.infoNotice = document.getElementById("termx-info-notice");
     elements.infoForm = document.getElementById("termx-info-form");
     elements.infoInput = document.getElementById("termx-info-input");
     elements.infoSend = document.getElementById("termx-info-send");
@@ -188,15 +223,39 @@
     if (elements.createType) {
       elements.createType.addEventListener("change", updateCreateType);
     }
+    if (elements.createRuntime) {
+      elements.createRuntime.addEventListener("change", updateCreateRuntime);
+    }
     if (elements.createAuth) {
       elements.createAuth.addEventListener("change", updateCreateAuth);
     }
-    if (elements.createUploadHelper) {
-      elements.createUploadHelper.addEventListener("change", updateCreateHelper);
+    if (elements.createHost) {
+      elements.createHost.addEventListener("input", updateCreateHostKey);
+    }
+    if (elements.createAnyHostKey) {
+      // 一旦用户手动改过，就不再按主机地址覆盖。
+      elements.createAnyHostKey.addEventListener("change", function () {
+        anyHostKeyTouched = true;
+      });
     }
     if (elements.createDialog) {
-      // 原生 Esc 关闭不经过 cancel 按钮：同样清掉只在内存中的密码/口令。
-      elements.createDialog.addEventListener("close", clearCreateSecrets);
+      // 原生 Esc 关闭不经过 cancel 按钮：清掉只在内存中的密码/口令与待确认授权。
+      elements.createDialog.addEventListener("close", onCreateDialogClosed);
+    }
+    if (elements.consentForm) {
+      elements.consentForm.addEventListener("submit", confirmConsent);
+    }
+    if (elements.consentCancel) {
+      elements.consentCancel.addEventListener("click", cancelConsentDialog);
+    }
+    if (elements.consentDialog) {
+      // Esc 等同取消；重试在飞时阻止关闭，避免请求与界面状态脱节。
+      elements.consentDialog.addEventListener("cancel", function (event) {
+        if (consentBusy) {
+          event.preventDefault();
+        }
+      });
+      elements.consentDialog.addEventListener("close", onConsentDialogClosed);
     }
     if (elements.rebindOpen) {
       elements.rebindOpen.addEventListener("click", openRebindDialog);
@@ -249,6 +308,7 @@
       }
       reconnectDelay = RECONNECT_MIN_MS;
       setConnected(true);
+      clearStatusBar();
       setStatus("已连接，正在读取终端列表…");
       refreshTerminals().then(function (items) {
         if (!connected) {
@@ -298,8 +358,8 @@
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   }
 
-  /** 发送一次 RPC 请求并按 id 配对响应。 */
-  function rpc(method, params) {
+  /** 发送一次 RPC 请求并按 id 配对响应；`timeoutMs` 缺省用全局超时。 */
+  function rpc(method, params, timeoutMs) {
     return new Promise(function (resolve, reject) {
       if (!connected || !socket || socket.readyState !== WebSocket.OPEN) {
         reject(new Error("WebSocket 未连接"));
@@ -311,7 +371,7 @@
       entry.timer = window.setTimeout(function () {
         delete pending[id];
         reject(new Error("请求超时: " + method));
-      }, RPC_TIMEOUT_MS);
+      }, timeoutMs || RPC_TIMEOUT_MS);
       pending[id] = entry;
       try {
         socket.send(JSON.stringify({ id: id, method: method, params: params || {} }));
@@ -373,6 +433,8 @@
     result.code = error && error.code;
     // session_exists 会携带冲突的旧 terminal_id，供界面直接展示。
     result.terminalId = error && error.terminal_id;
+    // consent_required 会携带本次将写入的远端文件，供确认弹窗展示。
+    result.injection = error && error.injection;
     return result;
   }
 
@@ -443,7 +505,10 @@
         claimed = false;
         terminalEnded = true;
         setInfoNotice("终端已退出（退出码 " + event.exit_code + "）");
-        setStatus("终端已退出（退出码 " + event.exit_code + "）");
+        setStatus(
+          "终端已退出（退出码 " + event.exit_code + "）",
+          event.exit_code === 0 ? "success" : "error"
+        );
         updateControls();
         refreshTerminals();
         break;
@@ -451,7 +516,7 @@
         claimed = false;
         terminalEnded = true;
         setInfoNotice("终端已中断（" + event.signal + "）");
-        setStatus("终端已中断（" + event.signal + "）");
+        setStatus("终端已中断（" + event.signal + "）", "warning");
         updateControls();
         refreshTerminals();
         break;
@@ -1422,7 +1487,25 @@
     hideCreateError();
     resetCreateForm();
     renderCreateSessions(lastSessions, selectedSession || WEB_ROOT_SESSION_ID);
+    renderCreateRuntimes(lastRuntimes, "");
     showCreateDialog();
+    // runtime.list 失败不阻塞创建：保持“自定义 cmd/args”。
+    rpc("runtime.list", {}).then(
+      function (result) {
+        if (!isCreateDialogOpen()) {
+          return;
+        }
+        lastRuntimes = normalizeRuntimes(result);
+        renderCreateRuntimes(
+          lastRuntimes,
+          elements.createRuntime ? elements.createRuntime.value : ""
+        );
+      },
+      function () {
+        lastRuntimes = [];
+        renderCreateRuntimes(lastRuntimes, "");
+      }
+    );
     setStatus("正在读取会话列表…");
     rpc("session.list", {}).then(
       function (result) {
@@ -1451,6 +1534,9 @@
     if (elements.createType) {
       elements.createType.value = "local";
     }
+    if (elements.createRuntime) {
+      elements.createRuntime.value = "";
+    }
     setInputValue(elements.createCmd, "");
     setInputValue(elements.createArgs, "");
     setInputValue(elements.createCwd, "");
@@ -1464,13 +1550,10 @@
     setInputValue(elements.createPassword, "");
     setInputValue(elements.createKeyPath, "");
     setInputValue(elements.createKeyPassphrase, "");
-    setInputValue(elements.createSshCmd, "");
-    setInputValue(elements.createHelperPath, "");
-    if (elements.createUploadHelper) {
-      elements.createUploadHelper.checked = false;
+    if (elements.createSshRuntime) {
+      elements.createSshRuntime.value = "termx-pwsh";
     }
-    setInputValue(elements.createHelperLocal, "");
-    setInputValue(elements.createHelperSha, "");
+    anyHostKeyTouched = false;
     if (elements.createAnyHostKey) {
       elements.createAnyHostKey.checked = false;
     }
@@ -1478,7 +1561,7 @@
     setInputValue(elements.createRows, String(DEFAULT_ROWS));
     updateCreateType();
     updateCreateAuth();
-    updateCreateHelper();
+    updateCreateHostKey();
     updateCreateSubmit();
   }
 
@@ -1486,6 +1569,59 @@
   function setInputValue(element, value) {
     if (element) {
       element.value = value;
+    }
+  }
+
+  /** `runtime.list` 结果统一成数组。 */
+  function normalizeRuntimes(result) {
+    if (Array.isArray(result)) {
+      return result;
+    }
+    if (result && Array.isArray(result.runtimes)) {
+      return result.runtimes;
+    }
+    return [];
+  }
+
+  /** 填充运行环境下拉；固定保留“自定义 cmd/args”，只显示可用项。 */
+  function renderCreateRuntimes(runtimes, preferred) {
+    var select = elements.createRuntime;
+    if (!select) {
+      return;
+    }
+    while (select.firstChild) {
+      select.removeChild(select.firstChild);
+    }
+    appendOptionTo(select, "", "自定义 cmd/args", null);
+    var values = [""];
+    for (var i = 0; i < runtimes.length; i += 1) {
+      var runtime = runtimes[i];
+      if (!runtime || !runtime.id || runtime.available === false) {
+        continue;
+      }
+      var label = runtime.name || runtime.id;
+      if (runtime.version) {
+        label += " · " + runtime.version;
+      }
+      appendOptionTo(select, runtime.id, label, runtime.id);
+      values.push(runtime.id);
+    }
+    select.value = values.indexOf(preferred) >= 0 ? preferred : "";
+    updateCreateRuntime();
+  }
+
+  /** 选中内置 runtime 时隐藏并禁用自定义 cmd/args 输入。 */
+  function updateCreateRuntime() {
+    var runtimeId = elements.createRuntime ? elements.createRuntime.value : "";
+    var custom = !runtimeId;
+    if (elements.createCustom) {
+      elements.createCustom.classList.toggle("termx-form-hidden", !custom);
+    }
+    if (elements.createCmd) {
+      elements.createCmd.disabled = !custom;
+    }
+    if (elements.createArgs) {
+      elements.createArgs.disabled = !custom;
     }
   }
 
@@ -1541,10 +1677,19 @@
     setInputValue(elements.createKeyPassphrase, "");
   }
 
-  /** 关闭新建弹窗并清空密码/口令。 */
+  /** 新建弹窗关闭（按钮或 Esc）：清掉密码/口令与待确认的注入授权。 */
+  function onCreateDialogClosed() {
+    clearCreateSecrets();
+    clearConsentState();
+    closeConsentDialog();
+  }
+
+  /** 关闭新建弹窗并清空密码/口令与待确认授权。 */
   function closeCreateDialog() {
     var dialog = elements.createDialog;
     clearCreateSecrets();
+    clearConsentState();
+    closeConsentDialog();
     if (!dialog) {
       return;
     }
@@ -1572,6 +1717,10 @@
     if (elements.createSsh) {
       elements.createSsh.classList.toggle("termx-form-hidden", !ssh);
     }
+    if (elements.createRuntime) {
+      elements.createRuntime.disabled = ssh;
+    }
+    updateCreateRuntime();
     updateCreateSubmit();
   }
 
@@ -1586,15 +1735,25 @@
     }
   }
 
-  /** 上传 helper 时显示本地路径组，并禁用互斥的远端 helper 路径。 */
-  function updateCreateHelper() {
-    var upload = !!elements.createUploadHelper && elements.createUploadHelper.checked;
-    if (elements.createUploadGroup) {
-      elements.createUploadGroup.classList.toggle("termx-form-hidden", !upload);
+  /** 本机回环主机：默认勾选「接受任意主机密钥」。 */
+  function isLoopbackHost(host) {
+    var value = String(host || "").trim().toLowerCase();
+    // IPv6 可能带方括号（[::1]）或端口；这里只做表单默认值判断。
+    if (value.charAt(0) === "[") {
+      var end = value.indexOf("]");
+      value = end > 0 ? value.slice(1, end) : value.slice(1);
     }
-    if (elements.createHelperPath) {
-      elements.createHelperPath.disabled = upload;
+    return value === "127.0.0.1" || value === "localhost" || value === "::1";
+  }
+
+  /** 主机变化时更新「接受任意主机密钥」默认值；用户手动改过则不覆盖。 */
+  function updateCreateHostKey() {
+    if (!elements.createAnyHostKey || anyHostKeyTouched) {
+      return;
     }
+    elements.createAnyHostKey.checked = isLoopbackHost(
+      elements.createHost ? elements.createHost.value : ""
+    );
   }
 
   /** 按连接状态启用/禁用新建提交。 */
@@ -1651,27 +1810,310 @@
     hideCreateError();
     setCreateBusy(true);
     setStatus("正在创建终端…");
-    rpc("terminal.create", params).then(
+    rpc("terminal.create", params, createRequestTimeout(params)).then(
       function (result) {
-        setCreateBusy(false);
-        var created = result || {};
-        setInputValue(elements.createPassword, "");
-        setInputValue(elements.createKeyPassphrase, "");
-        closeCreateDialog();
-        setStatus("已创建终端 " + (created.terminal_id || ""));
-        refreshTerminals(created.terminal_id).then(function () {
-          if (created.terminal_id) {
-            selectTerminal(created.terminal_id, false);
-          }
-          announceList(lastTerminals);
-        });
+        finishCreate(result);
       },
       function (error) {
         setCreateBusy(false);
-        showCreateError("创建失败：" + describeError(error));
-        setStatus("创建失败：" + describeError(error));
+        if (isConsentRequired(error)) {
+          showInjectionConsent(params, error.injection);
+          return;
+        }
+        var detail = describeError(error);
+        showCreateError("创建失败：" + detail);
+        setStatus("创建失败：" + detail);
       }
     );
+  }
+
+  /** SSH 创建放宽到 90s；本地创建保持默认超时。 */
+  function createRequestTimeout(params) {
+    return params && params.ssh ? SSH_CREATE_TIMEOUT_MS : RPC_TIMEOUT_MS;
+  }
+
+  /** 创建成功后的统一收尾：关闭弹窗、刷新列表并选中新终端。 */
+  function finishCreate(result) {
+    setCreateBusy(false);
+    var created = result || {};
+    setInputValue(elements.createPassword, "");
+    setInputValue(elements.createKeyPassphrase, "");
+    closeCreateDialog();
+    setStatus("已创建终端 " + (created.terminal_id || ""));
+    refreshTerminals(created.terminal_id).then(function () {
+      if (created.terminal_id) {
+        selectTerminal(created.terminal_id, false);
+      }
+      announceList(lastTerminals);
+    });
+  }
+
+  /** 是否为远端注入授权错误。 */
+  function isConsentRequired(error) {
+    return !!error && error.code === "consent_required";
+  }
+
+  /** 保存本次创建参数并展开确认弹窗；新建弹窗保持打开。 */
+  function showInjectionConsent(params, injection) {
+    // 请求在飞时用户已关闭新建弹窗：不再弹授权，避免遗留 pending。
+    if (!isCreateDialogOpen()) {
+      return;
+    }
+    if (!injection) {
+      showCreateError("远端写入需要授权，但服务端未返回写入详情");
+      setStatus("远端写入需要授权，但服务端未返回写入详情");
+      return;
+    }
+    pendingConsent = {
+      params: params,
+      injection: injection,
+      retried: false
+    };
+    consentBusy = false;
+    renderConsent(injection);
+    showConsentDialog();
+    setStatus("远端写入需要确认");
+  }
+
+  /** 渲染确认弹窗：host/user、逐条写入与风险说明。 */
+  function renderConsent(injection) {
+    var target = injection.host || "-";
+    if (injection.user) {
+      target = injection.user + "@" + target;
+    }
+    if (elements.consentHost) {
+      elements.consentHost.textContent = "目标主机：" + target;
+    }
+    var list = elements.consentWrites;
+    if (list) {
+      while (list.firstChild) {
+        list.removeChild(list.firstChild);
+      }
+      var writes = Array.isArray(injection.writes) ? injection.writes : [];
+      if (!writes.length) {
+        list.appendChild(consentEmptyItem());
+      }
+      for (var i = 0; i < writes.length; i += 1) {
+        list.appendChild(consentWriteItem(writes[i]));
+      }
+    }
+    hideConsentError();
+    updateConsentButtons();
+  }
+
+  /** 无写入详情时的占位项。 */
+  function consentEmptyItem() {
+    var item = document.createElement("li");
+    item.className = "termx-consent-write";
+    item.textContent = "服务端未列出具体写入文件。";
+    return item;
+  }
+
+  /** 单条写入描述；全部走 textContent，远端路径不参与 HTML 解析。 */
+  function consentWriteItem(write) {
+    var item = document.createElement("li");
+    item.className = "termx-consent-write";
+    var head = document.createElement("div");
+    head.className = "termx-consent-write-head";
+    var kind = document.createElement("strong");
+    kind.textContent = consentLabel(write && write.kind, CONSENT_KIND_LABELS, "unknown");
+    var action = document.createElement("span");
+    action.className = "termx-consent-action";
+    action.textContent =
+      consentLabel(write && write.action, CONSENT_ACTION_LABELS, "unknown") +
+      " · " +
+      consentLabel(write && write.reason, CONSENT_REASON_LABELS, "unknown");
+    head.appendChild(kind);
+    head.appendChild(action);
+    var path = document.createElement("div");
+    path.className = "termx-consent-path";
+    path.textContent = (write && write.path) || "(未知路径)";
+    var meta = document.createElement("div");
+    meta.className = "termx-consent-meta";
+    meta.textContent = consentWriteMeta(write || {});
+    item.appendChild(head);
+    item.appendChild(path);
+    item.appendChild(meta);
+    return item;
+  }
+
+  /** 写入元信息：大小、sha256 前缀与目标权限。 */
+  function consentWriteMeta(write) {
+    var size = typeof write.size === "number" ? write.size + " B" : "未知";
+    var sha = write.sha256
+      ? String(write.sha256).slice(0, CONSENT_SHA_PREFIX) + "…"
+      : "未知";
+    return "大小 " + size + " · sha256 " + sha + " · mode " + consentWriteMode(write);
+  }
+
+  /** 优先使用载荷中的 mode；协议未提供时按安装类型显示文档约定的权限。 */
+  function consentWriteMode(write) {
+    if (write.mode) {
+      return String(write.mode);
+    }
+    if (write.kind === "helper") {
+      return "0700";
+    }
+    if (write.kind === "runtime") {
+      return "0755";
+    }
+    return "未知";
+  }
+
+  /** 枚举值映射为“中文（原值）”，未知值原样展示。 */
+  function consentLabel(value, labels, fallback) {
+    var raw = value == null ? "" : String(value);
+    if (!raw) {
+      return fallback;
+    }
+    return Object.prototype.hasOwnProperty.call(labels, raw) ? labels[raw] : raw;
+  }
+
+  /** 展开确认弹窗。 */
+  function showConsentDialog() {
+    var dialog = elements.consentDialog;
+    if (!dialog) {
+      return;
+    }
+    if (typeof dialog.showModal === "function") {
+      if (!dialog.open) {
+        dialog.showModal();
+      }
+    } else {
+      dialog.setAttribute("open", "");
+    }
+  }
+
+  /** 关闭确认弹窗（不改变 pending；调用方负责清理）。 */
+  function closeConsentDialog() {
+    var dialog = elements.consentDialog;
+    if (!dialog) {
+      return;
+    }
+    if (typeof dialog.close === "function") {
+      if (dialog.open) {
+        dialog.close();
+      }
+    } else {
+      dialog.removeAttribute("open");
+    }
+  }
+
+  /** 清空待确认授权（仅内存）。 */
+  function clearConsentState() {
+    pendingConsent = null;
+    consentBusy = false;
+    updateConsentButtons();
+  }
+
+  /** 取消：清空 pending，保留新建弹窗，并提示未写入。 */
+  function cancelConsentDialog() {
+    if (consentBusy) {
+      return;
+    }
+    var hadPending = !!pendingConsent;
+    clearConsentState();
+    closeConsentDialog();
+    if (hadPending) {
+      setStatus("已取消，未写入远端");
+    }
+  }
+
+  /** Esc 关闭确认弹窗等同取消。 */
+  function onConsentDialogClosed() {
+    if (!pendingConsent) {
+      return;
+    }
+    clearConsentState();
+    setStatus("已取消，未写入远端");
+  }
+
+  /** 确认授权：复制本次参数并附加 `allow_injection=true`，最多重试一次。 */
+  function confirmConsent(event) {
+    if (event) {
+      event.preventDefault();
+    }
+    var current = pendingConsent;
+    if (!current || !connected) {
+      showConsentError("连接已断开，无法确认");
+      return;
+    }
+    if (current.retried) {
+      showConsentError("已重试过一次，请取消后重新创建");
+      return;
+    }
+    current.retried = true;
+    consentBusy = true;
+    hideConsentError();
+    updateConsentButtons();
+    setStatus("已确认，正在写入远端…");
+    var retryParams = copyParams(current.params);
+    retryParams.allow_injection = true;
+    rpc("terminal.create", retryParams, createRequestTimeout(retryParams)).then(
+      function (result) {
+        consentBusy = false;
+        if (pendingConsent !== current) {
+          return;
+        }
+        clearConsentState();
+        closeConsentDialog();
+        finishCreate(result);
+      },
+      function (error) {
+        consentBusy = false;
+        if (pendingConsent !== current) {
+          return;
+        }
+        var detail = describeError(error);
+        if (isConsentRequired(error)) {
+          showConsentError("服务端仍要求授权，已停止自动重试：" + detail);
+        } else {
+          showConsentError("创建失败：" + detail);
+        }
+        setStatus("创建失败：" + detail);
+        updateConsentButtons();
+      }
+    );
+  }
+
+  /** 浅复制创建参数；嵌套 ssh 对象只读，不修改原表单结果。 */
+  function copyParams(params) {
+    var copy = {};
+    for (var key in params) {
+      if (Object.prototype.hasOwnProperty.call(params, key)) {
+        copy[key] = params[key];
+      }
+    }
+    return copy;
+  }
+
+  /** 确认/取消按钮可用性；重试过或正在请求时不允许再次确认。 */
+  function updateConsentButtons() {
+    if (elements.consentConfirm) {
+      elements.consentConfirm.disabled =
+        consentBusy || !pendingConsent || pendingConsent.retried;
+    }
+    if (elements.consentCancel) {
+      elements.consentCancel.disabled = consentBusy;
+    }
+  }
+
+  /** 确认弹窗内错误。 */
+  function showConsentError(message) {
+    if (!elements.consentError) {
+      return;
+    }
+    elements.consentError.textContent = message;
+    elements.consentError.hidden = false;
+  }
+
+  /** 清空确认弹窗错误。 */
+  function hideConsentError() {
+    if (!elements.consentError) {
+      return;
+    }
+    elements.consentError.textContent = "";
+    elements.consentError.hidden = true;
   }
 
   /** 组装 `terminal.create` 参数；校验失败抛出可展示的错误。 */
@@ -1705,18 +2147,30 @@
         throw new Error("SSH 用户不能为空");
       }
       var port = parseInteger(elements.createPort, 1, 65535, "端口");
-      params.cmd = (elements.createSshCmd && elements.createSshCmd.value || "").trim() || "shell";
+      // 运行环境只有 termx-pwsh / 系统 shell；系统 shell 传空串。
+      params.cmd =
+        elements.createSshRuntime && elements.createSshRuntime.value === "termx-pwsh"
+          ? "termx-pwsh"
+          : "";
       params.args = [];
       params.ssh = buildSshConfig(host, port, user);
       return params;
     }
 
-    var cmd = (elements.createCmd && elements.createCmd.value || "").trim();
-    if (!cmd) {
-      throw new Error("本地终端需要程序（cmd）");
+    var runtimeId = (elements.createRuntime && elements.createRuntime.value || "").trim();
+    if (runtimeId) {
+      // 服务端按 manifest 解析 bin/args；显式清空，避免误传自定义命令。
+      params.runtime_id = runtimeId;
+      params.cmd = "";
+      params.args = [];
+    } else {
+      var cmd = (elements.createCmd && elements.createCmd.value || "").trim();
+      if (!cmd) {
+        throw new Error("本地终端需要程序（cmd），或选择内置运行环境");
+      }
+      params.cmd = cmd;
+      params.args = parseArgs(elements.createArgs && elements.createArgs.value || "");
     }
-    params.cmd = cmd;
-    params.args = parseArgs(elements.createArgs && elements.createArgs.value || "");
     var cwd = (elements.createCwd && elements.createCwd.value || "").trim();
     if (cwd) {
       params.cwd = cwd;
@@ -1750,35 +2204,14 @@
       auth = { type: "password", password: password };
     }
 
-    var ssh = {
+    // helper 路径/上传/摘要全部由 service 按注入配置自动处理，表单不再传递。
+    return {
       host: host,
       port: port,
       user: user,
       auth: auth,
-      upload_helper: !!(elements.createUploadHelper && elements.createUploadHelper.checked),
       accept_any_host_key: !!(elements.createAnyHostKey && elements.createAnyHostKey.checked)
     };
-    var helperPath = (elements.createHelperPath && elements.createHelperPath.value || "").trim();
-    var helperLocal = (elements.createHelperLocal && elements.createHelperLocal.value || "").trim();
-    var helperSha = (elements.createHelperSha && elements.createHelperSha.value || "").trim();
-    if (ssh.upload_helper) {
-      if (!helperLocal) {
-        throw new Error("上传 helper 时必须填写本地 helper 路径");
-      }
-      if (helperPath) {
-        throw new Error("远端 helper 路径与上传 helper 不能同时使用");
-      }
-      ssh.helper_local_path = helperLocal;
-    } else if (helperPath) {
-      ssh.helper_path = helperPath;
-    }
-    if (helperSha) {
-      if (!ssh.upload_helper && !ssh.helper_path) {
-        throw new Error("helper sha256 需要远端 helper 路径或上传 helper");
-      }
-      ssh.helper_sha256 = helperSha;
-    }
-    return ssh;
   }
 
   /** 读取并校验整数输入。 */
@@ -1903,6 +2336,9 @@
     appendMetaRow(container, "状态", item.state || "-");
     appendMetaRow(container, "PID", typeof item.pid === "number" ? String(item.pid) : "-");
     appendMetaRow(container, "模式", item.mode || "-");
+    if (item.runtime_id) {
+      appendMetaRow(container, "运行环境", item.runtime_id);
+    }
     appendMetaRow(container, "启动", launchCommand(item));
     appendMetaRow(container, "目录", item.cwd || "-");
   }
@@ -2153,41 +2589,166 @@
     }
     var atBottom =
       pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
-    var blocks = [];
+    var fragment = document.createDocumentFragment();
     for (var i = 0; i < commands.length; i += 1) {
       var command = commands[i];
       if (!command) {
         continue;
       }
-      var started = clockOf(command.started_at);
-      var ended = command.ended_at ? clockOf(command.ended_at) : "…";
-      var block =
-        started +
-        " → " +
-        ended +
-        " [" +
-        (command.status || "unknown") +
-        "]\n" +
-        (command.command || "");
-      if (typeof command.output === "string" && command.output) {
-        block += "\n" + command.output;
+      var group = document.createElement("div");
+      group.className = "termx-tx-group";
+      group.appendChild(
+        transcriptRow(
+          "termx-tx-cmd",
+          transcriptWallTime(command.started_at),
+          command.command || ""
+        )
+      );
+
+      var output =
+        typeof command.output === "string"
+          ? command.output.replace(/\n+$/, "")
+          : "";
+      var lines = output ? output.split("\n") : [];
+      var meta = transcriptMeta(command);
+      if (lines.length === 0) {
+        // 无输出也保留一行空白，让用时/退出状态可见。
+        group.appendChild(transcriptRow("termx-tx-empty", "", "\u00a0", meta));
+      } else {
+        for (var line = 0; line < lines.length; line += 1) {
+          var last = line === lines.length - 1;
+          group.appendChild(
+            transcriptRow("", "", lines[line], last ? meta : null)
+          );
+        }
       }
-      blocks.push(block);
+      fragment.appendChild(group);
     }
-    var text = blocks.join("\n\n");
-    if (text.length > TRANSCRIPT_UI_MAX_CHARS) {
-      text = text.slice(-TRANSCRIPT_UI_MAX_CHARS);
+    pre.textContent = "";
+    pre.appendChild(fragment);
+    // 与旧项目一致：只保留最近一段文本，避免长时间运行 DOM 无限增长。
+    while (pre.textContent.length > TRANSCRIPT_UI_MAX_CHARS && pre.firstChild) {
+      pre.removeChild(pre.firstChild);
     }
-    pre.textContent = text;
     if (atBottom) {
       pre.scrollTop = pre.scrollHeight;
     }
   }
 
-  /** 从 RFC3339 时间取 `HH:MM:SS`；格式异常时原样返回。 */
-  function clockOf(timestamp) {
-    var match = /T(\d\d:\d\d:\d\d)/.exec(String(timestamp || ""));
-    return match ? match[1] : String(timestamp || "");
+  /** 构造一行「时间列 + 内容列」；meta 挂到时间列。 */
+  function transcriptRow(className, time, text, meta) {
+    var row = document.createElement("div");
+    row.className = "termx-tx-row" + (className ? " " + className : "");
+    var timeCell = document.createElement("span");
+    timeCell.className = "termx-tx-time";
+    timeCell.textContent = time || "";
+    if (meta) {
+      timeCell.appendChild(meta);
+    }
+    var textCell = document.createElement("span");
+    textCell.className = "termx-tx-text";
+    textCell.textContent = text;
+    row.appendChild(timeCell);
+    row.appendChild(textCell);
+    return row;
+  }
+
+  /** 输出末行的时间列：`+耗时` + 退出状态。 */
+  function transcriptMeta(command) {
+    var wrap = document.createElement("span");
+    wrap.className = "termx-tx-meta";
+    var duration = transcriptDuration(command.started_at, command.ended_at);
+    if (duration) {
+      var elapsed = document.createElement("span");
+      elapsed.textContent = "+" + duration + "s ";
+      wrap.appendChild(elapsed);
+    }
+    var status = document.createElement("span");
+    var state = String(command.status || "unknown");
+    var exitCode =
+      typeof command.exit_code === "number" ? command.exit_code : null;
+    var label = transcriptStatusText(state);
+    var statusClass = transcriptStatusClass(state);
+    if (exitCode !== null) {
+      label = exitCode === 0 ? "✓ 0" : "✗ " + exitCode;
+      statusClass = exitCode === 0 ? "is-ok" : "is-bad";
+    } else if (
+      command.best_effort &&
+      (state === "done" || state === "unknown")
+    ) {
+      // 静默/降级结束：没有真实退出码，不能画成成功。
+      label = "~";
+      statusClass = "is-running";
+    }
+    status.className = "termx-tx-status " + statusClass;
+    status.textContent = label;
+    status.title =
+      state +
+      (command.source ? " · " + command.source : "") +
+      (command.best_effort ? " · best_effort" : "");
+    wrap.appendChild(status);
+    return wrap;
+  }
+
+  function transcriptDuration(startedAt, endedAt) {
+    if (!startedAt || !endedAt) {
+      return "";
+    }
+    var start = Date.parse(startedAt);
+    var end = Date.parse(endedAt);
+    if (!isFinite(start) || !isFinite(end) || end < start) {
+      return "";
+    }
+    return ((end - start) / 1000).toFixed(3);
+  }
+
+  function transcriptStatusText(status) {
+    switch (status) {
+      case "running":
+        return "…";
+      case "done":
+      case "exited":
+        return "✓";
+      case "interrupted":
+      case "error":
+        return "✗";
+      default:
+        return status;
+    }
+  }
+
+  function transcriptStatusClass(status) {
+    if (status === "done" || status === "exited") {
+      return "is-ok";
+    }
+    if (status === "interrupted" || status === "error") {
+      return "is-bad";
+    }
+    return "is-running";
+  }
+
+  /** RFC3339 转为本地 `YYYY-MM-DD HH:MM:SS`；格式异常时原样返回。 */
+  function transcriptWallTime(timestamp) {
+    var date = new Date(String(timestamp || ""));
+    if (isNaN(date.getTime())) {
+      return String(timestamp || "");
+    }
+    var pad = function (value) {
+      return String(value).padStart(2, "0");
+    };
+    return (
+      date.getFullYear() +
+      "-" +
+      pad(date.getMonth() + 1) +
+      "-" +
+      pad(date.getDate()) +
+      " " +
+      pad(date.getHours()) +
+      ":" +
+      pad(date.getMinutes()) +
+      ":" +
+      pad(date.getSeconds())
+    );
   }
 
   /** 信息页输入框提交：claim 后 `terminal.send(text, enter=true)`。 */
@@ -2237,19 +2798,95 @@
       });
   }
 
-  /** 信息页提示条（终态、错误、transcript reset）。 */
+  /** 信息页提示：统一进底部状态栏。 */
   function setInfoNotice(text) {
-    transcriptNotice = text || "";
-    if (elements.infoNotice) {
-      elements.infoNotice.textContent = transcriptNotice;
-      elements.infoNotice.hidden = !transcriptNotice;
+    var message = text == null ? "" : String(text);
+    if (!message) {
+      return;
     }
+    setStatusBar(message, classifyToast(message));
   }
-  /** 更新状态文本。 */
-  function setStatus(text) {
-    if (elements.status) {
-      elements.status.textContent = text;
+
+  /** 状态消息：统一进底部状态栏；高频进度/等待态不刷屏。 */
+  function setStatus(text, severity) {
+    var message = text == null ? "" : String(text);
+    if (!message || !shouldToastStatus(message)) {
+      return;
     }
+    setStatusBar(message, severity || classifyToast(message));
+  }
+
+  /** 底部状态栏：跨「信息/原始控制台」常驻，点击可关闭。 */
+  function setStatusBar(text, severity) {
+    if (!elements.statusbar) {
+      return;
+    }
+    var message = text == null ? "" : String(text);
+    if (!message) {
+      clearStatusBar();
+      return;
+    }
+    // 同一错误被用户点掉后，轮询重复上报不再自动弹回。
+    if (message === statusBarKey && statusBarDismissed) {
+      return;
+    }
+    if (message !== statusBarKey) {
+      statusBarKey = message;
+      statusBarDismissed = false;
+    }
+    var level = severity || "error";
+    elements.statusbar.className = "termx-statusbar is-" + level;
+    elements.statusbar.textContent = message;
+    elements.statusbar.title = "点击关闭";
+    elements.statusbar.hidden = false;
+  }
+
+  function dismissStatusBar() {
+    if (!elements.statusbar) {
+      return;
+    }
+    statusBarDismissed = !!statusBarKey;
+    elements.statusbar.hidden = true;
+  }
+
+  function clearStatusBar() {
+    statusBarKey = "";
+    statusBarDismissed = false;
+    if (!elements.statusbar) {
+      return;
+    }
+    elements.statusbar.textContent = "";
+    elements.statusbar.className = "termx-statusbar";
+    elements.statusbar.hidden = true;
+  }
+
+  function shouldToastStatus(text) {
+    return !/^(正在|已连接，正在|等待输入|终端运行中|已订阅终端)/.test(
+      text
+    );
+  }
+
+  function classifyToast(text) {
+    if (
+      /(失败|错误|无法|不存在|断开|拒绝|超时|未配置|不可用|limit_exceeded|error|failed)/i.test(
+        text
+      )
+    ) {
+      return "error";
+    }
+    if (
+      /(已退出|已中断|已请求终止|丢弃|达到上限|不可回放|没有终端|未选择|请选择|未连接|警告|请稍后)/.test(
+        text
+      )
+    ) {
+      return "warning";
+    }
+    if (
+      /(已连接|已订阅|已创建|已迁移|已发送|已释放|成功|完成)/.test(text)
+    ) {
+      return "success";
+    }
+    return "info";
   }
 
   /** 记录连接状态并同步控件可用性。 */

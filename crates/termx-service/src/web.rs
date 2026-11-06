@@ -397,6 +397,10 @@ fn static_response(content_type: &'static str, body: &'static str) -> Response {
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    // 内嵌资源随 service 二进制更新；禁止浏览器缓存，避免升级后仍用旧 UI。
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

@@ -1,6 +1,6 @@
 //! termx 协议 v1 的类型定义。
 //!
-//! 本 crate 是 `docs/PROTOCOL.md` 的代码映射，不含任何 OS 依赖，可独立单测。
+//! 本 crate 是 `docs/specs/PROTOCOL.md` 的代码映射，不含任何 OS 依赖，可独立单测。
 //! 约定：每个 WebSocket text frame 承载一个完整 JSON 对象；事件无 `id`，
 //! 以 `terminal_id` + 每终端单调 `seq` 定位；`ts` 为 RFC3339 UTC 字符串。
 
@@ -9,6 +9,14 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 
 pub mod helper;
+pub mod injection;
+pub mod shell_events;
+
+pub use injection::{
+    InjectionConsent, InjectionConsentMode, InjectionPathError, InjectionPlan, InjectionWrite,
+    InjectionWriteAction, InjectionWriteKind, InjectionWriteReason, expand_home,
+    validate_path_spec,
+};
 
 /// 主协议版本标识，对应 `hello.proto`。
 pub const PROTOCOL_VERSION: &str = "termx/1";
@@ -16,10 +24,13 @@ pub const PROTOCOL_VERSION: &str = "termx/1";
 /// helper 协议版本标识，对应 `helper.hello.proto`。
 pub const HELPER_PROTOCOL_VERSION: &str = "termx-helper/1";
 
+/// helper 能力：支持带外 shell 事件通道（`spawn.events` / `started.events`）。
+pub const SHELL_EVENTS_CAPABILITY: &str = "shell_events";
+
 /// Web 未绑定终端的保留 `root_session_id`。
 ///
 /// 该值的终端不参与「无存活会话」超时扫描，只能手动终止；非管理员连接
-/// 不能以它作为自身会话，也不能访问该会话下的终端。见 `docs/PROTOCOL.md` §6。
+/// 不能以它作为自身会话，也不能访问该会话下的终端。见 `docs/specs/PROTOCOL.md` §6。
 pub const WEB_ROOT_SESSION_ID: &str = "@web";
 
 /// 协议 JSON 编解码错误。
@@ -186,6 +197,12 @@ pub struct SshConfig {
     /// 缺失/不匹配时连接以明确错误失败。
     #[serde(default)]
     pub accept_any_host_key: bool,
+    /// 内部注入计划；由 service 按配置与本次请求组装，**不进入 JSON**。
+    ///
+    /// 直接反序列化 `terminal.create` 时取 [`InjectionPlan::default`]
+    /// （`consent=ask`、`allow=false`），保证需要写入时默认要求授权。
+    #[serde(skip)]
+    pub injection: InjectionPlan,
 }
 
 impl fmt::Debug for SshConfig {
@@ -201,6 +218,7 @@ impl fmt::Debug for SshConfig {
             .field("helper_sha256", &self.helper_sha256)
             .field("upload_helper", &self.upload_helper)
             .field("accept_any_host_key", &self.accept_any_host_key)
+            .field("injection", &self.injection)
             .finish()
     }
 }
@@ -235,6 +253,8 @@ pub enum ErrorCode {
     HelperFailed,
     /// 帧或状态机违例。
     ProtocolError,
+    /// 远端注入需要用户授权；`error.injection` 描述将写入的文件。
+    ConsentRequired,
     /// 服务崩溃/重启（客户端合成）。
     ServiceLost,
     /// 未分类错误。
@@ -242,7 +262,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// 该错误码是否建议客户端重试（对齐 `docs/PROTOCOL.md` §10）。
+    /// 该错误码是否建议客户端重试（对齐 `docs/specs/PROTOCOL.md` §10）。
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -267,6 +287,12 @@ pub struct ProtocolError {
     /// 相关终端 ID；`session_exists` 时携带旧终端 ID。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// `consent_required` 时的写入计划；其他错误码缺省。
+    ///
+    /// 用 `Box` 装以缩小 `Result` 的错误分支（clippy `result_large_err`）；
+    /// serde 对 `Box<T>` 透明，JSON 形状不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection: Option<Box<InjectionConsent>>,
 }
 
 /// 请求消息。
@@ -442,6 +468,9 @@ pub struct TerminalSnapshot {
     pub terminal_id: String,
     /// 生命周期状态。
     pub state: LifecycleState,
+    /// 创建时指定的 runtime ID；旧 cmd/args 终端缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     /// 创建模式。
     pub mode: Mode,
     /// 启动程序（`terminal.create` 的原始 `cmd`）。
@@ -542,6 +571,10 @@ pub struct CreateParams {
     /// 创建模式。
     pub mode: Mode,
     /// 可执行程序。
+    ///
+    /// 使用 `runtime_id` 时可缺省；服务端会忽略该值并用 runtime manifest 的
+    /// `bin` 覆盖。
+    #[serde(default)]
     pub cmd: String,
     /// 程序参数。
     #[serde(default)]
@@ -571,6 +604,40 @@ pub struct CreateParams {
     /// SSH 连接参数；存在时走远端 SSH 后端（fallback 模式）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
+    /// 内置 runtime ID；存在时服务端从 runtime catalog 解析程序与参数。
+    ///
+    /// 与自定义 `cmd`/`args` 互斥（空 `cmd` 与空 `args` 不算冲突）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    /// 本次创建是否已获用户授权，允许向远端写入 helper/runtime。
+    ///
+    /// 缺省 `false`；仅在配置为 `ask` 时需要显式置 `true`。
+    #[serde(default)]
+    pub allow_injection: bool,
+}
+
+/// `runtime.list` 的单个条目；不包含本机绝对路径。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    /// 稳定 runtime ID。
+    pub id: String,
+    /// 展示名。
+    pub name: String,
+    /// 版本。
+    pub version: String,
+    /// 平台。
+    pub platform: String,
+    /// 架构。
+    pub arch: String,
+    /// bin 是否存在且可执行。
+    pub available: bool,
+}
+
+/// `runtime.list` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeListResult {
+    /// 当前平台兼容的 runtime。
+    pub runtimes: Vec<RuntimeInfo>,
 }
 
 /// `terminal.create` 结果。
@@ -651,7 +718,7 @@ pub struct SubscribeResult {
 
 /// 终端定位：`terminal_id` 或 `(root_session_id, name)` 二选一。
 ///
-/// 两者都给时以 `terminal_id` 为准（见 `docs/PROTOCOL.md` §6）。
+/// 两者都给时以 `terminal_id` 为准（见 `docs/specs/PROTOCOL.md` §6）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TerminalLocator {
     /// 终端内部 ID；存在时优先。
@@ -703,6 +770,11 @@ pub struct Capabilities {
     /// 是否降级为 best-effort。
     #[serde(rename = "bestEffort")]
     pub best_effort: bool,
+    /// 服务端是否支持 `runtime.list` / `terminal.create.runtime_id`。
+    ///
+    /// 旧客户端反序列化时缺省为 `false`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_catalog: bool,
 }
 
 /// `hello` 结果。
@@ -769,6 +841,9 @@ pub struct ListItem {
     pub terminal_id: String,
     /// 所属 opencode 会话 ID。
     pub root_session_id: String,
+    /// 创建时指定的 runtime ID；旧 cmd/args 终端缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     /// 会话内名称。
     pub name: String,
     /// 生命周期状态。
@@ -1127,10 +1202,11 @@ mod tests {
             (ErrorCode::SshConnectFailed, "ssh_connect_failed"),
             (ErrorCode::HelperFailed, "helper_failed"),
             (ErrorCode::ProtocolError, "protocol_error"),
+            (ErrorCode::ConsentRequired, "consent_required"),
             (ErrorCode::ServiceLost, "service_lost"),
             (ErrorCode::Internal, "internal"),
         ];
-        assert_eq!(cases.len(), 15, "ErrorCode 变体数量应为 15");
+        assert_eq!(cases.len(), 16, "ErrorCode 变体数量应为 16");
 
         for (code, expected) in cases {
             let json = serde_json::to_value(code).expect("错误码序列化失败");
@@ -1182,6 +1258,7 @@ mod tests {
                 message: "终端不存在".to_string(),
                 retryable: false,
                 terminal_id: None,
+                injection: None,
             }),
         };
         let err_json: JsonValue =
@@ -1227,6 +1304,7 @@ mod tests {
             ErrorCode::SpawnFailed,
             ErrorCode::PtyFailed,
             ErrorCode::ProtocolError,
+            ErrorCode::ConsentRequired,
         ];
 
         for code in retryable {
@@ -1256,6 +1334,8 @@ mod tests {
             force: true,
             idle_timeout,
             ssh: None,
+            allow_injection: false,
+            runtime_id: None,
         }
     }
 
@@ -1287,6 +1367,49 @@ mod tests {
     }
 
     #[test]
+    fn runtime_id_is_optional_and_old_create_params_still_parse() {
+        let old = serde_json::json!({
+            "mode": "pty",
+            "cmd": "pwsh",
+            "root_session_id": "ses-1",
+            "name": "old"
+        });
+        let params: CreateParams = serde_json::from_value(old).expect("旧参数应兼容");
+        assert_eq!(params.runtime_id, None);
+        assert_eq!(params.cmd, "pwsh");
+
+        let runtime_only = serde_json::json!({
+            "mode": "pty",
+            "root_session_id": "ses-1",
+            "name": "rt",
+            "runtime_id": "termx-pwsh"
+        });
+        let params: CreateParams =
+            serde_json::from_value(runtime_only).expect("runtime 参数应解析");
+        assert_eq!(params.runtime_id.as_deref(), Some("termx-pwsh"));
+        assert!(params.cmd.is_empty(), "cmd 可缺省为空");
+        let json: JsonValue =
+            serde_json::from_str(&to_json(&params).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(json["runtime_id"], "termx-pwsh");
+
+        let info = RuntimeInfo {
+            id: "termx-pwsh".to_string(),
+            name: "termx-pwsh".to_string(),
+            version: "0.1.0".to_string(),
+            platform: "windows".to_string(),
+            arch: "x86_64".to_string(),
+            available: true,
+        };
+        let list = RuntimeListResult {
+            runtimes: vec![info],
+        };
+        let back: RuntimeListResult =
+            from_json(&to_json(&list).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(list, back);
+        assert!(!to_json(&list).expect("序列化失败").contains("bin"));
+    }
+
+    #[test]
     fn ssh_config_round_trips_and_debug_redacts_secrets() {
         let config = SshConfig {
             host: "127.0.0.1".to_string(),
@@ -1300,10 +1423,12 @@ mod tests {
             helper_sha256: Some("0123456789abcdef".to_string()),
             upload_helper: true,
             accept_any_host_key: true,
+            injection: InjectionPlan::default(),
         };
 
-        let back: SshConfig =
-            from_json(&to_json(&config).expect("序列化失败")).expect("反序列化失败");
+        let json = to_json(&config).expect("序列化失败");
+        assert!(!json.contains("injection"), "注入计划不得进入 JSON: {json}");
+        let back: SshConfig = from_json(&json).expect("反序列化失败");
         assert_eq!(config, back, "serde 需保留原值供本机传输");
 
         let debug = format!("{config:?}");
@@ -1380,6 +1505,7 @@ mod tests {
             rows: 30,
             cursor: 42,
             capabilities: None,
+            runtime_id: None,
         }
     }
 
@@ -1443,10 +1569,20 @@ mod tests {
             force: false,
             idle_timeout: None,
             ssh: None,
+            allow_injection: false,
+            runtime_id: None,
         };
         let params_json: JsonValue =
             serde_json::from_str(&to_json(&params).expect("序列化失败")).expect("JSON 解析失败");
-        for key in ["cwd", "env", "cols", "rows", "idle_timeout", "ssh"] {
+        for key in [
+            "cwd",
+            "env",
+            "cols",
+            "rows",
+            "idle_timeout",
+            "ssh",
+            "runtime_id",
+        ] {
             assert!(params_json.get(key).is_none(), "{key} 不应出现在 JSON 中");
         }
 
@@ -1467,10 +1603,12 @@ mod tests {
             message: "同名会话已存在".to_string(),
             retryable: false,
             terminal_id: None,
+            injection: None,
         };
         let error_json: JsonValue =
             serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
         assert!(error_json.get("terminal_id").is_none());
+        assert!(error_json.get("injection").is_none());
 
         let mut snapshot = sample_snapshot();
         snapshot.pid = None;
@@ -1486,12 +1624,67 @@ mod tests {
             message: "同名会话已存在".to_string(),
             retryable: false,
             terminal_id: Some("01JOLD".to_string()),
+            injection: None,
         };
         let json: JsonValue =
             serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
 
         assert_eq!(json["code"], "session_exists");
         assert_eq!(json["terminal_id"], "01JOLD");
+    }
+
+    #[test]
+    fn consent_required_error_carries_injection_payload() {
+        let error = ProtocolError {
+            code: ErrorCode::ConsentRequired,
+            message: "需要授权写入远端 helper".to_string(),
+            retryable: false,
+            terminal_id: None,
+            injection: Some(Box::new(InjectionConsent {
+                host: "example.com".to_string(),
+                user: "alice".to_string(),
+                writes: vec![InjectionWrite {
+                    kind: InjectionWriteKind::Helper,
+                    action: InjectionWriteAction::Install,
+                    reason: InjectionWriteReason::Missing,
+                    path: "/home/alice/.termx/bin/termx-helper".to_string(),
+                    size: Some(1024),
+                    sha256: Some("f".repeat(64)),
+                }],
+            })),
+        };
+        let json: JsonValue =
+            serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(json["code"], "consent_required");
+        assert_eq!(json["retryable"], false);
+        assert_eq!(json["injection"]["host"], "example.com");
+        assert_eq!(json["injection"]["writes"][0]["kind"], "helper");
+        assert_eq!(json["injection"]["writes"][0]["action"], "install");
+        assert_eq!(json["injection"]["writes"][0]["reason"], "missing");
+
+        let legacy: ProtocolError =
+            from_json(r#"{"code":"consent_required","message":"x","retryable":false}"#)
+                .expect("旧形状应可解析");
+        assert!(legacy.injection.is_none());
+    }
+
+    #[test]
+    fn allow_injection_defaults_false_and_round_trips_true() {
+        let legacy: CreateParams =
+            from_json(r#"{"mode":"pty","root_session_id":"ses-1","name":"x"}"#)
+                .expect("旧参数应兼容");
+        assert!(!legacy.allow_injection);
+
+        let json = to_json(&legacy).expect("序列化失败");
+        let value: JsonValue = serde_json::from_str(&json).expect("JSON 解析失败");
+        assert_eq!(value["allow_injection"], false);
+
+        let mut allowed = legacy;
+        allowed.allow_injection = true;
+        let back: CreateParams =
+            from_json(&to_json(&allowed).expect("序列化失败")).expect("反序列化失败");
+        assert!(back.allow_injection);
+        assert_eq!(allowed, back);
     }
 
     #[test]
@@ -1749,6 +1942,59 @@ mod tests {
                 .expect("JSON 解析失败");
         assert_eq!(value["all"], JsonValue::Bool(false));
     }
+
+    #[test]
+    fn transcript_command_keeps_legacy_json_compatible() {
+        // 旧 JSON 没有新字段：反序列化应使用默认值。
+        let legacy: TranscriptCommand = from_json(
+            r#"{"command":"ls","started_at":"2026-11-02T09:00:00Z",
+                "ended_at":null,"status":"running","output":"a.txt"}"#,
+        )
+        .expect("旧 TranscriptCommand 反序列化失败");
+        assert_eq!(legacy.exit_code, None);
+        assert_eq!(legacy.source, None);
+        assert!(!legacy.best_effort);
+
+        // 默认值不应出现在序列化结果中。
+        let legacy_json: JsonValue =
+            serde_json::from_str(&to_json(&legacy).expect("序列化失败")).expect("JSON 解析失败");
+        for key in ["exit_code", "source", "best_effort"] {
+            assert!(
+                legacy_json.get(key).is_none(),
+                "{key} 不应出现在旧形状 JSON 中"
+            );
+        }
+
+        // 完整字段可往返，且枚举使用 snake_case。
+        let full = TranscriptCommand {
+            command: "false".to_string(),
+            started_at: "2026-11-02T09:00:00Z".to_string(),
+            ended_at: Some("2026-11-02T09:00:01Z".to_string()),
+            status: TranscriptStatus::Done,
+            output: String::new(),
+            exit_code: Some(1),
+            source: Some(TranscriptSource::ProcessGroup),
+            best_effort: true,
+        };
+        let full_json: JsonValue =
+            serde_json::from_str(&to_json(&full).expect("序列化失败")).expect("JSON 解析失败");
+        assert_eq!(full_json["exit_code"], 1);
+        assert_eq!(full_json["source"], "process_group");
+        assert_eq!(full_json["best_effort"], true);
+
+        let back: TranscriptCommand =
+            from_json(&to_json(&full).expect("序列化失败")).expect("反序列化失败");
+        assert_eq!(back, full);
+
+        for (source, expected) in [
+            (TranscriptSource::ShellIntegration, "shell_integration"),
+            (TranscriptSource::ProcessGroup, "process_group"),
+            (TranscriptSource::Unknown, "unknown"),
+        ] {
+            let json = serde_json::to_value(source).expect("来源序列化失败");
+            assert_eq!(json, expected);
+        }
+    }
 }
 
 /// 命令记录状态。
@@ -1767,6 +2013,23 @@ pub enum TranscriptStatus {
     Error,
 }
 
+/// 命令结束证据来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptSource {
+    /// shell integration（OSC 133/633）报告的命令结束。
+    ShellIntegration,
+    /// 依据进程组/静默等进程级证据推断。
+    ProcessGroup,
+    /// 来源未知。
+    Unknown,
+}
+
+/// `bool` 字段为 `false` 时省略，保持旧 JSON 形状。
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// 单条命令记录（信息页使用）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptCommand {
@@ -1780,6 +2043,15 @@ pub struct TranscriptCommand {
     pub status: TranscriptStatus,
     /// 已清洗的输出（去 ANSI、命令回显与末尾提示符）。
     pub output: String,
+    /// 命令退出码；无法确定时为 `None`（不得伪造）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// 命令结束证据来源；未结束时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TranscriptSource>,
+    /// 结束判定是否为 best-effort（例如静默推断）；默认 `false`。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub best_effort: bool,
 }
 
 /// `terminal.transcript` 参数。

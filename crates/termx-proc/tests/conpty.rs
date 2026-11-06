@@ -33,6 +33,9 @@ async fn wait_exit(rx: &mut Receiver<ProcEvent>) -> (Vec<u8>, i32) {
                 Some(ProcEvent::Signaled(signal)) => {
                     panic!("Windows 不应收到 Signaled({signal})")
                 }
+                Some(ProcEvent::ShellEvent(_)) => {
+                    panic!("ConPTY 后端不应产生带外 shell 事件")
+                }
                 None => panic!("事件通道在收到 Exited 前关闭"),
             }
         }

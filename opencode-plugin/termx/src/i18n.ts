@@ -11,7 +11,7 @@ const HELP_EN = `termx_cli: single CLI tool for termx terminals.
 Usage:
   termx_cli help
   termx_cli local ["<cmd>"] [-n name] [-c cwd] [--env K=V]... [--cols N] [--rows N] [--force]
-  termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--cols N] [--rows N] [--force]
+  termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--allow-injection] [--cols N] [--rows N] [--force]
   termx_cli exec "<command>" [-n name] [-w] [--timeout ms]
   termx_cli run "<cmd>" [-n name] [--pty] [--cwd dir] [--env K=V]... [--timeout ms] [--force]
   termx_cli read [-n name] [--cursor N] [--max-bytes N]
@@ -44,6 +44,8 @@ Rules:
   - transcript returns recorded commands (start/end time, status, cleaned output) for the
     information page; --json returns the raw structure. Prompts and command echo are removed.
   - Use -- before a positional that starts with "-".
+  - --allow-injection authorizes writing the helper/shell scripts to the remote host when
+    creating the SSH terminal; it applies to this creation only and is not persisted.
   - rebind defaults the target to the current session (the target session pulls the terminal);
     use --terminal-id from Web or the original session. It always requires user approval;
     denial or failure returns "Rebind cancelled".`;
@@ -54,7 +56,7 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
 用法：
   termx_cli help
   termx_cli local ["<cmd>"] [-n name] [-c cwd] [--env K=V]... [--cols N] [--rows N] [--force]
-  termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--cols N] [--rows N] [--force]
+  termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--allow-injection] [--cols N] [--rows N] [--force]
   termx_cli exec "<command>" [-n name] [-w] [--timeout ms]
   termx_cli run "<cmd>" [-n name] [--pty] [--cwd dir] [--env K=V]... [--timeout ms] [--force]
   termx_cli read [-n name] [--cursor N] [--max-bytes N]
@@ -85,6 +87,8 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   - transcript 返回信息页记录的命令（起止时间、状态、清洗后输出）；--json 返回原始结构。
     提示符与命令回显已由 service 去除。
   - 以 - 开头的 positional 请放在 -- 之后。
+  - --allow-injection 表示本次创建 SSH 终端时允许向远端写入 helper/shell 脚本；
+    仅对本次创建生效，不做持久化保存。
   - rebind 默认把目标设为当前会话（目标会话自己拉取）；跨会话请用从 Web/原会话取得的
     --terminal-id。必须经用户批准；拒绝或异常返回“已取消迁移”。`;
 

@@ -120,14 +120,6 @@ body.termx-body {
   color: var(--termx-danger);
 }
 
-.termx-status {
-  margin-left: auto;
-  color: var(--termx-muted);
-  font-size: 13px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 .termx-tabs {
   display: inline-flex;
@@ -165,6 +157,40 @@ body.termx-body {
   padding: 8px;
 }
 
+.termx-statusbar {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.45;
+  border-top: 1px solid;
+  cursor: pointer;
+}
+
+.termx-statusbar.is-error {
+  color: #ff7b72;
+  background: #2d1212;
+  border-color: #8e2c27;
+}
+
+.termx-statusbar.is-warning {
+  color: #ffcf70;
+  background: #2a2415;
+  border-color: #9e6a03;
+}
+
+.termx-statusbar.is-info {
+  color: #c9d1d9;
+  background: #161b22;
+  border-color: #30363d;
+}
+
+.termx-statusbar.is-success {
+  color: #3fb950;
+  background: #0f2417;
+  border-color: #238636;
+}
+
 .termx-view {
   position: absolute;
   inset: 8px;
@@ -180,16 +206,6 @@ body.termx-body {
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-
-.termx-info-notice {
-  margin: 0;
-  padding: 6px 10px;
-  color: #ffcf70;
-  font-size: 13px;
-  background: #2a2415;
-  border: 1px solid #5a4a20;
-  border-radius: 6px;
 }
 
 .termx-info-meta {
@@ -234,6 +250,64 @@ body.termx-body {
   background: #05070a;
   border: 1px solid var(--termx-border);
   border-radius: 8px;
+}
+
+.termx-tx-group {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.termx-tx-group:last-child {
+  margin-bottom: 0;
+}
+
+.termx-tx-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.termx-tx-time {
+  box-sizing: border-box;
+  flex: 0 0 170px;
+  padding: 0 10px 0 4px;
+  color: var(--termx-muted);
+  border-right: 1px solid var(--termx-border);
+  white-space: pre;
+  font-variant-numeric: tabular-nums;
+}
+
+.termx-tx-text {
+  flex: 1;
+  min-width: 0;
+  padding-left: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.termx-tx-cmd {
+  background: #161b22;
+  box-shadow: inset 3px 0 0 #58a6ff;
+  font-weight: 600;
+}
+
+.termx-tx-empty .termx-tx-text {
+  min-height: 1.45em;
+}
+
+.termx-tx-meta {
+  white-space: nowrap;
+}
+
+.termx-tx-status.is-ok {
+  color: #3fb950;
+}
+
+.termx-tx-status.is-bad {
+  color: #ff7b72;
+}
+
+.termx-tx-status.is-running {
+  color: #d29922;
 }
 
 .termx-info-form {
@@ -347,6 +421,82 @@ body.termx-body {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 4px;
+}
+
+/* 远端注入确认：逐条列出待写入文件，长路径/摘要可换行。 */
+.termx-consent-writes {
+  display: grid;
+  gap: 8px;
+  max-height: 40vh;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.termx-consent-write {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  background: #0f141b;
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+.termx-consent-write-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+  font-size: 13px;
+}
+
+.termx-consent-action,
+.termx-consent-meta {
+  color: var(--termx-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.termx-consent-path {
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+  font-size: 12px;
+}
+
+.termx-consent-notes {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+  color: var(--termx-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  background: #0f141b;
+  border: 1px solid var(--termx-border);
+  border-radius: 8px;
+}
+
+/* 移动端：弹窗内边距收紧、操作按钮可换行并占满可用宽度。 */
+@media (max-width: 560px) {
+  .termx-dialog-form {
+    padding: 14px;
+  }
+
+  .termx-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .termx-dialog-actions {
+    flex-wrap: wrap;
+  }
+
+  .termx-dialog-actions .termx-button {
+    flex: 1 1 auto;
+  }
+
+  .termx-consent-writes {
+    max-height: 45vh;
+  }
 }
 
 .termx-primary {

@@ -4,8 +4,8 @@
 状态：需求与决策已确认（OQ-1~6 已定）；协议/开发计划随实现定稿
 定位：独立 Rust 项目，为中心化 `termx-service` 提供本地与 SSH 终端/进程监督能力。
 
-> 术语、状态与事件命名以 `docs/PROTOCOL.md` 为唯一权威；本文引用其名称，不重复定义。
-> 实现路线见 `docs/DEV_PLAN.md`；已知坑与旧项目参考见 `docs/REFERENCE_AND_PITFALLS.md`。
+> 术语、状态与事件命名以 `docs/specs/PROTOCOL.md` 为唯一权威；本文引用其名称，不重复定义。
+> 实现路线见 `docs/process/DEV_PLAN.md`；已知坑与旧项目参考见 `docs/reference/REFERENCE_AND_PITFALLS.md`。
 
 ## 1. 目标
 - 用 OS 进程/PTY/ConPTY 状态得到真实 `exit code`、`signal`、子进程树与交互状态，替代旧插件的「文本完成标记」。
@@ -131,6 +131,6 @@
 | AC-18 | 无存活会话 ≥ 5 分钟（可配短超时） | 按策略处理：`no_children` 有用户子进程则保活、子进程退出后重新计时并终止；`any` 直接终止；`never` 不终止。终止落 `interrupted{signal:"SIGTERM", source:"client_timeout"}`；会话心跳可阻止终止 |
 
 ## 9. 参考
-- 实现路线：`docs/DEV_PLAN.md`
-- 协议规格：`docs/PROTOCOL.md`
-- 旧项目参考与坑：`docs/REFERENCE_AND_PITFALLS.md`
+- 实现路线：`docs/process/DEV_PLAN.md`
+- 协议规格：`docs/specs/PROTOCOL.md`
+- 旧项目参考与坑：`docs/reference/REFERENCE_AND_PITFALLS.md`

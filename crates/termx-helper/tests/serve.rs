@@ -232,6 +232,7 @@ fn interactive_shell() -> HelperRequest {
         env: None,
         cols: Some(80),
         rows: Some(24),
+        events: false,
     }
 }
 
@@ -255,6 +256,7 @@ fn spawn_echo() -> HelperRequest {
         env: None,
         cols: Some(80),
         rows: Some(24),
+        events: false,
     }
 }
 
@@ -278,6 +280,7 @@ fn spawn_long() -> HelperRequest {
         env: None,
         cols: Some(80),
         rows: Some(24),
+        events: false,
     }
 }
 

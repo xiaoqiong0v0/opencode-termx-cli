@@ -6,6 +6,9 @@
 //! helper 上传测试还需要 `TERMX_TEST_SSH_HELPER_BIN` 指向 Linux 静态 helper；
 //! 版本不匹配测试使用本地临时脚本，不依赖该变量。
 //!
+//! 远端 shell 事件测试（T4）额外需要 `TERMX_TEST_SSH_EVENT_PROBE` 指定容器内可用的
+//! 解释器（如 `python3`）；未设置时跳过，不 fail。
+//!
 //! 密码只从环境读取，测试失败信息不打印配置/凭据。
 
 use std::{
@@ -17,8 +20,12 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tempfile::tempdir;
 use termx_proc::ProcEvent;
-use termx_protocol::{SshAuth, SshConfig};
-use termx_ssh::{SshConnectRequest, SshSession};
+use termx_protocol::{
+    SshAuth, SshConfig,
+    injection::{InjectionConsentMode, InjectionPlan},
+    shell_events::ShellEventKind,
+};
+use termx_ssh::{HelperProgram, SshConnectRequest, SshSession};
 use tokio::{sync::mpsc::Receiver, time::Instant};
 
 /// 单条事件等待上限。
@@ -26,6 +33,40 @@ const WAIT: Duration = Duration::from_secs(20);
 
 /// 远端临时目录前缀；与 `termx-ssh` 的 `mktemp` 模板保持一致。
 const REMOTE_TEMP_PATTERN: &str = "/tmp/termx-helper.*";
+
+/// 容器内 shell 事件探针（python3）。
+///
+/// 读取 helper 注入的 `TERMX_EVENT_ENDPOINT` / `TERMX_EVENT_TOKEN`，连接 UDS 后
+/// 发送 hello 与 C/D（D 携带 code=7、id=cmd-1）；发送后短暂停留，确保事件先于
+/// 进程退出被 helper 转发。token 只在子进程内存中使用，不打印、不落盘。
+const SHELL_EVENT_PROBE_SCRIPT: &str = r#"import json, os, socket, sys, time
+
+endpoint = os.environ.get("TERMX_EVENT_ENDPOINT", "")
+token = os.environ.get("TERMX_EVENT_TOKEN", "")
+if not endpoint or not token:
+    print("hello_missing_event_env", flush=True)
+    sys.exit(3)
+
+path = endpoint[len("unix:"):] if endpoint.startswith("unix:") else endpoint
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(5)
+sock.connect(path)
+stream = sock.makefile("w", encoding="utf-8")
+
+
+def send(frame):
+    stream.write(json.dumps(frame) + "\n")
+    stream.flush()
+
+
+send({"v": 1, "token": token})
+send({"v": 1, "event": "C", "id": "cmd-1"})
+time.sleep(0.1)
+send({"v": 1, "event": "D", "id": "cmd-1", "code": 7})
+print("hello_shell_events_ssh", flush=True)
+time.sleep(1.0)
+sock.close()
+"#;
 
 /// 上传测试串行锁：清理断言通过对比前后目录集合判断，并行执行会互相干扰。
 static HELPER_UPLOAD_LOCK: Mutex<()> = Mutex::new(());
@@ -54,6 +95,7 @@ fn test_config() -> Option<SshConfig> {
         upload_helper: false,
         // 测试容器使用临时主机密钥，显式接受。
         accept_any_host_key: true,
+        injection: InjectionPlan::default(),
     })
 }
 
@@ -66,7 +108,12 @@ fn skip() -> Option<SshConfig> {
     config
 }
 
-/// helper 测试配置：在基础配置上启用本地上传（使用默认远端临时目录）。
+/// 测试专用 helper 安装目标：按进程号隔离，避免影响容器内其他文件。
+fn test_helper_path(tag: &str) -> String {
+    format!("/tmp/termx-helper-{tag}-{}", std::process::id())
+}
+
+/// helper 测试配置：在基础配置上启用本地上传（安装到测试专用路径）。
 ///
 /// 需要额外设置 `TERMX_TEST_SSH_HELPER_BIN` 指向 musl 静态 helper；缺失时跳过。
 fn helper_config() -> Option<SshConfig> {
@@ -80,7 +127,25 @@ fn helper_config() -> Option<SshConfig> {
     };
     config.helper_local_path = Some(binary);
     config.upload_helper = true;
+    config.helper_path = Some(test_helper_path("test"));
+    // 测试直接调用 `termx-ssh`，需自行提供注入授权（service 会从请求装配）。
+    config.injection = InjectionPlan {
+        consent: InjectionConsentMode::Allow,
+        allow: true,
+        ..Default::default()
+    };
     Some(config)
+}
+
+/// 远端 shell 事件探针解释器（容器内为 `python3`）；未设置时跳过。
+fn shell_event_probe() -> Option<String> {
+    match env::var("TERMX_TEST_SSH_EVENT_PROBE") {
+        Ok(interpreter) if !interpreter.trim().is_empty() => Some(interpreter),
+        _ => {
+            eprintln!("跳过 SSH shell 事件测试：未设置 TERMX_TEST_SSH_EVENT_PROBE");
+            None
+        }
+    }
 }
 
 /// 从 helper 配置派生出纯 fallback 配置，用于独立核对远端状态。
@@ -306,8 +371,50 @@ fn helper_upload_reports_output_and_exit_code() {
         other => panic!("helper 模式应收到退出码 3，实际 {other:?}"),
     }
 
-    // 默认临时目录分支：上传成功、会话结束后只清理本次 `mktemp -d` 目录。
+    // 安装到测试专用路径：上传成功，会话结束后不再产生临时目录。
     assert_no_new_temp_dirs(&plain, &before);
+}
+
+/// helper 模式未显式提供 TERM 时，远端 PTY 应拿到默认 `xterm-256color`。
+#[test]
+fn helper_injects_default_term() {
+    let _guard = lock_helper_uploads();
+    let Some(config) = helper_config() else {
+        return;
+    };
+    let request = SshConnectRequest::from_create(
+        "sh",
+        &[
+            "-c".to_string(),
+            "printf 'TERM=%s\\n' \"$TERM\"".to_string(),
+        ],
+        80,
+        24,
+    );
+    let (session, mut events) =
+        SshSession::connect(&config, request).expect("helper shell 连接失败");
+    assert!(session.helper(), "应使用 helper 会话");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("测试运行时");
+    let mut output = Vec::new();
+    let terminal = collect_until_terminal(
+        &runtime,
+        &mut events,
+        Some(&mut output),
+        Instant::now() + WAIT,
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("TERM=xterm-256color"),
+        "应注入默认 TERM，实际 {text:?}"
+    );
+    assert!(
+        matches!(terminal, Some(ProcEvent::Exited(0))),
+        "命令应以 0 退出，实际 {terminal:?}"
+    );
 }
 
 /// helper 交互：pid/pgid/tree、input、resize、terminate 后经远端 `/proc` 确认无残留。
@@ -373,45 +480,97 @@ fn helper_interactive_reports_tree_and_terminates() {
     assert_no_new_temp_dirs(&plain, &before);
 }
 
-/// helper_path 不可用：回退 fallback 且仍可执行。
+/// T4：真实 sshd + helper + fake child，验证带外 shell 事件经 SSH 回传。
+///
+/// 子进程（容器内 python3）读取 helper 注入的 endpoint/token，连接 UDS 后发送
+/// hello + C/D；断言 `ProcEvent::ShellEvent` 的顺序、code/id、普通输出仍到达，
+/// 且 `SshSession::shell_events()` 为 true。
 #[test]
-fn helper_path_failure_falls_back_to_best_effort() {
-    let Some(mut config) = skip() else {
+fn helper_shell_events_arrive_over_ssh() {
+    let _guard = lock_helper_uploads();
+    let Some(config) = helper_config() else {
         return;
     };
-    config.helper_path = Some("/nonexistent/termx-helper".to_string());
+    let Some(interpreter) = shell_event_probe() else {
+        return;
+    };
 
-    let request = SshConnectRequest::exec("sh -c 'echo hello_fallback; exit 0'", 80, 24);
+    let mut request = SshConnectRequest::exec("", 80, 24);
+    request.events = true;
+    request.program = Some(HelperProgram {
+        cmd: interpreter,
+        args: vec!["-c".to_string(), SHELL_EVENT_PROBE_SCRIPT.to_string()],
+    });
+
     let (session, mut events) =
-        SshSession::connect(&config, request).expect("fallback SSH 连接失败");
-
-    let capabilities = session.capabilities();
-    assert!(!capabilities.helper, "helper 不可用时应标记 helper=false");
+        SshSession::connect(&config, request).expect("shell 事件 SSH 连接/握手失败");
+    assert!(session.helper(), "应进入 helper 模式");
     assert!(
-        capabilities.best_effort,
-        "回退 fallback 应标记 bestEffort=true"
+        session.shell_events(),
+        "helper 应声明 shell_events 能力且 started.events=true"
     );
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("测试运行时");
+    let deadline = Instant::now() + WAIT;
     let mut output = Vec::new();
-    let terminal = collect_until_terminal(
-        &runtime,
-        &mut events,
-        Some(&mut output),
-        Instant::now() + WAIT,
-    );
+    let mut shell_events = Vec::new();
+    let mut terminal = None;
+    runtime.block_on(async {
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(ProcEvent::Output { data, .. })) => output.extend_from_slice(&data),
+                Ok(Some(ProcEvent::ShellEvent(event))) => shell_events.push(event),
+                Ok(Some(other)) => {
+                    terminal = Some(other);
+                    break;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+
     assert!(
-        String::from_utf8_lossy(&output).contains("hello_fallback"),
-        "fallback 应仍可执行，实际 {} 字节",
+        String::from_utf8_lossy(&output).contains("hello_shell_events_ssh"),
+        "普通输出仍应到达，实际 {} 字节",
         output.len()
     );
+
+    let kinds: Vec<ShellEventKind> = shell_events.iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        [ShellEventKind::CommandStart, ShellEventKind::CommandEnd],
+        "shell 事件顺序错误: {kinds:?}"
+    );
+    assert_eq!(shell_events[0].id.as_deref(), Some("cmd-1"), "C 应携带 id");
+    assert_eq!(shell_events[0].code, None, "C 不应携带退出码");
+    assert_eq!(shell_events[1].code, Some(7), "D 应携带退出码 7");
+    assert_eq!(shell_events[1].id.as_deref(), Some("cmd-1"), "D 应携带 id");
     assert!(
         matches!(terminal, Some(ProcEvent::Exited(0))),
-        "fallback 应收到退出码 0，实际 {terminal:?}"
+        "探针应正常退出，实际 {terminal:?}"
     );
+}
+
+/// helper_path 不可用：直接失败，不回退 fallback。
+#[test]
+fn helper_path_failure_fails_directly() {
+    let Some(mut config) = skip() else {
+        return;
+    };
+    config.helper_path = Some("/nonexistent/termx-helper".to_string());
+
+    let request = SshConnectRequest::exec("sh -c 'echo hello_no_fallback; exit 0'", 80, 24);
+    let error = SshSession::connect(&config, request)
+        .expect_err("helper 不可用时应直接失败，而不是回退 fallback");
+    match error {
+        termx_ssh::SshError::InjectionFailed { path, .. } => {
+            assert_eq!(path, "/nonexistent/termx-helper");
+        }
+        other => panic!("应为 InjectionFailed，实际 {other:?}"),
+    }
 }
 
 /// 非上传模式：会话结束后不得删除用户配置的 `helper_path`。
@@ -462,9 +621,9 @@ fn helper_path_is_never_deleted() {
     );
 }
 
-/// sha256 不符：不上传 helper，回退 fallback，且不产生临时目录。
+/// sha256 不符：直接失败，不上传 helper，也不产生临时目录。
 #[test]
-fn helper_sha_mismatch_falls_back() {
+fn helper_sha_mismatch_fails_directly() {
     let _guard = lock_helper_uploads();
     let Some(mut config) = helper_config() else {
         return;
@@ -473,38 +632,20 @@ fn helper_sha_mismatch_falls_back() {
     let plain = fallback_config(&config);
     let before = list_temp_dirs(&plain);
 
-    let request = SshConnectRequest::exec("sh -c 'echo hello_sha_fallback; exit 0'", 80, 24);
-    let (session, mut events) =
-        SshSession::connect(&config, request).expect("sha 不符时的 fallback 连接失败");
-
-    let capabilities = session.capabilities();
-    assert!(!capabilities.helper, "sha 不符时不应启用 helper");
-    assert!(capabilities.best_effort, "sha 不符时应回退 bestEffort");
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("测试运行时");
-    let mut output = Vec::new();
-    let terminal = collect_until_terminal(
-        &runtime,
-        &mut events,
-        Some(&mut output),
-        Instant::now() + WAIT,
-    );
-    assert!(
-        String::from_utf8_lossy(&output).contains("hello_sha_fallback"),
-        "sha 不符回退后仍应可执行，实际 {} 字节",
-        output.len()
-    );
-    assert!(
-        matches!(terminal, Some(ProcEvent::Exited(0))),
-        "sha 不符回退应收到退出码 0，实际 {terminal:?}"
-    );
+    let request = SshConnectRequest::exec("sh -c 'echo hello_sha_should_not_run; exit 0'", 80, 24);
+    let error = SshSession::connect(&config, request)
+        .expect_err("sha 不符时应直接失败，而不是回退 fallback");
+    match error {
+        termx_ssh::SshError::InjectionFailed { path, message } => {
+            assert_eq!(path, config.helper_path.clone().unwrap_or_default());
+            assert!(message.contains("sha256"), "原因应说明摘要不符: {message}");
+        }
+        other => panic!("应为 InjectionFailed，实际 {other:?}"),
+    }
     assert_no_new_temp_dirs(&plain, &before);
 }
 
-/// 版本不匹配：握手失败后清理临时目录并回退 fallback。
+/// 版本不匹配：握手失败后回退 fallback（安装的脚本保留，不删除）。
 #[test]
 fn helper_version_mismatch_falls_back_and_cleans_up() {
     let _guard = lock_helper_uploads();
@@ -521,6 +662,13 @@ fn helper_version_mismatch_falls_back_and_cleans_up() {
     .expect("写入伪造 helper");
     config.helper_local_path = Some(script.to_string_lossy().to_string());
     config.upload_helper = true;
+    // 上传模式必须给出安装目标与本次授权，否则缺少 helper_path 会直接失败。
+    config.helper_path = Some(test_helper_path("version"));
+    config.injection = InjectionPlan {
+        consent: InjectionConsentMode::Allow,
+        allow: true,
+        ..Default::default()
+    };
     let plain = fallback_config(&config);
 
     let before = list_temp_dirs(&plain);

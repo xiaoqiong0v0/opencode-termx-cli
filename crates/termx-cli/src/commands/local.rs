@@ -47,10 +47,25 @@ fn build_params(
     args: &LocalArgs,
     root_session_id: &str,
 ) -> Result<CreateParams, CliError> {
+    let runtime_id = cli.runtime.clone();
+    if runtime_id.is_some() && (args.cmd.is_some() || !args.args.is_empty()) {
+        return Err(CliError::Usage(
+            "--runtime 与 --cmd/参数不能同时使用".to_string(),
+        ));
+    }
+    // 选内置 runtime 时让服务端完全按 manifest 解析 cmd/args；这里只清空请求值。
+    let (cmd, cmd_args) = if runtime_id.is_some() {
+        (String::new(), Vec::new())
+    } else {
+        (
+            args.cmd.clone().unwrap_or_else(default_shell),
+            args.args.clone(),
+        )
+    };
     Ok(CreateParams {
         mode: Mode::Pty,
-        cmd: args.cmd.clone().unwrap_or_else(default_shell),
-        args: args.args.clone(),
+        cmd,
+        args: cmd_args,
         cwd: args.cwd.clone(),
         env: parse_env(&args.env)?,
         cols: Some(args.cols),
@@ -60,6 +75,8 @@ fn build_params(
         force: cli.force,
         idle_timeout: build_idle_timeout(args),
         ssh: None,
+        allow_injection: false,
+        runtime_id,
     })
 }
 
@@ -158,5 +175,77 @@ fn default_shell() -> String {
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "/bin/sh".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Command, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS};
+
+    /// 构造只用于 `build_params` 的 CLI；其余字段取默认值。
+    fn make_cli(runtime: Option<&str>, cmd: Option<&str>, args: Vec<&str>) -> Cli {
+        Cli {
+            root_session_id: None,
+            name: None,
+            force: false,
+            config_dir: None,
+            token: None,
+            endpoint: None,
+            runtime: runtime.map(str::to_string),
+            json: false,
+            command: Command::Local(LocalArgs {
+                cmd: cmd.map(str::to_string),
+                cwd: None,
+                env: Vec::new(),
+                cols: DEFAULT_PTY_COLS,
+                rows: DEFAULT_PTY_ROWS,
+                idle_timeout: None,
+                idle_action: None,
+                follow: false,
+                args: args.into_iter().map(str::to_string).collect(),
+            }),
+        }
+    }
+
+    /// 从命令行取出 local 参数，避免测试里重复解构。
+    fn local_args(cli: &Cli) -> &LocalArgs {
+        match &cli.command {
+            Command::Local(args) => args,
+            _ => unreachable!("测试只构造 local"),
+        }
+    }
+
+    #[test]
+    fn runtime_is_forwarded_and_cmd_args_are_cleared() {
+        let cli = make_cli(Some("termx-pwsh"), None, Vec::new());
+        let params = build_params(&cli, local_args(&cli), "ses-1").expect("参数应构造成功");
+        assert_eq!(params.runtime_id.as_deref(), Some("termx-pwsh"));
+        assert!(params.cmd.is_empty(), "内置 runtime 不应带 cmd");
+        assert!(params.args.is_empty(), "内置 runtime 不应带 args");
+    }
+
+    #[test]
+    fn runtime_conflicts_with_custom_cmd_or_args() {
+        let cli = make_cli(Some("termx-pwsh"), Some("cmd.exe"), Vec::new());
+        assert!(matches!(
+            build_params(&cli, local_args(&cli), "ses-1"),
+            Err(CliError::Usage(_))
+        ));
+
+        let cli = make_cli(Some("termx-pwsh"), None, vec!["-NoLogo"]);
+        assert!(matches!(
+            build_params(&cli, local_args(&cli), "ses-1"),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn no_runtime_keeps_legacy_cmd_behavior() {
+        let cli = make_cli(None, Some("cmd.exe"), vec!["/Q"]);
+        let params = build_params(&cli, local_args(&cli), "ses-1").expect("参数应构造成功");
+        assert_eq!(params.runtime_id, None);
+        assert_eq!(params.cmd, "cmd.exe");
+        assert_eq!(params.args, vec!["/Q".to_string()]);
     }
 }

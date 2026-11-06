@@ -1,19 +1,24 @@
-//! SSH helper 分发、握手与协议驱动（M6b-2）。
+//! SSH helper 预检、持久安装、握手与协议驱动（远端注入阶段一）。
 //!
 //! 流程（全部在已认证的 SSH 连接上完成）：
-//! 1. 需要上传时，远端 `mktemp -d` 创建唯一的私有目录（700），把本地 helper
-//!    写入目录内的固定文件名，`chmod 700` 并用 `sha256sum` 校验；
-//! 2. 以 `exec` 启动 `<helper> serve`，经 stdin/stdout 走 JSON Lines 协议；
-//! 3. 完成 `hello` / `hello_ok` 与 `spawn` / `started` 握手，得到远端 pid/pgid；
-//! 4. 成功则进入 helper 驱动；任一步失败返回错误，由调用方关闭通道并回退 fallback。
+//! 1. `upload_helper=false`：只读预检 `helper_path`（目录/文件/摘要/可执行），
+//!    有效直接使用；缺失/不符/不可写一律报 `InjectionFailed` 直接失败，不回退；
+//! 2. `upload_helper=true`：先只读预检安装目标（不 mkdir、不写），已存在且校验
+//!    通过则直接复用；需要写入时按 [`InjectionPlan`] 决策（deny/ask/allow）；
+//! 3. 持久安装：`mkdir -p -m 700` 父目录 → 同目录 `mktemp` → 上传 → `sha256sum`
+//!    校验 → `chmod 700` → 旧文件 `mv` 为 `.old.<ts>` → `mv` 原子替换；
+//! 4. 以 `exec` 启动 `<helper> serve`，完成 `hello`/`spawn` 握手；
+//! 5. 路径/权限/安装/写入失败均报 `InjectionFailed`，由调用方直接失败；
+//!    仅 helper 协议/版本/握手错误允许回退 fallback。
 //!
 //! 安全约定：
 //! - 密码/口令只存在于内存，不进入命令行；上传/校验命令只拼接路径与十六进制摘要；
-//! - 上传只写本次 `mktemp -d` 创建的目录，绝不覆盖/删除用户配置的 `helper_path`；
-//! - 本次创建的目录在失败、握手前超时/取消、会话终态或断连时只 `rm -rf` 该目录。
+//! - 只写配置的安装目标与同目录临时文件；不删除已安装文件，旧文件改名为
+//!   `.old.<ts>` 保留；`consent_required` 时不创建目录、不写任何文件；
+//! - 注入失败消息只包含目标路径与原因，不含 token/密码。
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::mpsc::{Sender, channel},
     time::Duration,
 };
@@ -26,9 +31,12 @@ use russh::{
 use sha2::{Digest, Sha256};
 use termx_proc::{OutputStream, ProcEvent};
 use termx_protocol::{
-    Capabilities, HELPER_PROTOCOL_VERSION, ProcNode, SshConfig, Stream,
+    Capabilities, HELPER_PROTOCOL_VERSION, InjectionConsent, InjectionConsentMode,
+    InjectionPathError, InjectionPlan, InjectionWrite, InjectionWriteAction, InjectionWriteKind,
+    InjectionWriteReason, ProcNode, SHELL_EVENTS_CAPABILITY, SshConfig, Stream, expand_home,
     helper::{HelperEvent, HelperRequest},
-    to_json,
+    shell_events::ShellEventKind,
+    to_json, validate_path_spec,
 };
 use tokio::sync::mpsc;
 
@@ -50,98 +58,59 @@ pub(crate) const HELPER_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 同步 `tree()` 等待远端响应的上限。
 pub(crate) const TREE_WAIT: Duration = Duration::from_millis(2000);
 
-/// 远端临时目录模板；`mktemp -d` 会替换尾部 `X`，目录名便于测试核对。
-const REMOTE_TEMP_TEMPLATE: &str = "/tmp/termx-helper.XXXXXXXXXX";
+/// 同目录临时文件名模板；`mktemp` 会替换尾部 `X`。
+const REMOTE_TEMP_TEMPLATE: &str = ".termx-helper.XXXXXXXXXX";
 
-/// 上传到临时目录内的固定文件名。
-const REMOTE_HELPER_FILE: &str = "termx-helper";
+/// 同目录临时文件前缀；清理时据此再次校验路径归属。
+const REMOTE_TEMP_PREFIX: &str = ".termx-helper.";
 
 /// 未知信号编号的占位值；`termx-core` 会把它映射为 `"UNKNOWN"`。
 const UNKNOWN_SIGNAL: i32 = 0;
 
-/// 本次上传创建的远端目录。
+/// 远端路径预检结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UploadedHelper {
-    /// 由 `mktemp -d` 创建并校验过格式的目录。
-    dir: String,
-    /// 目录内的 helper 文件绝对路径。
-    file: String,
+struct RemotePrecheck {
+    /// 目标类型。
+    kind: RemotePathKind,
+    /// 是否为可执行文件。
+    executable: bool,
+    /// 文件 sha256（小写）；非文件或读取失败时为 `None`。
+    sha256: Option<String>,
+    /// 最近存在的祖先目录是否可写。
+    parent_writable: bool,
 }
 
-impl UploadedHelper {
-    /// 从目录拼出固定文件名。
-    fn new(dir: String) -> Self {
-        let file = format!("{}/{REMOTE_HELPER_FILE}", dir.trim_end_matches('/'));
-        Self { dir, file }
-    }
-
-    /// helper 可执行文件路径。
-    fn command(&self) -> &str {
-        &self.file
-    }
-}
-
-/// 上传阶段的清理守卫：持有连接句柄与本次创建的目录。
-///
-/// 正常路径通过 [`UploadGuard::into_parts`] 交出句柄与目录；失败路径先显式
-/// `cleanup()`，取消/超时导致 future 被丢弃时由 `Drop` 把句柄移入后台任务
-/// 完成清理与断开，避免远端临时目录残留。
-struct UploadGuard {
-    /// 已认证连接；`None` 表示已交出或已转入清理任务。
-    handle: Option<client::Handle<HostKeyPolicy>>,
-    /// 本次创建的目录；`None` 表示未上传或已清理。
-    uploaded: Option<UploadedHelper>,
-}
-
-impl UploadGuard {
-    /// 用连接句柄与可选上传目录创建守卫。
-    fn new(handle: client::Handle<HostKeyPolicy>, uploaded: Option<UploadedHelper>) -> Self {
-        Self {
-            handle: Some(handle),
-            uploaded,
-        }
-    }
-
-    /// 借用连接句柄；守卫存活期间始终可用。
-    fn handle(&self) -> &client::Handle<HostKeyPolicy> {
-        self.handle
-            .as_ref()
-            .expect("UploadGuard 持有连接句柄直到 into_parts")
-    }
-
-    /// 显式清理本次目录；失败只记日志。
-    async fn cleanup(&mut self) {
-        if let (Some(handle), Some(uploaded)) = (self.handle.as_ref(), self.uploaded.as_ref()) {
-            cleanup_uploaded(handle, uploaded).await;
-        }
-        self.uploaded = None;
-    }
-
-    /// 交出连接句柄与仍待会话结束时清理的目录。
-    fn into_parts(mut self) -> (client::Handle<HostKeyPolicy>, Option<UploadedHelper>) {
-        let handle = self.handle.take().expect("UploadGuard 只能交出一次句柄");
-        let uploaded = self.uploaded.take();
-        (handle, uploaded)
+impl RemotePrecheck {
+    /// 目标是否已存在（含目录/其他类型）。
+    fn exists(&self) -> bool {
+        !matches!(self.kind, RemotePathKind::Missing)
     }
 }
 
-impl Drop for UploadGuard {
-    fn drop(&mut self) {
-        let (Some(handle), Some(uploaded)) = (self.handle.take(), self.uploaded.take()) else {
-            return;
-        };
-        // 只有仍在 tokio 运行时内才可能派发清理；运行期退出时只能放弃。
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(dir = %uploaded.dir, "运行时已关闭，无法清理远端临时 helper 目录");
-            return;
-        };
-        runtime.spawn(async move {
-            cleanup_uploaded(&handle, &uploaded).await;
-            let _ = handle
-                .disconnect(russh::Disconnect::ByApplication, "", "")
-                .await;
-        });
-    }
+/// 预检得到的远端路径类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePathKind {
+    /// 不存在。
+    Missing,
+    /// 普通文件。
+    File,
+    /// 目录。
+    Directory,
+    /// 其他类型（符号链接指向目录、设备等）。
+    Other,
+}
+
+/// 是否需要写入的决策结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionDecision {
+    /// 已存在且校验通过，直接复用。
+    Reuse,
+    /// 按计划持久安装。
+    Install,
+    /// 需要用户授权。
+    ConsentRequired,
+    /// 不允许/无法写入；直接失败，不回退 fallback。
+    Unavailable,
 }
 
 /// helper 会话：已握手并完成 `spawn`。
@@ -154,10 +123,12 @@ pub(crate) struct HelperSession {
     pub(crate) pgid: u32,
     /// helper 协议版本（`hello_ok.proto`）。
     pub(crate) proto: String,
+    /// helper 是否声明 `shell_events` 能力（`hello_ok.capabilities`）。
+    pub(crate) events_supported: bool,
+    /// 本次会话是否实际建立带外事件通道（`started.events`）。
+    pub(crate) events_active: bool,
     /// 握手期间提前读到的会话事件（输出等）。
     pub(crate) pending: Vec<HelperEvent>,
-    /// 本次创建的远端临时目录；仅用于结束/失败时清理。
-    pub(crate) uploaded: Option<UploadedHelper>,
 }
 
 impl HelperSession {
@@ -167,143 +138,532 @@ impl HelperSession {
             helper: true,
             version: self.proto.clone(),
             best_effort: false,
+            runtime_catalog: false,
         }
+    }
+
+    /// 带外事件通道是否真正生效：能力已声明且本次 `started.events=true`。
+    pub(crate) fn shell_events_active(&self) -> bool {
+        self.events_supported && self.events_active
+    }
+}
+
+/// 构造注入失败错误：只带目标路径与原因，不含任何凭据。
+fn injection_failed(path: &str, message: impl Into<String>) -> SshError {
+    SshError::InjectionFailed {
+        path: path.to_string(),
+        message: message.into(),
+    }
+}
+
+/// 把安装阶段的任意错误归并为指向目标的注入失败。
+fn injection_error_at(target: &str, error: SshError) -> SshError {
+    match error {
+        SshError::InjectionFailed { .. } => error,
+        other => injection_failed(target, other.to_string()),
     }
 }
 
 /// 在已认证连接上尝试建立 helper 会话。
 ///
-/// 返回 `Ok((连接句柄, helper 会话))` 继续驱动；失败时把连接句柄一并返回，
-/// 调用方可在同一连接上回退 fallback。上传/握手期间的临时目录由
-/// [`UploadGuard`] 负责清理（失败显式清理，取消/超时由 `Drop` 兜底）。
+/// 返回 `Ok((连接句柄, helper 会话))` 继续驱动；失败时把连接句柄一并返回。
+/// `ConsentRequired` 与 `InjectionFailed` 表示不能回退 fallback：前者需要用户
+/// 授权，后者是路径/权限/安装/写入失败，调用方都必须原样上报。
 ///
 /// # 错误
-/// 上传/校验失败、exec 失败、握手超时或版本不符、`spawn` 失败时返回错误。
+/// 参数非法返回 `BadRequest`；需要授权返回 `ConsentRequired`；预检失败、
+/// 不可写、拒绝写入、安装/写入失败返回 `InjectionFailed`；握手/版本/`spawn`
+/// 失败返回对应的可回退错误。
 pub(crate) async fn bootstrap(
     handle: client::Handle<HostKeyPolicy>,
     config: &SshConfig,
     request: &SshConnectRequest,
 ) -> Result<(client::Handle<HostKeyPolicy>, HelperSession), (client::Handle<HostKeyPolicy>, SshError)>
 {
-    if !config.upload_helper {
-        // 远端已存在模式：只校验/使用 helper_path，不写远端任何文件。
-        let command = match config.helper_path.as_deref() {
-            Some(path) if !path.trim().is_empty() => path,
-            _ => {
+    let spec = match helper_target(config) {
+        Ok(spec) => spec,
+        Err(error) => return Err((handle, error)),
+    };
+    let home = if spec.starts_with("~/") {
+        match remote_home(&handle, &spec).await {
+            Ok(home) => Some(home),
+            Err(error) => return Err((handle, error)),
+        }
+    } else {
+        None
+    };
+    let target = match resolve_target(&spec, home.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return Err((handle, error)),
+    };
+
+    // 上传模式：本地读取/摘要校验没有远端副作用，失败可直接返回。
+    let (bytes, digest) = if config.upload_helper {
+        let Some(local_path) = config.helper_local_path.as_deref() else {
+            return Err((
+                handle,
+                SshError::BadRequest("upload_helper=true 但缺少 helper_local_path".to_string()),
+            ));
+        };
+        let bytes = match tokio::fs::read(local_path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
                 return Err((
                     handle,
-                    SshError::BadRequest("未配置 helper_path，无法启用 helper 模式".to_string()),
+                    injection_failed(&target, format!("读取本地 helper 失败: {error}")),
                 ));
             }
         };
-        let expected = configured_sha(config);
-        if let Some(expected) = expected.as_deref() {
-            if let Err(error) = verify_remote(&handle, command, expected).await {
-                return Err((handle, error));
+        let digest = sha256_hex(&bytes);
+        if let Some(expected) = configured_sha(config) {
+            if expected != digest {
+                return Err((
+                    handle,
+                    injection_failed(&target, "本地 helper sha256 与 helper_sha256 不一致"),
+                ));
             }
         }
-        return match open_and_spawn(&handle, command, request).await {
-            Ok((channel, proto, pid, pgid, pending)) => Ok((
-                handle,
-                HelperSession {
-                    channel,
-                    pid,
-                    pgid,
-                    proto,
-                    pending,
-                    uploaded: None,
-                },
-            )),
+        (Some(bytes), Some(digest))
+    } else {
+        (None, configured_sha(config))
+    };
+
+    // 写前只读预检：目录/文件/摘要/可执行检查，绝不 mkdir/写。
+    let precheck = match precheck_remote(&handle, &target).await {
+        Ok(precheck) => precheck,
+        Err(error) => return Err((handle, error)),
+    };
+
+    if helper_usable(&precheck, digest.as_deref()) {
+        return match open_and_spawn(&handle, &target, request).await {
+            Ok(spawned) => Ok((handle, helper_session(spawned))),
             Err(error) => Err((handle, error)),
         };
     }
 
-    // 上传模式：本地读取/摘要校验没有远端副作用，失败可直接返回。
-    let Some(local_path) = config.helper_local_path.as_deref() else {
+    // 只读模式无法写入：不可用即直接失败，不回退 fallback。
+    if !config.upload_helper {
         return Err((
             handle,
-            SshError::BadRequest("upload_helper=true 但缺少 helper_local_path".to_string()),
+            injection_failed(&target, precheck_problem(&precheck, digest.as_deref())),
         ));
-    };
-    let bytes = match tokio::fs::read(local_path).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    }
+    if matches!(
+        precheck.kind,
+        RemotePathKind::Directory | RemotePathKind::Other
+    ) {
+        return Err((
+            handle,
+            injection_failed(&target, precheck_problem(&precheck, digest.as_deref())),
+        ));
+    }
+    if !precheck.parent_writable {
+        return Err((handle, injection_failed(&target, "目标目录不可写")));
+    }
+
+    match injection_decision(&config.injection, true) {
+        InjectionDecision::Install => {}
+        InjectionDecision::ConsentRequired => {
+            let write = injection_write(
+                &target,
+                &precheck,
+                digest.as_deref(),
+                bytes.as_ref().map(Vec::len),
+            );
             return Err((
                 handle,
-                SshError::Connect {
-                    message: format!("读取本地 helper 失败: {error}"),
-                },
+                SshError::ConsentRequired(InjectionConsent {
+                    host: config.host.clone(),
+                    user: config.user.clone(),
+                    writes: vec![write],
+                }),
             ));
         }
-    };
-    let digest = sha256_hex(&bytes);
-    if let Some(expected) = configured_sha(config) {
-        if expected != digest {
+        InjectionDecision::Unavailable | InjectionDecision::Reuse => {
             return Err((
                 handle,
-                SshError::BadRequest("本地 helper sha256 与 helper_sha256 不一致".to_string()),
+                injection_failed(&target, "注入计划拒绝写入（consent=deny）"),
             ));
         }
     }
 
-    // 先创建唯一私有目录，创建成功后的任何失败/取消都由守卫清理。
-    let dir = match create_temp_dir(&handle).await {
-        Ok(dir) => dir,
-        Err(error) => return Err((handle, error)),
+    let (Some(bytes), Some(digest)) = (bytes.as_deref(), digest.as_deref()) else {
+        return Err((
+            handle,
+            SshError::BadRequest("upload_helper=true 但未读取到本地 helper".to_string()),
+        ));
     };
-    let mut guard = UploadGuard::new(handle, Some(UploadedHelper::new(dir)));
-    let remote = guard
-        .uploaded
-        .as_ref()
-        .expect("UploadGuard 刚由目录构造")
-        .clone();
-    let command = remote.command().to_string();
-    let step = async {
-        match tokio::time::timeout(
-            HELPER_STEP_TIMEOUT,
-            upload(guard.handle(), &remote.file, &bytes),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(SshError::Connect {
-                    message: format!("上传 helper 超过 {} 秒", HELPER_STEP_TIMEOUT.as_secs()),
-                });
-            }
-        }
-        verify_remote(guard.handle(), &remote.file, &digest).await?;
-        chmod_exec(guard.handle(), &remote.file).await
-    }
-    .await;
-    if let Err(error) = step {
-        guard.cleanup().await;
-        let (handle, _) = guard.into_parts();
+    if let Err(error) = install_helper(&handle, &target, bytes, digest).await {
         return Err((handle, error));
     }
 
-    let opened = open_and_spawn(guard.handle(), &command, request).await;
-    match opened {
-        Ok((channel, proto, pid, pgid, pending)) => {
-            let (handle, uploaded) = guard.into_parts();
-            Ok((
-                handle,
-                HelperSession {
-                    channel,
-                    pid,
-                    pgid,
-                    proto,
-                    pending,
-                    uploaded,
-                },
-            ))
-        }
-        Err(error) => {
-            guard.cleanup().await;
-            let (handle, _) = guard.into_parts();
-            Err((handle, error))
+    match open_and_spawn(&handle, &target, request).await {
+        Ok(spawned) => Ok((handle, helper_session(spawned))),
+        Err(error) => Err((handle, error)),
+    }
+}
+
+/// 把 `spawn` 结果转成会话；不再持有任何远端临时文件。
+fn helper_session(spawned: SpawnOutcome) -> HelperSession {
+    HelperSession {
+        channel: spawned.channel,
+        pid: spawned.pid,
+        pgid: spawned.pgid,
+        proto: spawned.proto,
+        events_supported: spawned.events_supported,
+        events_active: spawned.events_active,
+        pending: spawned.pending,
+    }
+}
+
+/// 解析 helper 安装目标：显式 `helper_path` 优先，其次计划里的 `helper`。
+fn helper_target(config: &SshConfig) -> Result<String, SshError> {
+    let spec = config
+        .helper_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .or_else(|| {
+            config
+                .injection
+                .helper
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+        })
+        .ok_or_else(|| {
+            SshError::BadRequest(
+                "未配置 helper 安装路径（helper_path 或注入计划的 helper）".to_string(),
+            )
+        })?;
+    validate_path_spec(spec)
+        .map_err(|error| SshError::BadRequest(format!("helper 路径非法: {error}")))?;
+    if spec.ends_with('/') {
+        return Err(SshError::BadRequest(
+            "helper 安装路径必须是文件路径，不能以 / 结尾".to_string(),
+        ));
+    }
+    Ok(spec.to_string())
+}
+
+/// 用远端 HOME 展开 `~/...`；绝对路径原样返回。
+fn resolve_target(spec: &str, home: Option<&str>) -> Result<String, SshError> {
+    if !spec.starts_with("~/") {
+        return Ok(spec.to_string());
+    }
+    let Some(home) = home else {
+        return Err(injection_failed(spec, "无法解析远端 HOME"));
+    };
+    expand_home(spec, home).map_err(|error| match error {
+        InjectionPathError::InvalidHome => injection_failed(spec, "远端 HOME 非法"),
+        other => SshError::BadRequest(format!("helper 路径非法: {other}")),
+    })
+}
+
+/// 读取远端用户 HOME；优先 `$HOME`，缺失时用登录 shell 的 `~` 展开。
+async fn remote_home(
+    handle: &client::Handle<HostKeyPolicy>,
+    spec: &str,
+) -> Result<String, SshError> {
+    let (code, stdout) = exec_step(handle, "printf '%s' \"$HOME\"", "读取远端 HOME").await?;
+    let home = String::from_utf8_lossy(&stdout).trim().to_string();
+    if code.unwrap_or(0) == 0 && !home.is_empty() {
+        return Ok(home);
+    }
+
+    let (code, stdout) = exec_step(handle, "cd ~ && pwd", "解析远端 HOME").await?;
+    let home = String::from_utf8_lossy(&stdout).trim().to_string();
+    if code.unwrap_or(0) == 0 && !home.is_empty() {
+        return Ok(home);
+    }
+    Err(injection_failed(spec, "无法解析远端 HOME"))
+}
+
+/// 只读预检远端目标；任何远程命令失败都视为注入失败（直接失败）。
+async fn precheck_remote(
+    handle: &client::Handle<HostKeyPolicy>,
+    path: &str,
+) -> Result<RemotePrecheck, SshError> {
+    let script = precheck_script(path);
+    let (code, stdout) = exec_script(handle, &script, "预检 helper").await?;
+    if code.unwrap_or(0) != 0 {
+        return Err(injection_failed(
+            path,
+            format!("预检失败（退出码 {}）", code.unwrap_or(-1)),
+        ));
+    }
+    Ok(parse_precheck_output(&String::from_utf8_lossy(&stdout)))
+}
+
+/// 预检脚本：只读 `test` / `sha256sum`，不创建任何目录或文件。
+fn precheck_script(path: &str) -> String {
+    format!(
+        r#"p={path}
+if [ -d "$p" ]; then echo kind=dir
+elif [ -f "$p" ]; then echo kind=file
+elif [ -e "$p" ]; then echo kind=other
+else echo kind=missing
+fi
+if [ -x "$p" ]; then echo exec=1; else echo exec=0; fi
+if [ -f "$p" ]; then h=$(sha256sum "$p" 2>/dev/null | awk '{{print $1}}'); echo "sha=$h"; fi
+d=$(dirname "$p")
+while [ ! -e "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do d=$(dirname "$d"); done
+if [ -d "$d" ] && [ -w "$d" ]; then echo writable=1; else echo writable=0; fi
+"#,
+        path = shell_quote(path)
+    )
+}
+
+/// 解析预检输出；未知/缺失的键使用安全默认值。
+fn parse_precheck_output(output: &str) -> RemotePrecheck {
+    let mut kind = RemotePathKind::Missing;
+    let mut executable = false;
+    let mut sha256 = None;
+    let mut parent_writable = false;
+    for line in output.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        match key {
+            "kind" => {
+                kind = match value {
+                    "file" => RemotePathKind::File,
+                    "dir" => RemotePathKind::Directory,
+                    "other" => RemotePathKind::Other,
+                    _ => RemotePathKind::Missing,
+                };
+            }
+            "exec" => executable = value == "1",
+            "writable" => parent_writable = value == "1",
+            "sha" if !value.is_empty() => sha256 = Some(value.to_ascii_lowercase()),
+            _ => {}
         }
     }
+    RemotePrecheck {
+        kind,
+        executable,
+        sha256,
+        parent_writable,
+    }
+}
+
+/// 目标是否已存在且满足使用条件。
+fn helper_usable(precheck: &RemotePrecheck, expected_sha: Option<&str>) -> bool {
+    precheck.kind == RemotePathKind::File
+        && precheck.executable
+        && expected_sha.is_none_or(|expected| precheck.sha256.as_deref() == Some(expected))
+}
+
+/// 生成预检失败的可读原因（只含路径相关事实，不含凭据）。
+fn precheck_problem(precheck: &RemotePrecheck, expected_sha: Option<&str>) -> String {
+    match precheck.kind {
+        RemotePathKind::Missing => "目标路径不存在且当前不允许写入".to_string(),
+        RemotePathKind::Directory => "目标路径是目录".to_string(),
+        RemotePathKind::Other => "目标路径不是普通文件".to_string(),
+        RemotePathKind::File if !precheck.executable => "目标文件不可执行".to_string(),
+        RemotePathKind::File => match expected_sha {
+            Some(expected) if precheck.sha256.as_deref() != Some(expected) => {
+                "目标文件 sha256 与 helper_sha256 不一致".to_string()
+            }
+            _ if !precheck.parent_writable => "目标目录不可写".to_string(),
+            _ => "目标文件不可复用".to_string(),
+        },
+    }
+}
+
+/// 按 plan 决策：复用/安装/需要授权/不可用。
+fn injection_decision(plan: &InjectionPlan, needs_write: bool) -> InjectionDecision {
+    if !needs_write {
+        return InjectionDecision::Reuse;
+    }
+    match plan.consent {
+        InjectionConsentMode::Deny => InjectionDecision::Unavailable,
+        InjectionConsentMode::Ask if !plan.allow => InjectionDecision::ConsentRequired,
+        InjectionConsentMode::Ask | InjectionConsentMode::Allow => InjectionDecision::Install,
+    }
+}
+
+/// 构造 `consent_required` 的单条写入描述。
+fn injection_write(
+    target: &str,
+    precheck: &RemotePrecheck,
+    digest: Option<&str>,
+    size: Option<usize>,
+) -> InjectionWrite {
+    let action = if precheck.exists() {
+        InjectionWriteAction::Replace
+    } else {
+        InjectionWriteAction::Install
+    };
+    let reason = match precheck.kind {
+        RemotePathKind::Missing => InjectionWriteReason::Missing,
+        RemotePathKind::File if !precheck.executable => InjectionWriteReason::NotExecutable,
+        _ => InjectionWriteReason::ChecksumMismatch,
+    };
+    InjectionWrite {
+        kind: InjectionWriteKind::Helper,
+        action,
+        reason,
+        path: target.to_string(),
+        size: size.map(|size| size as u64),
+        sha256: digest.map(str::to_string),
+    }
+}
+
+/// 同目录临时文件是否由本模块创建（路径归属 + 前缀 + 无控制字符）。
+fn is_safe_temp_file(temp: &str, parent: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
+    let prefix = if parent.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{parent}/")
+    };
+    if !temp.starts_with(&prefix) {
+        return false;
+    }
+    let name = &temp[prefix.len()..];
+    !name.is_empty()
+        && name.starts_with(REMOTE_TEMP_PREFIX)
+        && name.len() > REMOTE_TEMP_PREFIX.len()
+        && !temp.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        && !temp.split('/').any(|component| component == "..")
+}
+
+/// 安装目标文件的父目录；目标必须是文件路径（由 `helper_target` 保证）。
+fn parent_dir(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// 持久安装：mkdir 700 → 同目录 mktemp → 上传 → sha256 → chmod → 备份旧文件 → 原子替换。
+async fn install_helper(
+    handle: &client::Handle<HostKeyPolicy>,
+    target: &str,
+    bytes: &[u8],
+    digest: &str,
+) -> Result<(), SshError> {
+    let parent = parent_dir(target);
+    let mkdir = format!("mkdir -p -m 700 {}", shell_quote(&parent));
+    let (code, _) = exec_step(handle, &mkdir, "创建注入目录")
+        .await
+        .map_err(|error| injection_error_at(target, error))?;
+    if code.unwrap_or(0) != 0 {
+        return Err(injection_failed(
+            target,
+            format!(
+                "创建注入目录失败（退出码 {}）: {parent}",
+                code.unwrap_or(-1)
+            ),
+        ));
+    }
+
+    let template = format!("{}/{}", parent.trim_end_matches('/'), REMOTE_TEMP_TEMPLATE);
+    let command = format!("mktemp {}", shell_quote(&template));
+    let (code, stdout) = exec_step(handle, &command, "创建临时文件")
+        .await
+        .map_err(|error| injection_error_at(target, error))?;
+    if code.unwrap_or(0) != 0 {
+        return Err(injection_failed(
+            target,
+            format!(
+                "创建临时文件失败（退出码 {}）: {parent}",
+                code.unwrap_or(-1)
+            ),
+        ));
+    }
+    let temp = String::from_utf8_lossy(&stdout).trim().to_string();
+    if !is_safe_temp_file(&temp, &parent) {
+        tracing::warn!(temp = %temp, parent = %parent, "mktemp 返回了非预期的临时路径，拒绝继续");
+        return Err(injection_failed(target, "mktemp 返回了非预期的临时路径"));
+    }
+
+    let installed = async {
+        upload(handle, &temp, bytes)
+            .await
+            .map_err(|error| injection_error_at(target, error))?;
+        verify_remote(handle, &temp, digest)
+            .await
+            .map_err(|error| injection_error_at(target, error))?;
+        chmod_exec(handle, &temp)
+            .await
+            .map_err(|error| injection_error_at(target, error))?;
+        replace_target(handle, target, &temp).await
+    }
+    .await;
+    if let Err(error) = installed {
+        // 失败只清理本次同目录临时文件；绝不删除已安装目标或旧备份。
+        remove_temp(handle, &temp, &parent).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 备份已存在的目标并以 `mv` 原子替换为新文件。
+async fn replace_target(
+    handle: &client::Handle<HostKeyPolicy>,
+    target: &str,
+    temp: &str,
+) -> Result<(), SshError> {
+    let script = format!(
+        r#"set -e
+p={target}
+t={temp}
+if [ -e "$p" ]; then
+  base="$p.old.$(date -u +%Y%m%d%H%M%S)"
+  dest="$base"
+  i=1
+  while [ -e "$dest" ]; do dest="$base.$i"; i=$((i+1)); done
+  mv "$p" "$dest"
+fi
+mv "$t" "$p"
+"#,
+        target = shell_quote(target),
+        temp = shell_quote(temp)
+    );
+    let (code, _) = exec_script(handle, &script, "安装 helper")
+        .await
+        .map_err(|error| injection_error_at(target, error))?;
+    if code.unwrap_or(0) != 0 {
+        return Err(injection_failed(
+            target,
+            format!("替换 helper 失败（退出码 {}）", code.unwrap_or(-1)),
+        ));
+    }
+    Ok(())
+}
+
+/// 删除本次创建的临时文件；路径不匹配时只记日志。
+async fn remove_temp(handle: &client::Handle<HostKeyPolicy>, temp: &str, parent: &str) {
+    if !is_safe_temp_file(temp, parent) {
+        tracing::warn!(temp = %temp, "拒绝清理非本次创建的临时路径");
+        return;
+    }
+    let command = format!("rm -f {}", shell_quote(temp));
+    let cleaned = tokio::time::timeout(HELPER_STEP_TIMEOUT, exec_collect(handle, &command)).await;
+    if !matches!(cleaned, Ok(Ok((Some(0), _)))) {
+        tracing::debug!(temp = %temp, "清理临时 helper 文件未确认成功");
+    }
+}
+
+/// `open_and_spawn` 的结果：已握手的通道、进程信息与事件通道状态。
+struct SpawnOutcome {
+    /// 协议通道。
+    channel: HelperChannel,
+    /// helper 协议版本。
+    proto: String,
+    /// 远端根进程 ID。
+    pid: u32,
+    /// 远端进程组 ID。
+    pgid: u32,
+    /// `spawn` 之后、`started` 之前提前到达的事件。
+    pending: Vec<HelperEvent>,
+    /// helper 是否声明 `shell_events` 能力。
+    events_supported: bool,
+    /// 本次会话是否实际建立带外事件通道。
+    events_active: bool,
 }
 
 /// 打开 helper 通道、`exec serve`、握手并 `spawn`；失败时关闭通道。
@@ -311,7 +671,7 @@ async fn open_and_spawn(
     handle: &client::Handle<HostKeyPolicy>,
     command: &str,
     request: &SshConnectRequest,
-) -> Result<(HelperChannel, String, u32, u32, Vec<HelperEvent>), SshError> {
+) -> Result<SpawnOutcome, SshError> {
     let channel = handle
         .channel_open_session()
         .await
@@ -323,14 +683,23 @@ async fn open_and_spawn(
     let mut helper_channel = HelperChannel::new(channel);
 
     let handshake_result = async {
-        let proto = handshake(&mut helper_channel).await?;
-        let (pid, pgid, pending) = spawn_session(&mut helper_channel, request).await?;
-        Ok::<_, SshError>((proto, pid, pgid, pending))
+        let (proto, events_supported) = handshake(&mut helper_channel).await?;
+        let (pid, pgid, pending, events_active) =
+            spawn_session(&mut helper_channel, request, events_supported).await?;
+        Ok::<_, SshError>((proto, events_supported, pid, pgid, pending, events_active))
     }
     .await;
 
     match handshake_result {
-        Ok((proto, pid, pgid, pending)) => Ok((helper_channel, proto, pid, pgid, pending)),
+        Ok((proto, events_supported, pid, pgid, pending, events_active)) => Ok(SpawnOutcome {
+            channel: helper_channel,
+            proto,
+            pid,
+            pgid,
+            pending,
+            events_supported,
+            events_active,
+        }),
         Err(error) => {
             helper_channel.close().await;
             Err(error)
@@ -347,37 +716,6 @@ fn configured_sha(config: &SshConfig) -> Option<String> {
         .filter(|sha| !sha.is_empty())
 }
 
-/// 远端 `mktemp -d` 创建唯一私有目录并返回路径。
-///
-/// 目录模板固定在 `/tmp`，返回后立即 `chmod 700`；输出必须是绝对路径且不含
-/// 空白/控制字符，否则视为远端异常并拒绝继续。
-async fn create_temp_dir(handle: &client::Handle<HostKeyPolicy>) -> Result<String, SshError> {
-    let command = format!("mktemp -d {REMOTE_TEMP_TEMPLATE}");
-    let (code, stdout) = exec_step(handle, &command, "mktemp -d").await?;
-    if code.unwrap_or(0) != 0 {
-        return Err(SshError::Connect {
-            message: format!("创建远端临时目录失败（退出码 {}）", code.unwrap_or(-1)),
-        });
-    }
-    let dir = String::from_utf8_lossy(&stdout).trim().to_string();
-    if !is_safe_temp_dir(&dir) {
-        return Err(SshError::Connect {
-            message: format!("远端 mktemp 返回非法目录: {dir:?}"),
-        });
-    }
-    let uploaded = UploadedHelper::new(dir);
-    let command = format!("chmod 700 {}", shell_quote(&uploaded.dir));
-    let (code, _) = exec_step(handle, &command, "chmod 700").await?;
-    if code.unwrap_or(0) != 0 {
-        // 目录已创建但权限设置失败：立即清理，避免返回错误后残留。
-        cleanup_uploaded(handle, &uploaded).await;
-        return Err(SshError::Connect {
-            message: format!("设置临时目录权限失败（退出码 {}）", code.unwrap_or(-1)),
-        });
-    }
-    Ok(uploaded.dir)
-}
-
 /// 带单步超时执行命令；超时与错误都转成可回退的 `Connect` 错误。
 async fn exec_step(
     handle: &client::Handle<HostKeyPolicy>,
@@ -392,24 +730,26 @@ async fn exec_step(
     }
 }
 
-/// 校验 `mktemp -d` 返回目录的形状：`/tmp/termx-helper.` 前缀、无空白/控制字符。
-fn is_safe_temp_dir(dir: &str) -> bool {
-    dir.starts_with("/tmp/termx-helper.")
-        && dir.len() > "/tmp/termx-helper.".len()
-        && !dir.chars().any(|ch| ch.is_whitespace() || ch.is_control())
-        && !dir.contains("..")
+/// 以 `sh -c` 执行脚本；单引号包裹整个脚本，避免远端登录 shell 二次解释。
+async fn exec_script(
+    handle: &client::Handle<HostKeyPolicy>,
+    script: &str,
+    stage: &str,
+) -> Result<(Option<i32>, Vec<u8>), SshError> {
+    let command = format!("sh -c {}", shell_quote(script));
+    exec_step(handle, &command, stage).await
 }
 
-/// 上传本地字节到本次创建的私有目录内固定文件名。
+/// 上传本地字节到同目录临时文件。
 ///
-/// `set -C`（noclobber）拒绝覆盖已存在路径；目录权限 700 且由 `mktemp -d`
-/// 新建，配合 `umask 077` 与随后的 `chmod 700` 限制访问。
+/// 目标由 `mktemp` 唯一创建，直接截断写入；`umask 077` 与随后的 `chmod 700`
+/// 限制访问。
 async fn upload(
     handle: &client::Handle<HostKeyPolicy>,
     remote: &str,
     bytes: &[u8],
 ) -> Result<(), SshError> {
-    let inner = format!("set -C; umask 077; cat > {}", shell_quote(remote));
+    let inner = format!("umask 077; cat > {}", shell_quote(remote));
     let command = format!("sh -c {}", shell_quote(&inner));
     let channel = handle
         .channel_open_session()
@@ -519,29 +859,13 @@ async fn drain_exit_status(read: &mut ChannelReadHalf) -> Result<Option<i32>, Ss
     Ok(exit)
 }
 
-/// 只删除本次 `mktemp -d` 创建的目录；失败只记日志。
-///
-/// 清理前再次校验目录形状，避免把非本模块创建的路径交给 `rm -rf`；
-/// 用户配置的 `helper_path` 永不在此路径上，也不会被删除。
-async fn cleanup_uploaded(handle: &client::Handle<HostKeyPolicy>, uploaded: &UploadedHelper) {
-    if !is_safe_temp_dir(&uploaded.dir) {
-        tracing::warn!(dir = %uploaded.dir, "拒绝清理非本次创建的远端目录");
-        return;
-    }
-    let command = format!("rm -rf -- {}", shell_quote(&uploaded.dir));
-    let cleaned = tokio::time::timeout(HELPER_STEP_TIMEOUT, exec_collect(handle, &command)).await;
-    if !matches!(cleaned, Ok(Ok((Some(0), _)))) {
-        tracing::debug!(dir = %uploaded.dir, "清理远端临时 helper 目录未确认成功");
-    }
-}
-
-/// helper 启动命令：`helper_path` 已在校验阶段保证为不含空白的路径，按单一路径引用。
+/// helper 启动命令：安装路径已在校验阶段保证为不含空白/控制字符，按单一路径引用。
 fn helper_invocation(path: &str) -> String {
     format!("{} serve", shell_quote(path.trim()))
 }
 
-/// 完成 `hello` / `hello_ok` 握手，返回 helper 协议版本。
-async fn handshake(channel: &mut HelperChannel) -> Result<String, SshError> {
+/// 完成 `hello` / `hello_ok` 握手，返回 helper 协议版本与 `shell_events` 能力。
+async fn handshake(channel: &mut HelperChannel) -> Result<(String, bool), SshError> {
     channel
         .send(&HelperRequest::Hello {
             proto: HELPER_PROTOCOL_VERSION.to_string(),
@@ -555,11 +879,17 @@ async fn handshake(channel: &mut HelperChannel) -> Result<String, SshError> {
             .next_event_until(deadline, "waiting hello_ok")
             .await?;
         match event {
-            HelperEvent::HelloOk { proto, .. } => {
+            HelperEvent::HelloOk {
+                proto,
+                capabilities,
+            } => {
                 if proto != HELPER_PROTOCOL_VERSION {
                     return Err(SshError::BadRequest(format!("helper 协议不匹配: {proto}")));
                 }
-                return Ok(proto);
+                let supported = capabilities
+                    .iter()
+                    .any(|capability| capability == SHELL_EVENTS_CAPABILITY);
+                return Ok((proto, supported));
             }
             HelperEvent::Error { code, message } => {
                 return Err(SshError::BadRequest(format!(
@@ -571,12 +901,15 @@ async fn handshake(channel: &mut HelperChannel) -> Result<String, SshError> {
     }
 }
 
-/// 发送 `spawn` 并等待 `started`；返回 pid/pgid 与提前到达的事件。
+/// 发送 `spawn` 并等待 `started`；返回 pid/pgid、提前到达的事件与事件通道状态。
 async fn spawn_session(
     channel: &mut HelperChannel,
     request: &SshConnectRequest,
-) -> Result<(u32, u32, Vec<HelperEvent>), SshError> {
-    channel.send(&spawn_request(request)).await?;
+    events_supported: bool,
+) -> Result<(u32, u32, Vec<HelperEvent>, bool), SshError> {
+    channel
+        .send(&spawn_request(request, events_supported))
+        .await?;
 
     let deadline = tokio::time::Instant::now() + HELPER_STEP_TIMEOUT;
     let mut pending = Vec::new();
@@ -585,7 +918,9 @@ async fn spawn_session(
             .next_event_until(deadline, "waiting started")
             .await?;
         match event {
-            HelperEvent::Started { pid, pgid } => return Ok((pid, pgid, pending)),
+            HelperEvent::Started { pid, pgid, events } => {
+                return Ok((pid, pgid, pending, events && events_supported));
+            }
             HelperEvent::Error { code, message } => {
                 return Err(SshError::BadRequest(format!(
                     "helper spawn 失败: {code:?} {message}"
@@ -596,8 +931,46 @@ async fn spawn_session(
     }
 }
 
+/// 远端 PTY 缺失 `TERM` 时的默认值；与 xterm.js 前端声明的 256 色能力一致。
+///
+/// 远端 TERM 为空时，PSReadLine 等行编辑器会退化为逐键处理（输入 `ls`
+/// 显示为 `lsls`），补全/历史/预测同时失效。
+const DEFAULT_REMOTE_TERM: &str = "xterm-256color";
+
+/// 在 helper `spawn` 的环境覆盖表中补齐 `TERM`。
+///
+/// - 调用方显式提供非空 `TERM`（含 `dumb`）时原样保留；
+/// - 缺失或空值才注入 `term`，`term` 本身为空时回退
+///   [`DEFAULT_REMOTE_TERM`]。
+///
+/// `TERM=dumb` 视为用户显式选择，不在本层覆盖；该值会让行编辑/补全等能力
+/// 退化，兼容性风险由调用方承担。
+///
+/// 只在 helper 模式使用；fallback 由 SSH `pty-req` 的 term 字段携带。
+fn with_default_term(
+    env: Option<BTreeMap<String, String>>,
+    term: &str,
+) -> Option<BTreeMap<String, String>> {
+    let mut env = env.unwrap_or_default();
+    let explicit = env
+        .get("TERM")
+        .is_some_and(|value| !value.trim().is_empty());
+    if !explicit {
+        let term = if term.trim().is_empty() {
+            DEFAULT_REMOTE_TERM
+        } else {
+            term.trim()
+        };
+        env.insert("TERM".to_string(), term.to_string());
+    }
+    Some(env)
+}
+
 /// 把 `terminal.create` 的请求翻译为 helper `spawn`。
-fn spawn_request(request: &SshConnectRequest) -> HelperRequest {
+///
+/// 只有 helper 声明了 `shell_events` 能力且请求本身需要事件时才置
+/// `events=true`；旧 helper 不下发该字段，保持原有行为。
+fn spawn_request(request: &SshConnectRequest, events_supported: bool) -> HelperRequest {
     let (cmd, args) = match &request.program {
         Some(program) => (program.cmd.clone(), program.args.clone()),
         None => match &request.mode {
@@ -612,9 +985,10 @@ fn spawn_request(request: &SshConnectRequest) -> HelperRequest {
         cmd,
         args,
         cwd: request.cwd.clone(),
-        env: request.env.clone(),
+        env: with_default_term(request.env.clone(), &request.term),
         cols: Some(request.cols),
         rows: Some(request.rows),
+        events: events_supported && request.events,
     }
 }
 
@@ -725,12 +1099,9 @@ impl HelperChannel {
     }
 }
 
-/// 调用方已放弃时关闭 helper 通道、清理本次临时目录并断开连接。
+/// 调用方已放弃时关闭 helper 通道并断开连接。
 pub(crate) async fn abort(handle: &client::Handle<HostKeyPolicy>, mut session: HelperSession) {
     session.channel.close().await;
-    if let Some(uploaded) = session.uploaded.as_ref() {
-        cleanup_uploaded(handle, uploaded).await;
-    }
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "")
         .await;
@@ -816,9 +1187,6 @@ pub(crate) async fn drive(
     }
 
     helper.channel.close().await;
-    if let Some(uploaded) = helper.uploaded.as_ref() {
-        cleanup_uploaded(&handle, uploaded).await;
-    }
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "")
         .await;
@@ -869,6 +1237,32 @@ async fn handle_event(
         HelperEvent::Error { code, message } => {
             tracing::warn!(?code, %message, "helper 返回错误事件");
             false
+        }
+        HelperEvent::ShellEvent {
+            event,
+            code,
+            id,
+            command,
+            started_at_ms,
+            ended_at_ms,
+        } => {
+            let Some(kind) = ShellEventKind::parse(&event) else {
+                tracing::warn!(%event, "helper 返回未知 shell 事件，已忽略");
+                return false;
+            };
+            events
+                .send(ProcEvent::ShellEvent(
+                    termx_protocol::shell_events::ShellEvent {
+                        kind,
+                        code,
+                        id,
+                        command,
+                        started_at_ms,
+                        ended_at_ms,
+                    },
+                ))
+                .await
+                .is_err()
         }
         HelperEvent::HelloOk { .. } | HelperEvent::Started { .. } => false,
     }
@@ -954,24 +1348,248 @@ pub(crate) fn tree_channel() -> (
 mod tests {
     use super::*;
 
+    /// 注入失败必须带目标路径与原因，且不能混入凭据。
     #[test]
-    fn temp_dir_shape_is_checked_before_use_and_cleanup() {
-        assert!(is_safe_temp_dir("/tmp/termx-helper.abc123"));
-        for unsafe_dir in [
-            "/tmp/termx-helper.",
-            "/tmp/other.abc123",
-            "/tmp/termx-helper.abc 123",
-            "/tmp/termx-helper.../etc",
-            "relative/termx-helper.abc",
+    fn injection_failed_carries_path_and_reason_only() {
+        let error = injection_failed("/home/alice/.termx/bin/termx-helper", "目标目录不可写");
+        match &error {
+            SshError::InjectionFailed { path, message } => {
+                assert_eq!(path, "/home/alice/.termx/bin/termx-helper");
+                assert_eq!(message, "目标目录不可写");
+            }
+            other => panic!("应为 InjectionFailed，实际 {other:?}"),
+        }
+        let text = error.to_string();
+        assert!(text.contains("/home/alice/.termx/bin/termx-helper"));
+        assert!(!text.contains("password"));
+    }
+
+    /// deny 与不可写场景都归类为注入失败，不允许回退 fallback。
+    #[test]
+    fn unavailable_decision_is_injection_failure() {
+        assert_eq!(
+            injection_decision(
+                &InjectionPlan {
+                    consent: InjectionConsentMode::Deny,
+                    allow: false,
+                    ..InjectionPlan::default()
+                },
+                true,
+            ),
+            InjectionDecision::Unavailable
+        );
+        let precheck = RemotePrecheck {
+            kind: RemotePathKind::Missing,
+            executable: false,
+            sha256: None,
+            parent_writable: false,
+        };
+        assert!(precheck_problem(&precheck, None).contains("不存在"));
+    }
+
+    #[test]
+    fn temp_file_shape_is_checked_before_cleanup() {
+        assert!(is_safe_temp_file(
+            "/home/alice/.termx/bin/.termx-helper.abc123",
+            "/home/alice/.termx/bin"
+        ));
+        for (temp, parent) in [
+            (
+                "/home/alice/.termx/bin/.termx-helper.",
+                "/home/alice/.termx/bin",
+            ),
+            ("/tmp/.termx-helper.abc123", "/home/alice/.termx/bin"),
+            (
+                "/home/alice/.termx/bin/termx-helper",
+                "/home/alice/.termx/bin",
+            ),
+            (
+                "/home/alice/.termx/bin/.termx-helper.abc 123",
+                "/home/alice/.termx/bin",
+            ),
+            (
+                "/home/alice/.termx/bin/../.termx-helper.x",
+                "/home/alice/.termx/bin",
+            ),
         ] {
-            assert!(!is_safe_temp_dir(unsafe_dir), "应拒绝 {unsafe_dir:?}");
+            assert!(!is_safe_temp_file(temp, parent), "应拒绝 {temp:?}");
         }
     }
 
     #[test]
-    fn uploaded_helper_uses_fixed_file_name() {
-        let uploaded = UploadedHelper::new("/tmp/termx-helper.abc123".to_string());
-        assert_eq!(uploaded.command(), "/tmp/termx-helper.abc123/termx-helper");
+    fn parent_dir_handles_root_and_nested_paths() {
+        assert_eq!(parent_dir("/termx-helper"), "/");
+        assert_eq!(
+            parent_dir("/home/alice/.termx/bin/termx-helper"),
+            "/home/alice/.termx/bin"
+        );
+    }
+
+    #[test]
+    fn precheck_output_parses_safe_defaults() {
+        let parsed = parse_precheck_output("kind=file\nexec=1\nsha=ABCDEF\nwritable=1\n");
+        assert_eq!(parsed.kind, RemotePathKind::File);
+        assert!(parsed.executable);
+        assert_eq!(parsed.sha256.as_deref(), Some("abcdef"));
+        assert!(parsed.parent_writable);
+
+        let missing = parse_precheck_output("kind=missing\nexec=0\nwritable=0\n");
+        assert_eq!(missing.kind, RemotePathKind::Missing);
+        assert!(!missing.executable);
+        assert!(missing.sha256.is_none());
+        assert!(!missing.parent_writable);
+
+        let garbage = parse_precheck_output("garbage\nkind=weird\n");
+        assert_eq!(garbage.kind, RemotePathKind::Missing);
+    }
+
+    #[test]
+    fn usable_helper_requires_file_exec_and_expected_sha() {
+        let file = RemotePrecheck {
+            kind: RemotePathKind::File,
+            executable: true,
+            sha256: Some("abc".to_string()),
+            parent_writable: true,
+        };
+        assert!(helper_usable(&file, None));
+        assert!(helper_usable(&file, Some("abc")));
+        assert!(!helper_usable(&file, Some("def")));
+
+        let not_exec = RemotePrecheck {
+            executable: false,
+            ..file.clone()
+        };
+        assert!(!helper_usable(&not_exec, None));
+
+        let dir = RemotePrecheck {
+            kind: RemotePathKind::Directory,
+            ..file
+        };
+        assert!(!helper_usable(&dir, None));
+    }
+
+    #[test]
+    fn injection_decision_follows_plan() {
+        let mut plan = InjectionPlan::default();
+        assert_eq!(injection_decision(&plan, false), InjectionDecision::Reuse);
+        assert_eq!(
+            injection_decision(&plan, true),
+            InjectionDecision::ConsentRequired,
+            "默认 ask + 未授权"
+        );
+
+        plan.consent = InjectionConsentMode::Allow;
+        assert_eq!(injection_decision(&plan, true), InjectionDecision::Install);
+
+        plan.consent = InjectionConsentMode::Ask;
+        plan.allow = true;
+        assert_eq!(injection_decision(&plan, true), InjectionDecision::Install);
+
+        plan.allow = false;
+        plan.consent = InjectionConsentMode::Deny;
+        assert_eq!(
+            injection_decision(&plan, true),
+            InjectionDecision::Unavailable
+        );
+    }
+
+    #[test]
+    fn injection_write_describes_target_state() {
+        let missing = RemotePrecheck {
+            kind: RemotePathKind::Missing,
+            executable: false,
+            sha256: None,
+            parent_writable: true,
+        };
+        let write = injection_write(
+            "/home/alice/.termx/bin/termx-helper",
+            &missing,
+            Some("abc"),
+            Some(3),
+        );
+        assert_eq!(write.kind, InjectionWriteKind::Helper);
+        assert_eq!(write.action, InjectionWriteAction::Install);
+        assert_eq!(write.reason, InjectionWriteReason::Missing);
+        assert_eq!(write.size, Some(3));
+
+        let stale = RemotePrecheck {
+            kind: RemotePathKind::File,
+            executable: true,
+            sha256: Some("def".to_string()),
+            parent_writable: true,
+        };
+        let write = injection_write("/x", &stale, Some("abc"), None);
+        assert_eq!(write.action, InjectionWriteAction::Replace);
+        assert_eq!(write.reason, InjectionWriteReason::ChecksumMismatch);
+
+        let not_exec = RemotePrecheck {
+            executable: false,
+            ..stale
+        };
+        let write = injection_write("/x", &not_exec, Some("abc"), None);
+        assert_eq!(write.reason, InjectionWriteReason::NotExecutable);
+    }
+
+    #[test]
+    fn helper_target_and_resolve_prefer_explicit_path() {
+        let mut config = SshConfig {
+            host: "h".to_string(),
+            port: 22,
+            user: "u".to_string(),
+            auth: termx_protocol::SshAuth::Password {
+                password: "p".to_string(),
+            },
+            helper_path: Some("~/.termx/bin/termx-helper".to_string()),
+            helper_local_path: None,
+            helper_sha256: None,
+            upload_helper: false,
+            accept_any_host_key: true,
+            injection: InjectionPlan {
+                helper: Some("/ignored/helper".to_string()),
+                ..InjectionPlan::default()
+            },
+        };
+        assert_eq!(
+            helper_target(&config).expect("显式 helper_path 优先"),
+            "~/.termx/bin/termx-helper"
+        );
+        assert_eq!(
+            resolve_target("~/.termx/bin/termx-helper", Some("/home/alice")).expect("应展开"),
+            "/home/alice/.termx/bin/termx-helper"
+        );
+        assert_eq!(
+            resolve_target("/opt/helper", None).expect("绝对路径无需 HOME"),
+            "/opt/helper"
+        );
+        assert!(matches!(
+            resolve_target("~/x", None),
+            Err(SshError::InjectionFailed { path, message })
+                if path == "~/x" && message.contains("HOME")
+        ));
+
+        config.helper_path = None;
+        assert_eq!(
+            helper_target(&config).expect("回退 plan"),
+            "/ignored/helper"
+        );
+
+        config.injection.helper = None;
+        assert!(matches!(
+            helper_target(&config),
+            Err(SshError::BadRequest(message)) if message.contains("安装路径")
+        ));
+
+        config.helper_path = Some("relative/helper".to_string());
+        assert!(matches!(
+            helper_target(&config),
+            Err(SshError::BadRequest(message)) if message.contains("路径非法")
+        ));
+
+        config.helper_path = Some("/opt/dir/".to_string());
+        assert!(matches!(
+            helper_target(&config),
+            Err(SshError::BadRequest(message)) if message.contains("文件路径")
+        ));
     }
 
     #[test]
@@ -1000,5 +1618,135 @@ mod tests {
         assert_eq!(signal_number("BOGUS"), None);
         assert_eq!(signal_number("SIG31"), Some(31));
         assert_eq!(signal_number("15"), Some(15));
+    }
+
+    /// 只有 helper 声明能力且请求需要事件时，`spawn.events` 才为 `true`。
+    #[test]
+    fn spawn_requests_events_only_when_supported_and_requested() {
+        let mut request = SshConnectRequest::from_create(crate::SHELL_EVENT_PROGRAM, &[], 80, 24);
+        request.events = true;
+        assert!(matches!(
+            spawn_request(&request, true),
+            HelperRequest::Spawn { events: true, .. }
+        ));
+        assert!(matches!(
+            spawn_request(&request, false),
+            HelperRequest::Spawn { events: false, .. }
+        ));
+
+        request.events = false;
+        assert!(matches!(
+            spawn_request(&request, true),
+            HelperRequest::Spawn { events: false, .. }
+        ));
+    }
+
+    /// 取出 `spawn` 的环境覆盖表，断言确实带上了 env。
+    fn spawn_env(request: &SshConnectRequest) -> BTreeMap<String, String> {
+        match spawn_request(request, false) {
+            HelperRequest::Spawn { env: Some(env), .. } => env,
+            other => panic!("应为带 env 的 spawn，实际 {other:?}"),
+        }
+    }
+
+    /// 缺失的 TERM 用默认值补齐，不改变其他环境项。
+    #[test]
+    fn spawn_request_injects_default_term_when_absent() {
+        let env = spawn_env(&SshConnectRequest::shell(80, 24));
+        assert_eq!(
+            env.get("TERM").map(String::as_str),
+            Some(DEFAULT_REMOTE_TERM)
+        );
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("LANG".to_string(), "C.UTF-8".to_string());
+        let request = SshConnectRequest::shell(80, 24).with_working_dir(None, Some(overrides));
+        let env = spawn_env(&request);
+        assert_eq!(
+            env.get("TERM").map(String::as_str),
+            Some(DEFAULT_REMOTE_TERM)
+        );
+        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+    }
+
+    /// 空 TERM 值视同未设置；用户显式 TERM 必须原样保留。
+    #[test]
+    fn spawn_request_keeps_explicit_term() {
+        let mut empty = BTreeMap::new();
+        empty.insert("TERM".to_string(), "  ".to_string());
+        let request = SshConnectRequest::shell(80, 24).with_working_dir(None, Some(empty));
+        assert_eq!(
+            spawn_env(&request).get("TERM").map(String::as_str),
+            Some(DEFAULT_REMOTE_TERM)
+        );
+
+        for term in ["screen-256color", "dumb"] {
+            let mut explicit = BTreeMap::new();
+            explicit.insert("TERM".to_string(), term.to_string());
+            let request = SshConnectRequest::shell(80, 24).with_working_dir(None, Some(explicit));
+            assert_eq!(
+                spawn_env(&request).get("TERM").map(String::as_str),
+                Some(term)
+            );
+        }
+
+        // 未显式给 env 时，使用请求自身的 term（构造器默认即 xterm-256color）。
+        let mut request = SshConnectRequest::shell(80, 24);
+        request.term = "vt100".to_string();
+        assert_eq!(
+            spawn_env(&request).get("TERM").map(String::as_str),
+            Some("vt100")
+        );
+    }
+
+    /// helper 的 `shell_event` 帧转发为 `ProcEvent::ShellEvent`，未知事件被忽略。
+    #[tokio::test]
+    async fn shell_events_map_to_proc_events() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut tree_waiters = VecDeque::new();
+        let terminal = handle_event(
+            HelperEvent::ShellEvent {
+                event: "D".to_string(),
+                code: Some(7),
+                id: Some("cmd-1".to_string()),
+                command: Some("echo hi".to_string()),
+                started_at_ms: Some(1_700_000_000_000),
+                ended_at_ms: Some(1_700_000_001_000),
+            },
+            &tx,
+            &mut tree_waiters,
+        )
+        .await;
+        assert!(!terminal, "shell 事件不是终态");
+        assert_eq!(
+            rx.recv().await,
+            Some(ProcEvent::ShellEvent(
+                termx_protocol::shell_events::ShellEvent {
+                    kind: ShellEventKind::CommandEnd,
+                    code: Some(7),
+                    id: Some("cmd-1".to_string()),
+                    command: Some("echo hi".to_string()),
+                    started_at_ms: Some(1_700_000_000_000),
+                    ended_at_ms: Some(1_700_000_001_000),
+                }
+            ))
+        );
+
+        assert!(
+            !handle_event(
+                HelperEvent::ShellEvent {
+                    event: "Z".to_string(),
+                    code: None,
+                    id: None,
+                    command: None,
+                    started_at_ms: None,
+                    ended_at_ms: None,
+                },
+                &tx,
+                &mut tree_waiters,
+            )
+            .await
+        );
+        assert!(rx.try_recv().is_err(), "未知事件不应转发");
     }
 }

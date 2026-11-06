@@ -33,6 +33,8 @@ fn params(root_session_id: &str, name: &str, idle_timeout: Option<IdleTimeout>) 
         force: false,
         idle_timeout,
         ssh: None,
+        allow_injection: false,
+        runtime_id: None,
     }
 }
 

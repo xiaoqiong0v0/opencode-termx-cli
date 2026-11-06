@@ -79,6 +79,63 @@ fn expect_error(response: Response, code: ErrorCode) {
     assert_eq!(response.error.expect("缺少 error").code, code);
 }
 
+/// Web 资源必须包含远端注入授权流程（静态检查，不启动 SSH）。
+#[test]
+fn web_assets_expose_remote_injection_consent() {
+    let app = include_str!("../src/web_assets/app.js");
+    let index = include_str!("../src/web_assets/index.html");
+    assert!(
+        app.contains("consent_required"),
+        "app.js 应处理 consent_required"
+    );
+    assert!(
+        app.contains("allow_injection"),
+        "app.js 重试应附带 allow_injection"
+    );
+    assert!(
+        index.contains("termx-consent-dialog"),
+        "index.html 应包含远端注入确认弹窗"
+    );
+}
+
+/// SSH 创建表单：运行环境下拉、helper 字段移除、回环主机默认信任。
+#[test]
+fn web_ssh_form_converges_runtime_and_helper_fields() {
+    let app = include_str!("../src/web_assets/app.js");
+    let index = include_str!("../src/web_assets/index.html");
+
+    assert!(
+        index.contains("termx-create-ssh-runtime"),
+        "index.html 应提供 SSH 运行环境下拉"
+    );
+    assert!(
+        index.contains("termx-pwsh") && index.contains("系统 shell"),
+        "运行环境应只有 termx-pwsh 与系统 shell"
+    );
+    for removed in [
+        "termx-create-helper-path",
+        "termx-create-upload-helper",
+        "termx-create-helper-local",
+        "termx-create-helper-sha",
+        "termx-create-ssh-cmd",
+    ] {
+        assert!(!index.contains(removed), "index.html 不应再包含 {removed}");
+    }
+
+    assert!(
+        app.contains("params.cmd") && app.contains("\"termx-pwsh\""),
+        "app.js 应把 termx-pwsh 映射为 cmd"
+    );
+    assert!(
+        !app.contains("helper_local_path = ") && !app.contains("upload_helper:"),
+        "app.js 不应再传 helper_* 字段"
+    );
+    assert!(
+        app.contains("isLoopbackHost") && app.contains("127.0.0.1") && app.contains("::1"),
+        "app.js 应对回环主机自动勾选 accept-any-host-key"
+    );
+}
+
 #[tokio::test]
 async fn admin_can_create_web_terminal_and_read_launch_info() {
     let dir = tempdir().expect("创建临时目录失败");

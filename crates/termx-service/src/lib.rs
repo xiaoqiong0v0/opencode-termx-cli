@@ -14,13 +14,16 @@ pub mod cli;
 mod config;
 mod lock;
 pub mod logging;
+mod marker;
 mod server;
+pub mod shell_events;
 mod web;
 
 pub use cli::{CliError, Command, ServiceArgs, USAGE};
 pub use config::{
     ClientIdlePolicy, DEFAULT_CLIENT_IDLE_TIMEOUT, DEFAULT_EVENT_BUFFER_CAPACITY,
-    DEFAULT_IDLE_TICK_INTERVAL, DEFAULT_LOG_MAX_DAYS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_SESSION_TTL,
-    PORT_FILE_NAME, SERVICE_LOCK_FILE_NAME, ServiceConfig, TOKEN_FILE_NAME,
+    DEFAULT_IDLE_TICK_INTERVAL, DEFAULT_LOG_MAX_DAYS, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_REMOTE_INJECTION_ROOT, DEFAULT_SESSION_TTL, PORT_FILE_NAME, RemoteInjectionConfig,
+    RemoteInjectionPaths, SERVICE_LOCK_FILE_NAME, ServiceConfig, TOKEN_FILE_NAME,
 };
 pub use server::{Service, ServiceError};

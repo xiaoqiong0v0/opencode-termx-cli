@@ -510,6 +510,7 @@ fn handle_text(inner: &Inner, text: &str) -> bool {
                 message: "连接级错误缺少 error 字段".to_string(),
                 retryable: false,
                 terminal_id: None,
+                injection: None,
             });
             inner.set_connection_error(error);
             return false;
@@ -649,6 +650,7 @@ fn protocol_error(code: ErrorCode, message: impl Into<String>) -> ClientError {
         message: message.into(),
         retryable: false,
         terminal_id: None,
+        injection: None,
     })
 }
 

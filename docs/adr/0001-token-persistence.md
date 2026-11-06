@@ -2,7 +2,7 @@
 
 - 状态：已采纳
 - 日期：2026-11-02
-- 关联：`docs/PROTOCOL.md` §3、`crates/termx-service/src/config.rs`
+- 关联：`docs/specs/PROTOCOL.md` §3、`crates/termx-service/src/config.rs`
 
 ## 背景
 

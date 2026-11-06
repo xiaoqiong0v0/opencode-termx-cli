@@ -1,13 +1,13 @@
 //! `termx-helper` 的 stdio sidecar 服务端实现。
 //!
-//! 协议见 `docs/PROTOCOL.md` §11：
+//! 协议见 `docs/specs/PROTOCOL.md` §11：
 //! - stdin 每行一个 [`HelperRequest`]，首帧必须是 `hello`；
 //! - stdout 每行一个 [`HelperEvent`]，**只承载协议 JSON**；
 //! - 日志一律写 stderr（tracing）；
 //! - 同一时刻只维护一个 PTY 会话，`spawn` 会先清理上一会话；
 //! - stdin EOF 或进程退出前终止整棵进程树，确保无孤儿。
 //!
-//! 线程边界见 `docs/ASYNC.md`：stdin 请求循环、PTY 事件转发任务、stdout 写任务
+//! 线程边界见 `docs/specs/ASYNC.md`：stdin 请求循环、PTY 事件转发任务、stdout 写任务
 //! 三者相互独立；所有可能阻塞的 PTY 操作都经 `spawn_blocking` 执行。
 
 use std::collections::BTreeMap;
@@ -18,7 +18,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use termx_proc::{OutputStream, ProcError, ProcEvent, PtyConfig, PtySession};
 use termx_protocol::helper::{HELPER_CAPABILITIES, HelperEvent, HelperRequest};
+use termx_protocol::shell_events::ShellEvent;
 use termx_protocol::{ErrorCode, HELPER_PROTOCOL_VERSION, ProcNode, Stream, to_json};
+#[cfg(unix)]
+use termx_shell_events::{EVENT_ENDPOINT_ENV, EVENT_TOKEN_ENV};
+use termx_shell_events::{ShellEventCancel, ShellEventChannel};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -183,6 +187,8 @@ struct SpawnSpec {
     cols: Option<u16>,
     /// 行数。
     rows: Option<u16>,
+    /// 是否请求带外 shell 事件通道。
+    events: bool,
 }
 
 /// 单个 helper 会话及其后台转发任务。
@@ -191,6 +197,10 @@ struct HelperState {
     session: Option<PtySession>,
     /// PTY 事件转发任务；随会话创建，会话释放后结束。
     forwarder: Option<JoinHandle<()>>,
+    /// shell 事件通道的取消句柄；drop 时关闭 listener 并清理 socket。
+    shell_events_cancel: Option<ShellEventCancel>,
+    /// 把 shell 事件转成 `HelperEvent::ShellEvent` 的转发任务。
+    shell_events_forwarder: Option<JoinHandle<()>>,
     /// 会话是否仍在运行；由转发任务在事件流结束时置 `false`。
     running: Arc<AtomicBool>,
 }
@@ -201,6 +211,8 @@ impl HelperState {
         Self {
             session: None,
             forwarder: None,
+            shell_events_cancel: None,
+            shell_events_forwarder: None,
             running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -218,6 +230,7 @@ impl HelperState {
                 env,
                 cols,
                 rows,
+                events,
             } => {
                 let spec = SpawnSpec {
                     cmd,
@@ -226,6 +239,7 @@ impl HelperState {
                     env,
                     cols,
                     rows,
+                    events,
                 };
                 self.spawn(spec, out_tx).await;
             }
@@ -249,7 +263,7 @@ impl HelperState {
         }
         self.cleanup().await;
 
-        let config = PtyConfig {
+        let mut config = PtyConfig {
             program: spec.cmd,
             args: spec.args,
             cwd: spec.cwd,
@@ -257,6 +271,7 @@ impl HelperState {
             cols: spec.cols.unwrap_or(DEFAULT_COLS),
             rows: spec.rows.unwrap_or(DEFAULT_ROWS),
         };
+        let event_channel = open_event_channel(spec.events, &mut config.env);
         let spawned = tokio::task::spawn_blocking(move || PtySession::spawn(config)).await;
 
         match spawned {
@@ -264,13 +279,24 @@ impl HelperState {
                 let (pid, pgid) = (session.pid(), session.pgid());
                 self.session = Some(session);
                 self.running.store(true, Ordering::SeqCst);
-                let _ = out_tx.send(HelperEvent::Started { pid, pgid });
+                let events_enabled = event_channel.is_some();
+                let _ = out_tx.send(HelperEvent::Started {
+                    pid,
+                    pgid,
+                    events: events_enabled,
+                });
                 self.forwarder = Some(spawn_forwarder(
                     events,
                     out_tx.clone(),
                     Arc::clone(&self.running),
                 ));
-                debug!(pid, pgid, "PTY 会话已启动");
+                if let Some(channel) = event_channel {
+                    let (receiver, cancel) = channel.split();
+                    self.shell_events_cancel = Some(cancel);
+                    self.shell_events_forwarder =
+                        Some(spawn_shell_event_forwarder(receiver, out_tx.clone()));
+                }
+                debug!(pid, pgid, events = events_enabled, "PTY 会话已启动");
             }
             Ok(Err(err)) => {
                 let (code, message) = map_proc_error(&err);
@@ -326,7 +352,10 @@ impl HelperState {
     /// 句柄本身保留，使重复 `terminate` 仍按幂等路径返回。
     async fn terminate(&mut self, out_tx: &UnboundedSender<HelperEvent>) {
         match session_op(&mut self.session, |session| session.terminate()).await {
-            Ok(()) => self.running.store(false, Ordering::SeqCst),
+            Ok(()) => {
+                self.running.store(false, Ordering::SeqCst);
+                self.stop_shell_events().await;
+            }
             Err(err) => self.report(err, out_tx),
         }
     }
@@ -379,7 +408,16 @@ impl HelperState {
         if let Some(forwarder) = self.forwarder.take() {
             let _ = forwarder.await;
         }
+        self.stop_shell_events().await;
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// 关闭 shell 事件 listener、等待转发任务退出；Unix socket 随之清理。
+    async fn stop_shell_events(&mut self) {
+        drop(self.shell_events_cancel.take());
+        if let Some(forwarder) = self.shell_events_forwarder.take() {
+            let _ = forwarder.await;
+        }
     }
 }
 
@@ -409,6 +447,70 @@ where
     }
 }
 
+/// 按请求创建 shell 事件通道并把 endpoint/token 注入子进程环境。
+///
+/// 创建失败只降级（`started.events=false`），绝不阻断 spawn。
+#[cfg(unix)]
+fn open_event_channel(
+    requested: bool,
+    env: &mut Option<BTreeMap<String, String>>,
+) -> Option<ShellEventChannel> {
+    if !requested {
+        return None;
+    }
+    match ShellEventChannel::open() {
+        Ok(channel) => {
+            let env = env.get_or_insert_with(BTreeMap::new);
+            env.insert(
+                EVENT_ENDPOINT_ENV.to_string(),
+                channel.endpoint().to_string(),
+            );
+            env.insert(EVENT_TOKEN_ENV.to_string(), channel.token().to_string());
+            Some(channel)
+        }
+        Err(error) => {
+            warn!(%error, "shell 事件通道创建失败，降级为无事件");
+            None
+        }
+    }
+}
+
+/// 非 Unix 暂不提供 helper 侧事件通道；请求只降级。
+#[cfg(not(unix))]
+fn open_event_channel(
+    requested: bool,
+    _env: &mut Option<BTreeMap<String, String>>,
+) -> Option<ShellEventChannel> {
+    if requested {
+        warn!("当前平台暂不支持 helper shell 事件通道，已降级");
+    }
+    None
+}
+
+/// 把通道事件转成 `HelperEvent::ShellEvent` 写入协议输出。
+fn spawn_shell_event_forwarder(
+    mut events: Receiver<ShellEvent>,
+    out_tx: UnboundedSender<HelperEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let _ = out_tx.send(translate_shell_event(event));
+        }
+    })
+}
+
+/// 共享事件类型到 helper 协议的映射。
+fn translate_shell_event(event: ShellEvent) -> HelperEvent {
+    HelperEvent::ShellEvent {
+        event: event.kind.as_str().to_string(),
+        code: event.code,
+        id: event.id,
+        command: event.command,
+        started_at_ms: event.started_at_ms,
+        ended_at_ms: event.ended_at_ms,
+    }
+}
+
 /// 启动 PTY 事件转发任务；事件流结束（会话释放）后清空运行标记。
 fn spawn_forwarder(
     mut events: Receiver<ProcEvent>,
@@ -433,6 +535,15 @@ fn translate_event(event: ProcEvent) -> HelperEvent {
         ProcEvent::Exited(code) => HelperEvent::Exited { code },
         ProcEvent::Signaled(signal) => HelperEvent::Signaled {
             signal: signal_name(signal),
+        },
+        // 本地 PTY 不产生该事件；保留映射以覆盖穷举并让将来的本地通道可直接复用。
+        ProcEvent::ShellEvent(event) => HelperEvent::ShellEvent {
+            event: event.kind.as_str().to_string(),
+            code: event.code,
+            id: event.id,
+            command: event.command,
+            started_at_ms: event.started_at_ms,
+            ended_at_ms: event.ended_at_ms,
         },
     }
 }
@@ -536,6 +647,31 @@ mod tests {
         assert_eq!(signal_name(2), "SIGINT");
         assert_eq!(signal_name(15), "SIGTERM");
         assert_eq!(signal_name(31), "SIG31");
+    }
+
+    #[test]
+    fn shell_events_map_to_protocol_frames() {
+        use termx_protocol::shell_events::ShellEventKind;
+
+        let event = translate_shell_event(ShellEvent {
+            kind: ShellEventKind::CommandEnd,
+            code: Some(7),
+            id: Some("cmd-1".to_string()),
+            command: Some("echo hi".to_string()),
+            started_at_ms: Some(1_700_000_000_000),
+            ended_at_ms: Some(1_700_000_001_000),
+        });
+        assert_eq!(
+            event,
+            HelperEvent::ShellEvent {
+                event: "D".to_string(),
+                code: Some(7),
+                id: Some("cmd-1".to_string()),
+                command: Some("echo hi".to_string()),
+                started_at_ms: Some(1_700_000_000_000),
+                ended_at_ms: Some(1_700_000_001_000),
+            }
+        );
     }
 
     #[test]

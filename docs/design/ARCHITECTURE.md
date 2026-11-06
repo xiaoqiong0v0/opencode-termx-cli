@@ -63,7 +63,7 @@ idle_timeout > 0：按配置仅 detach 或 terminate
 - 多客户端：同一 terminal 可多 attach；输入冲突需定义 owner/lease，至少保证输出广播顺序。
 
 ## 5. 事件状态机
-状态/事件命名以 `docs/PROTOCOL.md` 为唯一权威；此处只述维度关系（三个正交维度）：
+状态/事件命名以 `docs/specs/PROTOCOL.md` 为唯一权威；此处只述维度关系（三个正交维度）：
 
 ```text
 生命周期: created -> running -> exiting -> exited | interrupted | error   (终态唯一)

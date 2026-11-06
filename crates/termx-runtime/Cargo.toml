@@ -1,0 +1,14 @@
+[package]
+name = "termx-runtime"
+description = "termx runtime manifest：本地目录索引、平台过滤与安全解析"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

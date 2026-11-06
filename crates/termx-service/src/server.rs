@@ -22,11 +22,13 @@ use termx_protocol::{
     AttachParams, Capabilities, ClaimParams, CreateParams, DetachParams, ErrorCode, Event,
     EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListItem, ListParams, Mode,
     PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, RebindParams, ReleaseParams, Request,
-    ResizeParams, Response, SendParams, SessionInfo, SessionListParams, SessionListResult,
-    SignalParams, SimpleResult, StatusParams, StatusResult, Stream, SubscribeParams,
-    SubscribeResult, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TerminateParams,
-    TranscriptParams, UnsubscribeParams, WEB_ROOT_SESSION_ID, from_json, to_json,
+    ResizeParams, Response, RuntimeInfo, RuntimeListResult, SendParams, SessionInfo,
+    SessionListParams, SessionListResult, SignalParams, SimpleResult, StatusParams, StatusResult,
+    Stream, SubscribeParams, SubscribeResult, SubscriptionCursor, TerminalLocator,
+    TerminalSnapshot, TerminateParams, TranscriptParams, UnsubscribeParams, WEB_ROOT_SESSION_ID,
+    from_json, to_json,
 };
+use termx_runtime::{RuntimeCatalog, RuntimeError};
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -48,14 +50,27 @@ use tokio_tungstenite::{
 };
 use ulid::Ulid;
 
-use crate::config::{ClientIdlePolicy, ServiceConfig, load_or_create_token, write_port_file};
+use crate::config::{
+    ClientIdlePolicy, RemoteInjectionConfig, ServiceConfig, load_or_create_token, write_port_file,
+};
 use crate::lock::{LockError, ServiceLock};
+use crate::marker;
+use crate::shell_events::{
+    EVENT_ENDPOINT_ENV, EVENT_TOKEN_ENV, ShellEventCancel, ShellEventChannel, ShellEventTracker,
+};
 use crate::web::WebServer;
 
 /// 服务端标识，随包版本变化。
 const SERVER_ID: &str = concat!("termx-service/", env!("CARGO_PKG_VERSION"));
 /// 等待首条 `hello` 的超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 命令内 marker 注入开关。
+///
+/// P1 的 in-band marker 会被 shell 回显并写入历史，污染 raw/历史记录；
+/// 等 hook-based shell integration 接上后再启用精确退出码。
+const TRANSCRIPT_MARKER_ENABLED: bool = false;
+/// 使用带外 shell 事件通道的本地 runtime ID。
+const SHELL_EVENT_RUNTIME_ID: &str = "termx-pwsh";
 /// 单终端交互采样（`foreground_pgrp` + `tree`）的超时上限。
 ///
 /// 每个终端独立任务并带超时：任一后端的 `tree()` 卡住只影响自身，不会拖住
@@ -332,6 +347,8 @@ pub struct Service {
     token: Arc<str>,
     /// 多客户端共享的终端 registry；std Mutex 临界区不跨 `await`。
     registry: Arc<Mutex<Registry>>,
+    /// 启动时读取的本地 runtime catalog；加载失败时为空。
+    runtimes: Arc<RuntimeCatalog>,
     /// `web_port > 0` 时预先绑定的 Web 监听器。
     web: Option<WebServer>,
 }
@@ -397,6 +414,22 @@ impl Service {
             repeat_interval: config.interaction_repeat_interval,
         });
         let registry = Arc::new(Mutex::new(registry));
+        // runtime catalog 只读本地目录；缺失/非法时保持空 catalog，不影响旧 cmd/args。
+        let (runtimes, runtime_error) = RuntimeCatalog::load(config.runtime_dir());
+        if let Some(error) = runtime_error {
+            tracing::warn!(
+                runtime_dir = %config.runtime_dir().display(),
+                %error,
+                "runtime catalog 加载失败，按空 catalog 启动"
+            );
+        } else {
+            tracing::info!(
+                runtime_dir = %runtimes.dir().display(),
+                runtimes = runtimes.len(),
+                "runtime catalog 已加载"
+            );
+        }
+        let runtimes = Arc::new(runtimes);
 
         tracing::info!(
             addr = %local_addr,
@@ -411,6 +444,7 @@ impl Service {
             _lock: lock,
             token,
             registry,
+            runtimes,
             web,
         })
     }
@@ -501,9 +535,11 @@ impl Service {
                     let token = Arc::clone(&self.token);
                     let resources = ConnectionResources {
                         registry: Arc::clone(&self.registry),
+                        runtimes: Arc::clone(&self.runtimes),
                         sessions: Arc::clone(&sessions),
                         max_frame_bytes: self.config.max_frame_bytes,
                         subscriber_queue_capacity: self.config.subscriber_queue_capacity,
+                        remote_injection: Arc::new(self.config.remote_injection.clone()),
                     };
                     tokio::spawn(async move {
                         if let Err(error) = handle_connection(stream, token, resources).await {
@@ -781,12 +817,16 @@ async fn sample_terminal_interaction(
 struct ConnectionResources {
     /// 共享 registry。
     registry: Arc<Mutex<Registry>>,
+    /// 只读 runtime catalog。
+    runtimes: Arc<RuntimeCatalog>,
     /// 共享会话心跳表。
     sessions: SessionBook,
     /// 入站帧上限。
     max_frame_bytes: usize,
     /// 订阅事件队列容量。
     subscriber_queue_capacity: usize,
+    /// 远端注入授权与路径配置（只读，不保存任何授权状态）。
+    remote_injection: Arc<RemoteInjectionConfig>,
 }
 
 /// 处理单个客户端连接：完成 `hello` 鉴权，成功则保持连接。
@@ -930,6 +970,8 @@ where
         "hello 鉴权成功"
     );
     let response = hello_response(id)?;
+    // `hello.capabilities.runtime_catalog` 是服务级声明；具体条目由
+    // `runtime.list` 返回，加载失败时该列表为空。
     send_response(&mut ws, &response).await?;
     serve_connection(ws, peer_addr, client_id, caller, resources).await
 }
@@ -961,6 +1003,7 @@ fn hello_response(id: String) -> Result<Response, ServiceError> {
             helper: false,
             version: HELPER_PROTOCOL_VERSION.to_string(),
             best_effort: false,
+            runtime_catalog: true,
         },
     };
 
@@ -988,9 +1031,11 @@ where
 {
     let ConnectionResources {
         registry,
+        runtimes,
         sessions,
         max_frame_bytes,
         subscriber_queue_capacity,
+        remote_injection,
     } = resources;
     let (sink, mut stream) = ws.split();
     let (out_tx, out_rx) = unbounded_channel::<Message>();
@@ -1018,7 +1063,9 @@ where
         client_id: &client_id,
         caller: &caller,
         registry: &registry,
+        runtimes: &runtimes,
         sessions: &sessions,
+        remote_injection: &remote_injection,
         out_tx: &out_tx,
         event_tx: &event_tx,
         shutdown: &mut shutdown_rx,
@@ -1114,6 +1161,7 @@ fn send_limit_exceeded(out_tx: &UnboundedSender<Message>) {
             message: LIMIT_EXCEEDED_MESSAGE.to_string(),
             retryable: true,
             terminal_id: None,
+            injection: None,
         }),
     };
     match to_json(&response) {
@@ -1135,8 +1183,12 @@ struct ReadContext<'a> {
     caller: &'a Caller,
     /// 共享 registry。
     registry: &'a Arc<Mutex<Registry>>,
+    /// 只读 runtime catalog。
+    runtimes: &'a Arc<RuntimeCatalog>,
     /// 共享会话心跳表。
     sessions: &'a SessionBook,
+    /// 远端注入配置；`terminal.create` 组装内部计划时只读。
+    remote_injection: &'a RemoteInjectionConfig,
     /// 连接出站队列。
     out_tx: &'a UnboundedSender<Message>,
     /// 订阅事件发送端。
@@ -1192,7 +1244,9 @@ where
                     context.client_id,
                     context.caller,
                     context.registry,
+                    context.runtimes,
                     context.sessions,
+                    context.remote_injection,
                     context.out_tx,
                     context.event_tx,
                 )
@@ -1206,18 +1260,34 @@ where
 }
 
 /// 解析请求并分发；非法 JSON 回 `protocol_error`。
+//
+// 连接上下文（身份、registry、runtime、会话表、输出通道）都是独立借用，
+// 拆成结构体会把生命周期参数扩散到整个分发层；此处保持显式参数。
+#[allow(clippy::too_many_arguments)]
 async fn handle_rpc_text(
     text: &str,
     client_id: &str,
     caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
+    runtimes: &Arc<RuntimeCatalog>,
     sessions: &SessionBook,
+    remote_injection: &RemoteInjectionConfig,
     out_tx: &UnboundedSender<Message>,
     event_tx: &Sender<Event>,
 ) -> Result<(), ServiceError> {
     let response = match from_json::<Request>(text) {
         Ok(request) => {
-            dispatch_request(request, client_id, caller, registry, sessions, event_tx).await?
+            dispatch_request(
+                request,
+                client_id,
+                caller,
+                registry,
+                runtimes,
+                sessions,
+                remote_injection,
+                event_tx,
+            )
+            .await?
         }
         Err(_) => error_response(String::new(), ErrorCode::ProtocolError, "请求 JSON 非法"),
     };
@@ -1231,12 +1301,18 @@ async fn handle_rpc_text(
 ///
 /// 锁内只做 registry 读写（事件投递为非阻塞 send），不跨 `await` 持有锁；
 /// `terminal.create` 的 spawn/terminate 都在 `spawn_blocking` 中于锁外执行。
+//
+// 连接级依赖（身份、registry、runtime、会话表、注入配置、事件通道）都是独立
+// 借用，拆结构体会把生命周期扩散到整个分发层；与 `handle_rpc_text` 保持一致。
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     request: Request,
     client_id: &str,
     caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
+    runtimes: &Arc<RuntimeCatalog>,
     sessions: &SessionBook,
+    remote_injection: &RemoteInjectionConfig,
     event_tx: &Sender<Event>,
 ) -> Result<Response, ServiceError> {
     let Request { id, method, params } = request;
@@ -1272,6 +1348,26 @@ async fn dispatch_request(
             let value = serde_json::to_value(build_session_list(heartbeats, terminals, now))?;
             Ok(ok_response(id, value))
         }
+        "runtime.list" => {
+            let result = RuntimeListResult {
+                runtimes: runtimes
+                    .list(
+                        &termx_runtime::current_platform(),
+                        &termx_runtime::current_arch(),
+                    )
+                    .into_iter()
+                    .map(|runtime| RuntimeInfo {
+                        id: runtime.id,
+                        name: runtime.name,
+                        version: runtime.version,
+                        platform: runtime.platform,
+                        arch: runtime.arch,
+                        available: runtime.available,
+                    })
+                    .collect(),
+            };
+            Ok(ok_response(id, serde_json::to_value(result)?))
+        }
         "terminal.create" => {
             let params: CreateParams = match serde_json::from_value(params) {
                 Ok(params) => params,
@@ -1283,7 +1379,7 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_create(id, params, caller, registry).await
+            handle_create(id, params, caller, registry, runtimes, remote_injection).await
         }
         "terminal.list" => {
             let params: ListParams = match serde_json::from_value(params) {
@@ -1693,6 +1789,18 @@ async fn dispatch_request(
     }
 }
 
+/// SSH 远端程序是否需要 helper（按 basename 匹配 `termx-pwsh`）。
+///
+/// Web 表单的「运行环境」只允许 `termx-pwsh` 或系统 shell；旧客户端仍可
+/// 直接发 `cmd`，因此按 basename 判断，兼容 `/usr/local/bin/termx-pwsh` 与
+/// Windows 风格分隔符。
+fn ssh_needs_helper(cmd: &str) -> bool {
+    cmd.trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name == SHELL_EVENT_RUNTIME_ID)
+}
+
 /// 创建终端：预检 → 锁外终止旧后端 → 锁外 spawn → 锁内注册 → 启动事件摄取。
 ///
 /// 并发契约：registry 的 `std::sync::Mutex` 只在同步短操作中持有；
@@ -1700,10 +1808,79 @@ async fn dispatch_request(
 /// 且不在持锁期间等待。
 async fn handle_create(
     id: String,
-    params: CreateParams,
+    mut params: CreateParams,
     caller: &Caller,
     registry: &Arc<Mutex<Registry>>,
+    runtimes: &RuntimeCatalog,
+    remote_injection: &RemoteInjectionConfig,
 ) -> Result<Response, ServiceError> {
+    // runtime_id 指向本机 runtime，ssh 指向远端主机，两者语义冲突，先拒绝再解析。
+    if params.runtime_id.is_some() && params.ssh.is_some() {
+        return Ok(error_response(
+            id,
+            ErrorCode::BadRequest,
+            "runtime_id 与 ssh 不能同时使用".to_string(),
+        ));
+    }
+    // runtime_id 与自定义 cmd/args 互斥；解析失败直接返回明确错误，不回退到
+    // 请求里的 cmd，避免“选了内置 runtime 却跑了任意程序”。
+    if let Some(runtime_id) = params.runtime_id.clone() {
+        if !params.cmd.trim().is_empty() || !params.args.is_empty() {
+            return Ok(error_response(
+                id,
+                ErrorCode::BadRequest,
+                "runtime_id 与自定义 cmd/args 不能同时使用".to_string(),
+            ));
+        }
+        match runtimes.resolve(&runtime_id) {
+            Ok(runtime) => {
+                params.cmd = runtime.bin_path.to_string_lossy().into_owned();
+                params.args = runtime.args;
+            }
+            Err(error) => return Ok(runtime_error_response(id, &error)),
+        }
+    }
+    // 远端注入计划：SSH + termx-pwsh（或旧请求显式要求）视为需要 helper，
+    // 由 service 从生效的 remote injection 自动填充 helper 字段；只读预检固定
+    // deny。授权只来自本次请求，不写入 registry 或任何状态。
+    if params.ssh.is_some() {
+        let allow_injection = params.allow_injection;
+        let needs_helper = ssh_needs_helper(&params.cmd);
+        if let Some(ssh) = params.ssh.as_mut() {
+            if let Err(error) = remote_injection.plan_for_ssh(ssh, allow_injection, needs_helper) {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::BadRequest,
+                    format!("远端注入 helper 路径非法: {error}"),
+                ));
+            }
+        }
+    }
+    // 只有本地 PTY 的 termx-pwsh 使用带外通道；SSH/其他 runtime 保持现状。
+    let event_channel_eligible = params.mode == Mode::Pty
+        && params.ssh.is_none()
+        && params.runtime_id.as_deref() == Some(SHELL_EVENT_RUNTIME_ID);
+    let event_channel = if event_channel_eligible {
+        match ShellEventChannel::open() {
+            Ok(channel) => {
+                let env = params.env.get_or_insert_with(BTreeMap::new);
+                env.insert(
+                    EVENT_ENDPOINT_ENV.to_string(),
+                    channel.endpoint().to_string(),
+                );
+                env.insert(EVENT_TOKEN_ENV.to_string(), channel.token().to_string());
+                Some(channel)
+            }
+            Err(error) => {
+                // 通道失败不阻断创建：transcript 退化为静默判定，不伪造退出码。
+                tracing::warn!(%error, "shell 事件通道创建失败，降级为 best-effort");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 只做参数/冲突预检，不提前终止旧后端：否则旧进程退出的 `exited` 可能
     // 抢在 `register_create` 落 `interrupted` 之前。置换统一在锁内完成。
     let factory = {
@@ -1721,11 +1898,23 @@ async fn handle_create(
         Ok(spawned) => spawned,
         Err(error) => return Ok(response_from_core_error(id, error)),
     };
+    // 远端事件是否生效由后端快照决定：只有 ssh + pty + termx-pwsh + helper
+    // `shell_events` 能力 + `started.events=true` 才会为 true。普通 SSH 保持
+    // in-band OSC；本地通道逻辑不变。
+    let remote_events = backend.shell_events();
+    // 只有本地通道真正建立或远端 helper 通道生效时才关闭 in-band fallback；
+    // 本地通道创建失败时仍保留 send/in-band 记录，避免 transcript 丢失。
+    let event_channel_active = event_channel.is_some() || remote_events;
     let foreground_pgrp = read_foreground_pgrp(Arc::clone(&backend)).await;
 
     let registered = {
         let mut registry = lock_registry(registry);
-        registry.register_create(params, Arc::clone(&backend), foreground_pgrp)
+        registry.register_create_with(
+            params,
+            Arc::clone(&backend),
+            foreground_pgrp,
+            !event_channel_active,
+        )
     };
     let (result, displaced) = match registered {
         Ok(registered) => registered,
@@ -1744,6 +1933,15 @@ async fn handle_create(
         TerminalId::new(result.terminal_id.clone()),
         events,
     ));
+    if let Some(channel) = event_channel {
+        let (receiver, cancel) = channel.split();
+        tokio::spawn(ingest_shell_events(
+            Arc::clone(registry),
+            TerminalId::new(result.terminal_id.clone()),
+            receiver,
+            cancel,
+        ));
+    }
     Ok(ok_response(id, serde_json::to_value(result)?))
 }
 
@@ -1765,7 +1963,7 @@ async fn handle_send(
     let command_text = params
         .enter
         .then(|| String::from_utf8_lossy(&payload).into_owned());
-    let (backend, mode) = {
+    let (backend, mode, wrapped) = {
         let mut registry = lock_registry(registry);
         let locator = match authorize_locator(&registry, &params.locator, caller) {
             Ok(locator) => locator,
@@ -1780,17 +1978,33 @@ async fn handle_send(
             Err(error) => return Ok(response_from_core_error(id, error)),
         };
         // 与 prepare_send 同锁记录，保证新命令排在本次写入产生的输出之前；
-        // 鉴权/lease 已通过，因此不会记录被拒绝的输入。
+        // 鉴权/lease 已通过，因此不会记录被拒绝的输入。事件通道终端改由宿主
+        // `C` 建记录，这里跳过，避免 send 与宿主产生两条来源。
         if let (Some(text), Some(raw_id)) = (&command_text, &locator.terminal_id) {
-            let terminal_id = TerminalId::new(raw_id.clone());
-            if let Err(error) =
-                registry.record_transcript_command(&terminal_id, text, OffsetDateTime::now_utc())
-            {
-                tracing::debug!(%terminal_id, %error, "记录 transcript 命令失败");
+            match registry.records_transcript_on_send(&locator) {
+                Ok(true) => {
+                    let terminal_id = TerminalId::new(raw_id.clone());
+                    if let Err(error) = registry.record_transcript_command(
+                        &terminal_id,
+                        text,
+                        OffsetDateTime::now_utc(),
+                    ) {
+                        tracing::debug!(%terminal_id, %error, "记录 transcript 命令失败");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => return Ok(response_from_core_error(id, error)),
             }
         }
-        (backend, mode)
+        // 仅本地 PTY 的单行 text 命令尝试追加 marker；data/SSH/stdio/cmd 一律降级。
+        let wrapped = TRANSCRIPT_MARKER_ENABLED
+            .then(|| wrap_local_command(&registry, &locator, &params, mode))
+            .flatten();
+        (backend, mode, wrapped)
     };
+    if let Some(wrapped) = wrapped {
+        payload = wrapped.into_bytes();
+    }
     if params.enter {
         // 协议 §6：pty 回车为 `\r`，stdio 为 `\n`。
         payload.push(enter_byte(mode));
@@ -1983,6 +2197,29 @@ fn enter_byte(mode: Mode) -> u8 {
     }
 }
 
+/// 为本地 PTY 的单行 `text` 命令构造带 shell marker 的发送文本。
+///
+/// 仅当 `enter=true && mode=pty && data 缺省 && text 存在` 时尝试；shell 为
+/// cmd/未知（含 SSH 的 `shell`）或命令不适合单行执行时返回 `None`，调用方
+/// 保持原文本发送（显式降级，不伪造完成）。
+fn wrap_local_command(
+    registry: &Registry,
+    locator: &TerminalLocator,
+    params: &SendParams,
+    mode: Mode,
+) -> Option<String> {
+    if !params.enter || mode != Mode::Pty || params.data.is_some() {
+        return None;
+    }
+    // SSH 远端 shell 不做本地包装（无论其启动程序是什么）。
+    if registry.is_ssh(locator).unwrap_or(true) {
+        return None;
+    }
+    let text = params.text.as_deref()?;
+    let kind = marker::shell_kind(registry.shell_command(locator).ok()?);
+    marker::wrap_command(kind, text)
+}
+
 /// 在阻塞线程池中调用后端 `spawn`，避免占用 async worker。
 async fn spawn_backend(
     factory: Arc<dyn BackendFactory>,
@@ -2041,53 +2278,20 @@ async fn ingest_proc_events(
     terminal_id: TerminalId,
     mut events: Receiver<ProcEvent>,
 ) {
+    // 远端 helper 与本地通道共用同一套 command-id + 代次判定；跟踪器跨事件保留。
+    let mut tracker = ShellEventTracker::new();
     while let Some(event) = events.recv().await {
         let (result, terminal) = {
             let mut registry = registry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match event {
-                ProcEvent::Output { data, stream } => {
-                    let now = OffsetDateTime::now_utc();
-                    let reported = registry.report_event(
-                        &terminal_id,
-                        EventKind::Output {
-                            data: BASE64_STANDARD.encode(&data),
-                            stream: protocol_stream(stream),
-                        },
-                    );
-                    // 同一把锁内写入有界 transcript（短操作），再喂交互识别器。
-                    let result = match reported {
-                        Ok(_) => {
-                            let text = String::from_utf8_lossy(&data);
-                            if let Err(error) =
-                                registry.record_transcript_output(&terminal_id, &text, now)
-                            {
-                                tracing::debug!(terminal_id = %terminal_id, %error, "记录 transcript 输出失败");
-                            }
-                            registry
-                                .observe_output(&terminal_id, &data, now)
-                                .map(|_| ())
-                        }
-                        Err(error) => Err(error),
-                    };
-                    (result, false)
-                }
-                // 退出结果统一交给 report_exit：由 registry 结合 pending 决定
-                // 发 interrupted（Ctrl-C / terminate / signal）还是 exited。
-                ProcEvent::Exited(exit_code) => (
-                    registry
-                        .report_exit(&terminal_id, ExitOutcome::Code(exit_code))
-                        .map(|_| ()),
-                    true,
-                ),
-                ProcEvent::Signaled(signal) => (
-                    registry
-                        .report_exit(&terminal_id, ExitOutcome::Signal(signal))
-                        .map(|_| ()),
-                    true,
-                ),
-            }
+            apply_proc_event(
+                &mut registry,
+                &terminal_id,
+                &mut tracker,
+                event,
+                OffsetDateTime::now_utc(),
+            )
         };
         match result {
             Ok(_) => {}
@@ -2098,6 +2302,96 @@ async fn ingest_proc_events(
 
         if terminal {
             break;
+        }
+    }
+}
+
+/// 在已持有的 registry 锁内处理一条进程事件。
+///
+/// 返回值第二项表示是否为终态事件。所有 registry 操作保持同步短路径；
+/// `ShellEvent` 复用本地通道的 tracker 语义，不是终态。
+fn apply_proc_event(
+    registry: &mut Registry,
+    terminal_id: &TerminalId,
+    tracker: &mut ShellEventTracker,
+    event: ProcEvent,
+    now: OffsetDateTime,
+) -> (Result<(), CoreError>, bool) {
+    match event {
+        ProcEvent::Output { data, stream } => {
+            let reported = registry.report_event(
+                terminal_id,
+                EventKind::Output {
+                    data: BASE64_STANDARD.encode(&data),
+                    stream: protocol_stream(stream),
+                },
+            );
+            // 同一把锁内写入有界 transcript（短操作），再喂交互识别器。
+            let result = match reported {
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&data);
+                    if let Err(error) = registry.record_transcript_output(terminal_id, &text, now) {
+                        tracing::debug!(%terminal_id, %error, "记录 transcript 输出失败");
+                    }
+                    registry.observe_output(terminal_id, &data, now).map(|_| ())
+                }
+                Err(error) => Err(error),
+            };
+            (result, false)
+        }
+        // 退出结果统一交给 report_exit：由 registry 结合 pending 决定
+        // 发 interrupted（Ctrl-C / terminate / signal）还是 exited。
+        ProcEvent::Exited(exit_code) => (
+            registry
+                .report_exit(terminal_id, ExitOutcome::Code(exit_code))
+                .map(|_| ()),
+            true,
+        ),
+        ProcEvent::Signaled(signal) => (
+            registry
+                .report_exit(terminal_id, ExitOutcome::Signal(signal))
+                .map(|_| ()),
+            true,
+        ),
+        // 远端 helper 的带外事件与本地通道同语义：C 绑定代次，只有
+        // command-id + 代次都匹配的 D 才结束 transcript；不是终态。
+        ProcEvent::ShellEvent(event) => (
+            crate::shell_events::apply_event(registry, terminal_id, tracker, &event, now)
+                .map(|_| ()),
+            false,
+        ),
+    }
+}
+
+/// 带外 shell 事件摄取任务。
+///
+/// 只把 command-id 与代次都匹配的 `D` 交给
+/// [`Registry::record_transcript_end_for_generation`]；迟到/不匹配的 `D` 被
+/// 忽略，不会结束新命令。通道断开或终端被移除后退出，
+/// `cancel` 随任务一起释放，关闭 listener 并清理 socket/pipe。
+async fn ingest_shell_events(
+    registry: Arc<Mutex<Registry>>,
+    terminal_id: TerminalId,
+    mut events: Receiver<crate::shell_events::ShellEvent>,
+    _cancel: ShellEventCancel,
+) {
+    let mut tracker = ShellEventTracker::new();
+    while let Some(event) = events.recv().await {
+        let applied = {
+            let mut registry = lock_registry(&registry);
+            crate::shell_events::apply_event(
+                &mut registry,
+                &terminal_id,
+                &mut tracker,
+                &event,
+                OffsetDateTime::now_utc(),
+            )
+        };
+        match applied {
+            Ok(_) => {}
+            // 终端被 force 替换或删除：结束摄取。
+            Err(CoreError::NotFound) => break,
+            Err(error) => tracing::debug!(%error, terminal_id = %terminal_id, "shell 事件写入失败"),
         }
     }
 }
@@ -2210,6 +2504,24 @@ fn ok_response(id: String, result: serde_json::Value) -> Response {
     }
 }
 
+/// runtime 解析错误 → 协议错误响应。
+///
+/// 未知 ID 返回 `not_found`；平台不兼容、路径越界、文件缺失/不可执行均返回
+/// `bad_request`，不静默回退到请求里的 cmd。
+fn runtime_error_response(id: String, error: &RuntimeError) -> Response {
+    let code = match error {
+        RuntimeError::NotFound(_) => ErrorCode::NotFound,
+        RuntimeError::MissingManifest(_)
+        | RuntimeError::Io { .. }
+        | RuntimeError::InvalidManifest(_)
+        | RuntimeError::Incompatible { .. }
+        | RuntimeError::UnsafeBinary { .. }
+        | RuntimeError::MissingBinary { .. }
+        | RuntimeError::NotExecutable { .. } => ErrorCode::BadRequest,
+    };
+    error_response(id, code, error.to_string())
+}
+
 /// 把 core 错误映射为协议错误响应。
 fn response_from_core_error(id: String, error: CoreError) -> Response {
     Response {
@@ -2234,9 +2546,16 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         CoreError::UnsupportedSignal(_) => ErrorCode::BadRequest,
         CoreError::LimitExceeded(_) => ErrorCode::LimitExceeded,
         CoreError::BackendFailed(_) => ErrorCode::Internal,
+        // 授权要求必须单独成码并带回写入计划，不能落到普通 bad_request；
+        // 注入失败已由 core 映射为 BadRequest，最终返回 bad_request，不回退。
+        CoreError::ConsentRequired { .. } => ErrorCode::ConsentRequired,
     };
     let terminal_id = match &error {
         CoreError::SessionExists { terminal_id } => Some(terminal_id.clone()),
+        _ => None,
+    };
+    let injection = match &error {
+        CoreError::ConsentRequired { details } => Some(Box::new(details.clone())),
         _ => None,
     };
 
@@ -2245,6 +2564,7 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         message: error.to_string(),
         retryable: code.is_retryable(),
         terminal_id,
+        injection,
     }
 }
 
@@ -2272,6 +2592,7 @@ fn error_response(id: String, code: ErrorCode, message: impl Into<String>) -> Re
             message: message.into(),
             retryable: code.is_retryable(),
             terminal_id: None,
+            injection: None,
         }),
     }
 }
@@ -2438,6 +2759,9 @@ pub(crate) fn is_loopback(addr: SocketAddr) -> bool {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use termx_core::MockFactory;
+    use termx_protocol::TranscriptSource;
+    use termx_protocol::shell_events::{ShellEvent, ShellEventKind};
 
     #[test]
     fn loopback_addresses_are_recognized() {
@@ -2521,5 +2845,189 @@ mod tests {
             send_payload(&send_params(Some("not-base64!"), None, false)),
             Err(CoreError::BadRequest(_))
         ));
+    }
+
+    /// 构造 mock 后端终端，返回 registry 与 terminal_id。
+    fn proc_event_terminal() -> (Arc<Mutex<Registry>>, String) {
+        let mut registry = Registry::with_factory(64, Arc::new(MockFactory));
+        let created = registry
+            .create(CreateParams {
+                mode: Mode::Pty,
+                cmd: "mock".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: None,
+                cols: None,
+                rows: None,
+                root_session_id: "ses-1".to_string(),
+                name: "build".to_string(),
+                force: false,
+                idle_timeout: None,
+                ssh: None,
+                allow_injection: false,
+                runtime_id: None,
+            })
+            .expect("mock 终端应创建成功");
+        (Arc::new(Mutex::new(registry)), created.terminal_id)
+    }
+
+    /// 把事件按顺序喂给摄取任务，等任务处理完再返回。
+    async fn feed_proc_events(
+        registry: &Arc<Mutex<Registry>>,
+        terminal_id: &str,
+        events: Vec<ProcEvent>,
+    ) {
+        let (tx, rx) = channel(8);
+        let handle = tokio::spawn(ingest_proc_events(
+            Arc::clone(registry),
+            TerminalId::new(terminal_id.to_string()),
+            rx,
+        ));
+        for event in events {
+            tx.send(event).await.expect("摄取任务应仍在运行");
+        }
+        drop(tx);
+        handle.await.expect("摄取任务不应 panic");
+    }
+
+    /// 读取 transcript 的第一条命令。
+    fn first_transcript(
+        registry: &Arc<Mutex<Registry>>,
+        terminal_id: &str,
+    ) -> termx_protocol::TranscriptCommand {
+        let registry = lock_registry(registry);
+        registry
+            .transcript(
+                &TerminalLocator {
+                    terminal_id: Some(terminal_id.to_string()),
+                    root_session_id: None,
+                    name: None,
+                },
+                None,
+            )
+            .expect("读取 transcript")
+            .commands
+            .into_iter()
+            .next()
+            .expect("应有一条命令")
+    }
+
+    /// 构造 shell 事件。
+    fn shell_proc_event(kind: ShellEventKind, code: Option<i32>, id: &str) -> ProcEvent {
+        ProcEvent::ShellEvent(ShellEvent {
+            kind,
+            code,
+            id: Some(id.to_string()),
+            command: None,
+            started_at_ms: None,
+            ended_at_ms: None,
+        })
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("合法时间戳")
+    }
+
+    #[tokio::test]
+    async fn proc_shell_events_finish_transcript_with_remote_exit_code() {
+        let (registry, terminal_id) = proc_event_terminal();
+        {
+            let mut guard = lock_registry(&registry);
+            guard
+                .record_transcript_command(&TerminalId::new(terminal_id.clone()), "first", now())
+                .expect("记录命令");
+        }
+        feed_proc_events(
+            &registry,
+            &terminal_id,
+            vec![
+                shell_proc_event(ShellEventKind::CommandStart, None, "cmd-1"),
+                shell_proc_event(ShellEventKind::CommandEnd, Some(7), "cmd-1"),
+            ],
+        )
+        .await;
+
+        let command = first_transcript(&registry, &terminal_id);
+        assert_eq!(command.command, "first");
+        assert_eq!(command.status, termx_protocol::TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(7));
+        assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+        assert!(!command.best_effort);
+    }
+
+    #[test]
+    fn late_proc_shell_event_does_not_finish_new_command() {
+        let (registry, terminal_id) = proc_event_terminal();
+        let id = TerminalId::new(terminal_id.clone());
+        let mut tracker = ShellEventTracker::new();
+        let mut guard = lock_registry(&registry);
+        guard
+            .record_transcript_command(&id, "first", now())
+            .expect("记录第一条");
+        // C1 绑定 g1。
+        let (_, terminal) = apply_proc_event(
+            &mut guard,
+            &id,
+            &mut tracker,
+            shell_proc_event(ShellEventKind::CommandStart, None, "cmd-1"),
+            now(),
+        );
+        assert!(!terminal);
+        // service 已记录新命令 g2，旧 C 的迟到 D 必须被忽略。
+        guard
+            .record_transcript_command(&id, "second", now() + time::Duration::seconds(1))
+            .expect("记录第二条");
+        let (result, terminal) = apply_proc_event(
+            &mut guard,
+            &id,
+            &mut tracker,
+            shell_proc_event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+            now() + time::Duration::seconds(2),
+        );
+        assert!(result.is_ok());
+        assert!(!terminal);
+
+        let commands = guard
+            .transcript(
+                &TerminalLocator {
+                    terminal_id: Some(terminal_id),
+                    root_session_id: None,
+                    name: None,
+                },
+                None,
+            )
+            .expect("读取 transcript")
+            .commands;
+        assert_eq!(commands[1].command, "second");
+        assert_eq!(
+            commands[1].status,
+            termx_protocol::TranscriptStatus::Running
+        );
+        assert_eq!(commands[1].exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn output_without_shell_events_does_not_fake_exit() {
+        let (registry, terminal_id) = proc_event_terminal();
+        {
+            let mut guard = lock_registry(&registry);
+            guard
+                .record_transcript_command(&TerminalId::new(terminal_id.clone()), "first", now())
+                .expect("记录命令");
+        }
+        feed_proc_events(
+            &registry,
+            &terminal_id,
+            vec![ProcEvent::Output {
+                data: b"hi".to_vec(),
+                stream: OutputStream::Pty,
+            }],
+        )
+        .await;
+
+        let command = first_transcript(&registry, &terminal_id);
+        assert_eq!(command.status, termx_protocol::TranscriptStatus::Running);
+        assert_eq!(command.exit_code, None);
+        assert_eq!(command.ended_at, None);
     }
 }

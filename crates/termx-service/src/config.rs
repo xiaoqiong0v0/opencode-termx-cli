@@ -13,6 +13,10 @@ use std::{
     time::Duration,
 };
 
+use termx_protocol::{
+    InjectionConsentMode, InjectionPathError, InjectionPlan, SshConfig, validate_path_spec,
+};
+
 /// 直接提供 token 的环境变量；优先于默认 token 文件。
 const TERMX_TOKEN_ENV: &str = "TERMX_TOKEN";
 /// 覆盖空闲检查 ticker 周期的环境变量，单位为毫秒。
@@ -39,6 +43,23 @@ const TERMX_CLIENT_IDLE_TIMEOUT_MS_ENV: &str = "TERMX_CLIENT_IDLE_TIMEOUT_MS";
 const TERMX_CLIENT_IDLE_POLICY_ENV: &str = "TERMX_CLIENT_IDLE_POLICY";
 /// 覆盖会话心跳 TTL 的环境变量，单位为毫秒。
 const TERMX_SESSION_TTL_MS_ENV: &str = "TERMX_SESSION_TTL_MS";
+/// 远端注入授权模式：`ask` / `allow` / `deny`。
+const TERMX_REMOTE_INJECTION_CONSENT_ENV: &str = "TERMX_REMOTE_INJECTION_CONSENT";
+/// 远端注入根目录（整体覆盖）。
+const TERMX_REMOTE_INJECTION_ROOT_ENV: &str = "TERMX_REMOTE_INJECTION_ROOT";
+/// 远端 helper 安装路径。
+const TERMX_REMOTE_INJECTION_HELPER_ENV: &str = "TERMX_REMOTE_INJECTION_HELPER";
+/// 本地 controller 上的 helper 产物路径；为空表示不自动上传。
+const TERMX_REMOTE_INJECTION_HELPER_LOCAL_ENV: &str = "TERMX_REMOTE_INJECTION_HELPER_LOCAL";
+/// 远端 pwsh runtime 目录。
+const TERMX_REMOTE_INJECTION_PWSH_ENV: &str = "TERMX_REMOTE_INJECTION_PWSH";
+/// 远端 bash runtime 目录。
+const TERMX_REMOTE_INJECTION_BASH_ENV: &str = "TERMX_REMOTE_INJECTION_BASH";
+/// 远端 sh runtime 目录。
+const TERMX_REMOTE_INJECTION_SH_ENV: &str = "TERMX_REMOTE_INJECTION_SH";
+
+/// 远端注入默认根目录（`~` 表示远端用户 home）。
+pub const DEFAULT_REMOTE_INJECTION_ROOT: &str = "~/.termx";
 
 /// token 文件名。
 pub const TOKEN_FILE_NAME: &str = "token";
@@ -110,6 +131,291 @@ impl ClientIdlePolicy {
     }
 }
 
+/// 远端注入的四个目标路径；缺省由 [`RemoteInjectionConfig::root`] 派生。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInjectionPaths {
+    /// helper 安装目标（文件）。
+    pub helper: String,
+    /// pwsh runtime 版本目录。
+    pub pwsh: String,
+    /// bash runtime 版本目录。
+    pub bash: String,
+    /// sh runtime 版本目录。
+    pub sh: String,
+}
+
+impl RemoteInjectionPaths {
+    /// 按根目录派生默认路径。
+    ///
+    /// - helper: `<root>/bin/termx-helper`
+    /// - pwsh/bash/sh: `<root>/runtimes/<name>`
+    pub fn from_root(root: &str) -> Self {
+        Self {
+            helper: join_root(root, "bin/termx-helper"),
+            pwsh: join_root(root, "runtimes/pwsh"),
+            bash: join_root(root, "runtimes/bash"),
+            sh: join_root(root, "runtimes/sh"),
+        }
+    }
+}
+
+/// 远端注入配置：授权模式、根目录与各目标路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInjectionConfig {
+    /// 授权模式；缺省 [`InjectionConsentMode::Ask`]。
+    pub consent: InjectionConsentMode,
+    /// 注入根目录；缺省 [`DEFAULT_REMOTE_INJECTION_ROOT`]。
+    pub root: String,
+    /// 具体目标路径；缺省按 `root` 派生。
+    pub paths: RemoteInjectionPaths,
+    /// 本地 controller 上的 helper 产物路径；空串表示不自动上传。
+    ///
+    /// 这是本机路径，**不**按远端注入路径规则校验（远端可能是 Unix，
+    /// 主控端可能运行在 Windows）。
+    pub helper_local: String,
+}
+
+impl Default for RemoteInjectionConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RemoteInjectionConfig {
+    /// 默认配置：`ask` + `~/.termx` + 派生路径。
+    pub fn new() -> Self {
+        let root = DEFAULT_REMOTE_INJECTION_ROOT.to_string();
+        Self {
+            consent: InjectionConsentMode::Ask,
+            paths: RemoteInjectionPaths::from_root(&root),
+            root,
+            helper_local: String::new(),
+        }
+    }
+
+    /// 读取 `TERMX_REMOTE_INJECTION_*` 环境变量。
+    ///
+    /// 非法值**保留**并记录 warn，交由后续连接前的路径校验给出明确错误；
+    /// 只有空值/无法识别的授权模式会回退默认（`ask`）。
+    pub fn from_env<F>(env: &F) -> Self
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let mut config = Self::new();
+        if let Some(raw) = env_string(env, TERMX_REMOTE_INJECTION_CONSENT_ENV) {
+            match InjectionConsentMode::parse(&raw) {
+                Some(mode) => config.consent = mode,
+                None => {
+                    tracing::warn!(
+                        value = %raw,
+                        "TERMX_REMOTE_INJECTION_CONSENT 非法，保留默认 ask"
+                    );
+                }
+            }
+        }
+        if let Some(raw) = env_string(env, TERMX_REMOTE_INJECTION_ROOT_ENV) {
+            if raw.trim().is_empty() {
+                tracing::warn!("TERMX_REMOTE_INJECTION_ROOT 为空，保留默认根目录");
+            } else {
+                config.set_root(&raw);
+            }
+        }
+        // 本地 helper 路径允许为空（表示不自动上传），因此空值也接受。
+        if let Some(raw) = env_string(env, TERMX_REMOTE_INJECTION_HELPER_LOCAL_ENV) {
+            config.helper_local = raw.trim().to_string();
+        }
+        for (name, slot) in [
+            (TERMX_REMOTE_INJECTION_HELPER_ENV, &mut config.paths.helper),
+            (TERMX_REMOTE_INJECTION_PWSH_ENV, &mut config.paths.pwsh),
+            (TERMX_REMOTE_INJECTION_BASH_ENV, &mut config.paths.bash),
+            (TERMX_REMOTE_INJECTION_SH_ENV, &mut config.paths.sh),
+        ] {
+            if let Some(raw) = env_string(env, name) {
+                if raw.trim().is_empty() {
+                    tracing::warn!(variable = name, "注入路径为空，保留派生值");
+                    continue;
+                }
+                let value = raw.trim().to_string();
+                if let Err(error) = validate_path_spec(&value) {
+                    tracing::warn!(
+                        variable = name,
+                        value = %value,
+                        reason = error.reason(),
+                        "注入路径非法，保留原值等待连接前校验"
+                    );
+                }
+                *slot = value;
+            }
+        }
+        config
+    }
+
+    /// 覆盖授权模式。
+    #[must_use]
+    pub fn with_consent(mut self, consent: InjectionConsentMode) -> Self {
+        self.consent = consent;
+        self
+    }
+
+    /// 覆盖根目录并重新派生全部路径。
+    #[must_use]
+    pub fn with_root(mut self, root: impl Into<String>) -> Self {
+        self.set_root(&root.into());
+        self
+    }
+
+    /// 覆盖单个 path 字段。
+    #[must_use]
+    pub fn with_helper_path(mut self, path: impl Into<String>) -> Self {
+        self.paths.helper = path.into();
+        self
+    }
+
+    /// 覆盖本地 controller 上的 helper 产物路径。
+    ///
+    /// 空串表示不自动上传，改为使用远端预装 helper。
+    #[must_use]
+    pub fn with_helper_local(mut self, path: impl Into<String>) -> Self {
+        self.helper_local = path.into();
+        self
+    }
+
+    /// 把服务端配置与**本次请求**的授权标记组装成 SSH 注入计划。
+    ///
+    /// `needs_helper` 由调用方按请求语义给出（例如 SSH + `termx-pwsh`）；
+    /// 请求里显式设置了 `upload_helper`/`helper_local_path` 的旧格式仍然生效。
+    ///
+    /// 约定：
+    /// - 需要 helper 且配置了 [`Self::helper_local`]：自动开启上传，并把
+    ///   `helper_local` / `paths.helper` 写入 `SshConfig`；客户端不再手填。
+    /// - 需要 helper 但 `helper_local` 为空：不自动上传；优先保留请求里的
+    ///   `helper_path`，否则使用配置的远端预装路径（`paths.helper`）。
+    ///   计划固定为 [`InjectionConsentMode::Deny`]，只做只读预检。
+    /// - 不需要 helper：同样只读预检，不覆盖请求里的 helper 字段。
+    /// - `consent` 来自服务配置，`allow` 只来自本次请求，**不落任何状态**。
+    /// - `~` 不做本地展开（展开需要远端 home，由 `termx-ssh` 在连接后完成）。
+    ///
+    /// # 错误
+    /// 需要写入但 `paths.helper` 不满足注入路径规则时返回
+    /// [`InjectionPathError`]；`helper_local` 与 `paths.helper` 都为空时返回
+    /// [`InjectionPathError::Empty`]。
+    pub fn plan_for_ssh(
+        &self,
+        ssh: &mut SshConfig,
+        allow_injection: bool,
+        needs_helper: bool,
+    ) -> Result<(), InjectionPathError> {
+        let paths = self.plan_paths();
+        // 旧格式：请求显式要求上传或携带本地路径，同样视为需要 helper。
+        let wants_helper = needs_helper || ssh.upload_helper || ssh.helper_local_path.is_some();
+        if !wants_helper {
+            ssh.injection = InjectionPlan {
+                consent: InjectionConsentMode::Deny,
+                allow: false,
+                ..paths
+            };
+            return Ok(());
+        }
+
+        let helper_local = self.helper_local.trim();
+        let request_local = ssh
+            .helper_local_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+
+        // 优先使用配置的本地 helper；旧请求自带的本地路径仅在显式上传时沿用。
+        let local: Option<String> = if !helper_local.is_empty() {
+            Some(helper_local.to_string())
+        } else if ssh.upload_helper {
+            request_local.map(str::to_string)
+        } else {
+            None
+        };
+
+        if let Some(local) = local {
+            validate_path_spec(&self.paths.helper)?;
+            ssh.upload_helper = true;
+            ssh.helper_local_path = Some(local);
+            // 配置路径是安装目标，优先于请求里可能残留的 helper_path。
+            ssh.helper_path = Some(self.paths.helper.clone());
+            ssh.injection = InjectionPlan {
+                consent: self.consent,
+                allow: allow_injection,
+                ..paths
+            };
+            return Ok(());
+        }
+
+        // 没有可上传的本地 helper：不自动上传，使用远端预装路径。
+        ssh.upload_helper = false;
+        if ssh
+            .helper_path
+            .as_deref()
+            .is_none_or(|path| path.trim().is_empty())
+        {
+            if self.paths.helper.trim().is_empty() {
+                return Err(InjectionPathError::Empty);
+            }
+            ssh.helper_path = Some(self.paths.helper.clone());
+        }
+        ssh.injection = InjectionPlan {
+            consent: InjectionConsentMode::Deny,
+            allow: false,
+            ..paths
+        };
+        Ok(())
+    }
+
+    /// 计划里的路径字段（原样保留 `~/`，由远端展开）。
+    fn plan_paths(&self) -> InjectionPlan {
+        InjectionPlan {
+            root: Some(self.root.clone()),
+            helper: Some(self.paths.helper.clone()),
+            pwsh: Some(self.paths.pwsh.clone()),
+            bash: Some(self.paths.bash.clone()),
+            sh: Some(self.paths.sh.clone()),
+            ..InjectionPlan::default()
+        }
+    }
+
+    /// 设置根目录并重新派生路径；非法值保留并 warn。
+    fn set_root(&mut self, root: &str) {
+        let root = root.trim();
+        if root.is_empty() {
+            tracing::warn!("注入根目录为空，保留原值");
+            return;
+        }
+        if let Err(error) = validate_path_spec(root) {
+            tracing::warn!(
+                value = %root,
+                reason = error.reason(),
+                "注入根目录非法，保留原值等待连接前校验"
+            );
+        }
+        self.root = root.to_string();
+        self.paths = RemoteInjectionPaths::from_root(root);
+    }
+}
+
+/// 把 `root` 与相对尾部拼成注入路径；保留 `~/` 原样。
+fn join_root(root: &str, tail: &str) -> String {
+    let trimmed = root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        format!("/{tail}")
+    } else {
+        format!("{trimmed}/{tail}")
+    }
+}
+
+/// 读取非空环境变量（保留原值，由调用方决定 trim/校验）。
+fn env_string<F>(env: &F, name: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env(name).and_then(|value| value.into_string().ok())
+}
+
 /// 服务配置。
 ///
 /// 自定义 `Debug`：`web_password` 只在输出中标记是否已设置，绝不打印明文。
@@ -117,6 +423,8 @@ impl ClientIdlePolicy {
 pub struct ServiceConfig {
     /// token/port 文件所在目录。
     pub config_dir: PathBuf,
+    /// runtime catalog 目录；缺省 `<config_dir>/runtimes`。
+    pub runtime_dir: Option<PathBuf>,
     /// 监听地址；缺省为 `127.0.0.1:0`。
     pub bind_addr: SocketAddr,
     /// 每个终端的事件缓冲容量；缺省 4096。
@@ -166,12 +474,15 @@ pub struct ServiceConfig {
     pub web_allow_remote: bool,
     /// Web 登录密码；来自 `TERMX_WEB_PASSWORD`，远程访问时必填。
     pub web_password: Option<String>,
+    /// 远端注入授权与路径；缺省 `ask` + `~/.termx` 派生路径。
+    pub remote_injection: RemoteInjectionConfig,
 }
 
 impl fmt::Debug for ServiceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceConfig")
             .field("config_dir", &self.config_dir)
+            .field("runtime_dir", &self.runtime_dir)
             .field("bind_addr", &self.bind_addr)
             .field("event_buffer_capacity", &self.event_buffer_capacity)
             .field("transcript_capacity", &self.transcript_capacity)
@@ -206,6 +517,7 @@ impl fmt::Debug for ServiceConfig {
                 "web_password",
                 &self.web_password.as_ref().map(|_| "<redacted>"),
             )
+            .field("remote_injection", &self.remote_injection)
             .finish()
     }
 }
@@ -215,6 +527,7 @@ impl ServiceConfig {
     pub fn new(config_dir: PathBuf) -> Self {
         Self {
             config_dir,
+            runtime_dir: None,
             bind_addr: DEFAULT_BIND_ADDR,
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
@@ -237,7 +550,22 @@ impl ServiceConfig {
             web_port: 0,
             web_allow_remote: false,
             web_password: None,
+            remote_injection: RemoteInjectionConfig::new(),
         }
+    }
+
+    /// 覆盖 runtime catalog 目录；缺省为 `<config_dir>/runtimes`。
+    #[must_use]
+    pub fn with_runtime_dir(mut self, runtime_dir: PathBuf) -> Self {
+        self.runtime_dir = Some(runtime_dir);
+        self
+    }
+
+    /// runtime catalog 目录；未显式覆盖时取 `<config_dir>/runtimes`。
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.runtime_dir
+            .clone()
+            .unwrap_or_else(|| self.config_dir.join("runtimes"))
     }
 
     /// 覆盖监听地址（便于测试或后续配置项扩展）。
@@ -373,6 +701,13 @@ impl ServiceConfig {
         self
     }
 
+    /// 覆盖远端注入配置。
+    #[must_use]
+    pub fn with_remote_injection(mut self, remote_injection: RemoteInjectionConfig) -> Self {
+        self.remote_injection = remote_injection;
+        self
+    }
+
     /// 用显式配置目录构造配置，并读取环境调参。
     /// 配置目录**只**来自参数，不会从 `TERMX_CONFIG_DIR`、`XDG_CONFIG_HOME`、
     /// `APPDATA` 或 `HOME` 推导；调用方（命令行入口）负责解析与校验。
@@ -431,6 +766,7 @@ impl ServiceConfig {
             positive_usize_from_env(TERMX_STDIO_WRITE_QUEUE_ENV, &env)
                 .unwrap_or(DEFAULT_STDIO_WRITE_QUEUE_CAPACITY);
         config.web_password = web_password_from_env(&env);
+        config.remote_injection = RemoteInjectionConfig::from_env(&env);
         config
     }
 
@@ -1026,5 +1362,241 @@ mod tests {
         assert_eq!(configured.web_port, 8138);
         assert!(configured.web_allow_remote);
         assert_eq!(configured.web_password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn remote_injection_defaults_match_requirement() {
+        let config = RemoteInjectionConfig::default();
+        assert_eq!(config.consent, InjectionConsentMode::Ask);
+        assert_eq!(config.root, "~/.termx");
+        assert_eq!(config.paths.helper, "~/.termx/bin/termx-helper");
+        assert_eq!(config.paths.pwsh, "~/.termx/runtimes/pwsh");
+        assert_eq!(config.paths.bash, "~/.termx/runtimes/bash");
+        assert_eq!(config.paths.sh, "~/.termx/runtimes/sh");
+        assert_eq!(config.helper_local, "", "默认不自动上传本地 helper");
+
+        let service = ServiceConfig::new(PathBuf::from("/tmp/termx"));
+        assert_eq!(service.remote_injection, config);
+    }
+
+    #[test]
+    fn remote_injection_reads_env_and_derives_paths() {
+        let table = [
+            (TERMX_REMOTE_INJECTION_CONSENT_ENV, "allow"),
+            (TERMX_REMOTE_INJECTION_ROOT_ENV, "/opt/termx"),
+        ];
+        let config = RemoteInjectionConfig::from_env(&|key: &str| {
+            table
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(*value))
+        });
+        assert_eq!(config.consent, InjectionConsentMode::Allow);
+        assert_eq!(config.root, "/opt/termx");
+        assert_eq!(config.paths.helper, "/opt/termx/bin/termx-helper");
+        assert_eq!(config.paths.pwsh, "/opt/termx/runtimes/pwsh");
+
+        // 单路径覆盖优先于 root 派生；本地 helper 路径单独读取。
+        let table = [
+            (TERMX_REMOTE_INJECTION_ROOT_ENV, "~/.termx"),
+            (
+                TERMX_REMOTE_INJECTION_HELPER_ENV,
+                "~/.local/bin/termx-helper",
+            ),
+            (TERMX_REMOTE_INJECTION_SH_ENV, "/opt/sh"),
+            (
+                TERMX_REMOTE_INJECTION_HELPER_LOCAL_ENV,
+                "  /opt/termx/helper  ",
+            ),
+        ];
+        let config = RemoteInjectionConfig::from_env(&|key: &str| {
+            table
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(*value))
+        });
+        assert_eq!(config.paths.helper, "~/.local/bin/termx-helper");
+        assert_eq!(config.paths.sh, "/opt/sh");
+        assert_eq!(config.paths.pwsh, "~/.termx/runtimes/pwsh");
+        assert_eq!(config.helper_local, "/opt/termx/helper");
+    }
+
+    #[test]
+    fn remote_injection_keeps_invalid_values_and_falls_back_on_empty() {
+        let config = RemoteInjectionConfig::from_env(&|key: &str| match key {
+            TERMX_REMOTE_INJECTION_CONSENT_ENV => Some(OsString::from("bogus")),
+            TERMX_REMOTE_INJECTION_ROOT_ENV => Some(OsString::from("   ")),
+            TERMX_REMOTE_INJECTION_HELPER_ENV => Some(OsString::from("relative/helper")),
+            _ => None,
+        });
+        assert_eq!(
+            config.consent,
+            InjectionConsentMode::Ask,
+            "非法模式回退 ask"
+        );
+        assert_eq!(config.root, "~/.termx", "空 root 保留默认");
+        assert_eq!(
+            config.paths.helper, "relative/helper",
+            "非法路径保留原值，等待连接前校验"
+        );
+
+        let configured = RemoteInjectionConfig::new()
+            .with_consent(InjectionConsentMode::Deny)
+            .with_root("/srv/termx")
+            .with_helper_path("/srv/termx/helper");
+        assert_eq!(configured.consent, InjectionConsentMode::Deny);
+        assert_eq!(configured.root, "/srv/termx");
+        assert_eq!(configured.paths.helper, "/srv/termx/helper");
+        assert_eq!(configured.paths.bash, "/srv/termx/runtimes/bash");
+    }
+
+    /// 构造 SSH 参数；`helper_path` 留空，由计划覆盖或请求自行提供。
+    fn ssh_config(upload_helper: bool) -> SshConfig {
+        SshConfig {
+            host: "example.com".to_string(),
+            port: 22,
+            user: "alice".to_string(),
+            auth: termx_protocol::SshAuth::Password {
+                password: "secret".to_string(),
+            },
+            helper_path: None,
+            helper_local_path: upload_helper.then(|| "./termx-helper".to_string()),
+            helper_sha256: None,
+            upload_helper,
+            accept_any_host_key: false,
+            injection: InjectionPlan::default(),
+        }
+    }
+
+    #[test]
+    fn plan_for_ssh_auto_upload_uses_configured_helper_local() {
+        let config = RemoteInjectionConfig::new().with_helper_local("./termx-helper");
+        let mut ssh = ssh_config(false);
+
+        config
+            .plan_for_ssh(&mut ssh, false, true)
+            .expect("默认路径应合法");
+        assert!(ssh.upload_helper, "有本地 helper 时应自动开启上传");
+        assert_eq!(
+            ssh.helper_local_path.as_deref(),
+            Some("./termx-helper"),
+            "客户端不再手填本地 helper"
+        );
+        assert_eq!(
+            ssh.helper_path.as_deref(),
+            Some("~/.termx/bin/termx-helper")
+        );
+        assert_eq!(ssh.injection.consent, InjectionConsentMode::Ask);
+        assert!(!ssh.injection.allow, "未确认的请求不得自动授权");
+        assert_eq!(
+            ssh.injection.pwsh.as_deref(),
+            Some("~/.termx/runtimes/pwsh")
+        );
+
+        let mut confirmed = ssh_config(false);
+        config
+            .plan_for_ssh(&mut confirmed, true, true)
+            .expect("默认路径应合法");
+        assert_eq!(confirmed.injection.consent, InjectionConsentMode::Ask);
+        assert!(confirmed.injection.allow, "allow 只来自本次请求");
+    }
+
+    #[test]
+    fn plan_for_ssh_legacy_upload_keeps_request_local_path() {
+        let config = RemoteInjectionConfig::new();
+        let mut ssh = ssh_config(true);
+
+        config
+            .plan_for_ssh(&mut ssh, false, false)
+            .expect("旧格式应继续可用");
+        assert!(ssh.upload_helper, "旧格式显式上传仍然生效");
+        assert_eq!(ssh.helper_local_path.as_deref(), Some("./termx-helper"));
+        assert_eq!(
+            ssh.helper_path.as_deref(),
+            Some("~/.termx/bin/termx-helper")
+        );
+        assert_eq!(ssh.injection.consent, InjectionConsentMode::Ask);
+    }
+
+    #[test]
+    fn plan_for_ssh_read_only_mode_forces_deny_without_overriding_path() {
+        let config = RemoteInjectionConfig::new().with_consent(InjectionConsentMode::Allow);
+        let mut ssh = ssh_config(false);
+        ssh.helper_path = Some("/opt/preinstalled/termx-helper".to_string());
+
+        config
+            .plan_for_ssh(&mut ssh, true, false)
+            .expect("只读模式不校验写入路径");
+        assert_eq!(ssh.injection.consent, InjectionConsentMode::Deny);
+        assert!(!ssh.injection.allow, "只读模式必须保持未授权");
+        assert_eq!(
+            ssh.helper_path.as_deref(),
+            Some("/opt/preinstalled/termx-helper"),
+            "只读模式不得覆盖请求里的已有 helper 路径"
+        );
+    }
+
+    #[test]
+    fn plan_for_ssh_without_helper_local_uses_preinstalled_path() {
+        let config = RemoteInjectionConfig::new();
+        let mut ssh = ssh_config(false);
+
+        config
+            .plan_for_ssh(&mut ssh, true, true)
+            .expect("预装路径应合法");
+        assert!(!ssh.upload_helper, "没有本地 helper 时不得自动上传");
+        assert!(ssh.helper_local_path.is_none());
+        assert_eq!(
+            ssh.helper_path.as_deref(),
+            Some("~/.termx/bin/termx-helper"),
+            "回退到配置的远端预装路径"
+        );
+        assert_eq!(ssh.injection.consent, InjectionConsentMode::Deny);
+        assert!(!ssh.injection.allow);
+    }
+
+    #[test]
+    fn plan_for_ssh_overrides_helper_path_with_configured_value() {
+        let config = RemoteInjectionConfig::new()
+            .with_helper_path("/srv/termx/bin/helper")
+            .with_helper_local("/local/termx-helper");
+        let mut ssh = ssh_config(false);
+        ssh.helper_path = Some("/request/ignored".to_string());
+
+        config
+            .plan_for_ssh(&mut ssh, false, true)
+            .expect("自定义路径应合法");
+        assert_eq!(ssh.helper_path.as_deref(), Some("/srv/termx/bin/helper"));
+        assert_eq!(
+            ssh.injection.helper.as_deref(),
+            Some("/srv/termx/bin/helper")
+        );
+    }
+
+    #[test]
+    fn plan_for_ssh_rejects_invalid_helper_path() {
+        for path in ["relative/helper", "~/../escape", "/srv/../helper", " "] {
+            let config = RemoteInjectionConfig::new()
+                .with_helper_path(path)
+                .with_helper_local("./termx-helper");
+            let mut ssh = ssh_config(false);
+            assert!(
+                config.plan_for_ssh(&mut ssh, true, true).is_err(),
+                "路径 {path:?} 应被拒绝"
+            );
+            assert_eq!(ssh.helper_path, None, "非法路径不得覆盖安装目标: {path:?}");
+            assert_eq!(ssh.injection, InjectionPlan::default());
+        }
+    }
+
+    #[test]
+    fn plan_for_ssh_requires_remote_helper_path_when_local_missing() {
+        let config = RemoteInjectionConfig::new().with_helper_path("");
+        let mut ssh = ssh_config(false);
+        assert_eq!(
+            config.plan_for_ssh(&mut ssh, true, true),
+            Err(InjectionPathError::Empty),
+            "本地与远端 helper 都为空时应明确报错"
+        );
     }
 }

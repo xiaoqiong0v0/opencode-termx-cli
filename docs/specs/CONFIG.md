@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `toolLang` | `"en"` | 工具描述/错误文案语言：`en`/`zh`；`TERMX_TOOL_LANG` 覆盖 |
 | `webLang` | `"en"` | Web UI 语言预留；`TERMX_WEB_LANG` 覆盖 |
-| `service.autostart` | `true` | service 不可连时是否由插件自动拉起 |
+| `service.autostart` | `true` | service 不可连时是否由插件自动拉起；插件加载时后台预热（不阻塞 opencode），首次工具调用复用/重试 |
 | `service.bin` | `"termx-service"` | service 可执行文件（命令名或绝对路径） |
 | `service.configDir` | 空 | token/port 目录；空 = `<插件缓存>/config` |
 | `service.port` | `0` | 监听端口；0 = OS 分配 |
@@ -25,6 +25,14 @@
 | `limits.clientIdleTimeoutMs` | `300000` | 无存活会话超时（毫秒，默认 5 分钟）；`0` 关闭（传给 `TERMX_CLIENT_IDLE_TIMEOUT_MS`） |
 | `interaction.tickMs` | `250` | 交互识别 ticker 周期 |
 | `interaction.noOutputMs` | `5000` | 无输出判定阈值 |
+| `injection.consent` | `"ask"` | 本地/远端共同默认授权：`ask`（缺 `allow_injection=true` 时返回 `consent_required`）/ `allow` / `deny` |
+| `injection.root` | `"~/.termx"` | 默认注入根目录；本地展开本机 home，远端展开远端 home |
+| `injection.helperLocal` | 空 | 本地 controller 上的 helper 产物路径；空表示不自动上传，使用远端预装 helper |
+| `injection.paths.helper` | `<root>/bin/termx-helper` | 远端 helper 安装/预装目标 |
+| `injection.paths.pwsh` | `<root>/runtimes/pwsh` | pwsh runtime 目录（本轮预留） |
+| `injection.paths.bash` | `<root>/runtimes/bash` | bash runtime 目录（本轮预留） |
+| `injection.paths.sh` | `<root>/runtimes/sh` | sh runtime 目录（本轮预留） |
+| `local.injection` / `remote.injection` | 继承 `injection` | 可选覆盖；字段级合并，`paths` 按 key 覆盖。旧的 `remote.injection` 仍兼容 |
 
 ### 环境变量覆盖
 - `TERMX_CONFIG`：配置文件路径。
@@ -37,6 +45,12 @@
 - `TERMX_CLIENT_IDLE_TIMEOUT_MS`：终端所属 `root_session_id` 无会话心跳的时长上限（毫秒），默认 `300000`（5 分钟），`0` 关闭；与按活动时间的 `idle_timeout` 独立。
 - `TERMX_CLIENT_IDLE_POLICY`：到期策略，默认 `no_children`（仍有用户子进程则继续保活）；`any` 到期即终止；`never` 永不因无会话终止。
 - `TERMX_SESSION_TTL_MS`：会话心跳 TTL（毫秒），默认 `90000`（90 秒）；超过该时间未收到 `heartbeat {root_session_id}` 视为会话结束。
+- 插件先合并顶层 `injection` 与 `local.injection` / `remote.injection`，再把远端生效值转成下面的 env。
+- `TERMX_REMOTE_INJECTION_CONSENT`：`ask`/`allow`/`deny`，默认 `ask`；非法值保留默认并 warn。
+- `TERMX_REMOTE_INJECTION_ROOT`：注入根目录，默认 `~/.termx`；设置后按 `<root>/bin/termx-helper` 与 `<root>/runtimes/{pwsh,bash,sh}` 重新派生路径。
+- `TERMX_REMOTE_INJECTION_{HELPER,PWSH,BASH,SH}`：单独覆盖对应路径；非法路径保留原值并 warn，在连接前由路径校验给出明确错误。
+- `TERMX_REMOTE_INJECTION_HELPER_LOCAL`：本地 controller 上的 helper 产物路径；空表示不自动上传。
+- 远端路径规则：只允许绝对路径或 `~/...`；拒绝空值、空白/控制字符、`..` 组件与相对路径。`helperLocal` 是本机路径，不走该规则。
 
 ## 2. 插件缓存与日志
 - 缓存/日志根：`~/.opencode/plugins-cache/@xiaoqiong0v0/opencode-termx/termx-service/`。
@@ -52,7 +66,7 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
               [--web-port <u16>] [--web-allow-remote true|false]
 ```
 - `--config-dir` 必填（或显式 `TERMX_CONFIG_DIR`）；**无平台默认目录**。
-- token 缺省 `<config-dir>/token`；port 文件 `<config-dir>/port`。
+- token 缺省 `<config-dir>/token`；port 文件 `<config-dir>/port`；runtime catalog 缺省 `<config-dir>/runtimes/index.json`。
 - `--log-enabled true` 时必须给 `--log-dir`；`--log-max-days` 默认 7。
 - `--web-port` 缺省 `0`（不启动 Web）；`--web-allow-remote` 缺省 `false`。
 - Web 登录密码**只**从环境变量 `TERMX_WEB_PASSWORD` 读取，不进命令行与日志。
@@ -69,12 +83,13 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
 - 登录会话在内存中保留 12 小时，过期后需重新登录；没有登出与登录限速。远程 Web 为明文 HTTP，仅建议在可信内网使用，或置于 HTTPS 反代之后。
 - 插件连接前校验 endpoint 主机必须是 `127.0.0.1` 或 `[::1]`；外部地址直接拒绝，避免 token 发往非环回主机。
 - 路由：`GET /`（首页）、`GET /login`、`POST /login`、`GET /static/*`、`GET /ws`（代理到内部 service，注入 `hello`，浏览器不接触 token）。
-- 页面默认「信息」Tab（transcript 文本 + 命令输入框，轮询 `terminal.transcript`），可切到「原始控制台」Tab 使用现有 xterm；切换不销毁终端。
+- 页面默认「信息」Tab（每条命令+输出为一组：命令行左侧开始时间，输出末行左侧 `+耗时` 与退出状态，无输出补空白行；轮询 `terminal.transcript`）。有 `exit_code` 时显示 `✓ 0`/`✗ N`；无退出码的静默降级显示 `~`。可切到「原始控制台」Tab 使用现有 xterm；切换不销毁终端。
+- 所有状态/错误消息写入**底部状态栏**，在「信息」和「原始控制台」两个 Tab 下都可见；`info`/`success`/`warning`/`error` 四色，点击关闭，同一消息关闭后重复上报不再自动弹回；WebSocket 重连成功清除。**不使用 toast**；高频进度/等待态不刷屏；标题栏不显示状态文本。
 - **两级选择**：header 依次选择 opencode 会话（`session.list` + 固定项「其他/未绑定」`@web`）和该会话下的终端（`terminal.list` 按 `root_session_id` 过滤；显示名称/状态/pid）。刷新、迁移（`rebound`）与新建后自动刷新并保留/选中当前终端。
 - **信息页顶部**：显示当前终端的 `state`、`pid`、`mode`、启动命令（`command` + `args`）与 `cwd`（来自 `terminal.list` / `terminal.status` 快照）。
 - **新建终端**：header「新建终端」打开表单，绑定会话（含「其他/未绑定」`@web`）、名称（默认 `default`）、类型 `local`/`ssh`。
   - `local`：程序、参数（空格分隔，支持单/双引号）、cwd、环境变量（每行 `KEY=VALUE`）、cols/rows。
-  - `ssh`：host/port/user、密码或私钥路径/口令、helper 远端路径或上传（本地路径/sha256）、`accept-any-host-key`、cols/rows；启动程序留空时使用交互式 shell（`cmd:"shell"`）。
+  - `ssh`：host/port/user、密码或私钥路径/口令、运行环境（`termx-pwsh` / 系统 shell）、`accept-any-host-key`、cols/rows；helper 路径/上传/摘要由 service 按注入配置自动处理。主机为 `127.0.0.1`/`localhost`/`::1` 时默认勾选 `accept-any-host-key`，外部主机默认不勾。
   - 提交 `terminal.create`（`mode:"pty"`）；绑定「其他/未绑定」时 `root_session_id` 使用保留值 `@web`。成功后刷新两级选择并选中新终端，失败在弹窗内显示错误。
   - **密码/口令只随本次创建请求发送**（内存表单 → WebSocket），不写页面文本、日志或 localStorage；关闭弹窗时清空。
 - **`@web` 生命周期**：该会话下的终端不参与无会话超时（clientless 扫描跳过），只能手动终止；非管理员（普通 opencode 会话连接）不可见/不可访问。迁移弹窗也可把终端迁到 `@web`（管理员，等同解绑）。
@@ -85,11 +100,40 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
 - `port` 使用“同目录临时文件 + rename”原子替换：绑定中途失败不会留下半写文件，也不会破坏上一次成功写入的内容。
 - 插件 autostart 的并发容错：子进程若因单实例锁立即退出，插件会在宽限期内重新读取 `port`/`token` 并握手一次；成功则复用已运行实例，不再报“connection refused”。
 
+## 3.2 Runtime catalog（P1）
+
+- 目录：`<config_dir>/runtimes/`（service 也可用 `ServiceConfig::with_runtime_dir` 覆盖；无新增必填 CLI 参数）。
+- 索引：`<config_dir>/runtimes/index.json`；service 启动时读取一次，缺失/非法只记录警告并保持空 catalog，不影响旧 `cmd/args` 创建。
+- P1 **不下载、不远程传输**；只使用本机已存在的文件。
+
+```json
+{
+  "runtimes": [
+    {
+      "id": "termx-pwsh",
+      "name": "termx-pwsh",
+      "version": "0.1.0",
+      "platform": "windows",
+      "arch": "x86_64",
+      "bin": "bin/termx-pwsh.exe",
+      "args": []
+    }
+  ]
+}
+```
+
+- `bin` 必须是 `runtimes/` 下的相对路径；拒绝绝对路径、`..`、盘符前缀与 symlink 越界。
+- 启动前检查文件存在且可执行；Windows 按 `.exe/.cmd/.bat/.com`，Unix 检查执行位。
+- `platform` / `arch` 与 `std::env::consts` 对齐：`windows|linux|macos`、`x86_64|aarch64`。
+- `runtime.list` 只返回当前平台兼容项；`available` 表示 bin 存在且可执行（不暴露绝对路径）。
+- `terminal.create.runtime_id` 与自定义 `cmd/args` 互斥；未给 `runtime_id` 时保持旧行为。
+
 ## 4. termx-cli / termx-client
 - 必须显式 `--config-dir` 或 `--endpoint`（或非空 `TERMX_CONFIG_DIR`）；无平台默认。
 - token 优先级：`--token` > `TERMX_TOKEN` > `<config-dir>/token`。
 - 端口读 `<config-dir>/port`。
 - **CLI 调用者会话 ID**：`--root-session-id <ID>`（全局参数）> `TERMX_ROOT_SESSION_ID` > `default`；作为 `hello.root_session_id` 发送，决定 CLI 能访问哪些终端（仅同会话，`list`/`prune` 也只作用于该会话）。CLI 不声明 `admin`。
+- **内置 runtime**：`termx-cli local --runtime <ID>`（全局参数，可放在子命令前/后）设置 `CreateParams.runtime_id`，并清空 `cmd/args`；若同时给 `--cmd` 或尾随参数则直接报用法错误。未给 `--runtime` 时保持旧默认 shell 行为。`termx-cli runtime list` 暂未实现（可通过 Web/协议 `runtime.list` 查询）。
 - 插件按当前工具调用的 opencode `sessionID` 建立/复用**独立连接**（`endpoint + token + rootSessionId` 为缓存键），并每 30s 发 `heartbeat {root_session_id}`；`session.deleted` 时用该会话连接发 `session_closed` 后关闭。Web 代理使用 `admin:true`，不经插件。
 - CLI 在 `local --follow` 与长 `exec` 期间同样每 30s 发送 `heartbeat {root_session_id}`；心跳失败仅停止心跳，不中断命令与输出。
 

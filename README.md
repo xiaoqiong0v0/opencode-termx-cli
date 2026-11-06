@@ -2,7 +2,7 @@
 
 用 Rust 重写终端会话/进程监督层的独立项目，目标是为本地终端与 SSH 终端提供**真实进程状态**、**精确退出/中断**和**交互事件**，而不是依赖输出文本中的完成标记。
 
-> 当前状态：**M0–M6 已完成**——协议、service（WS/token/hello）、本地 PTY/stdio、交互识别、`termx-client`/`termx-cli`、SSH（russh）与 `termx-helper` 分发/回退均已落地；Windows/WSL 与真实 SSH 容器测试通过。先读 `docs/REQUIREMENTS.md`、`docs/PROTOCOL.md` 与 `docs/ADAPTER.md`。
+> 当前状态：**M0–M6 已完成**——协议、service（WS/token/hello）、本地 PTY/stdio、交互识别、`termx-client`/`termx-cli`、SSH（russh）与 `termx-helper` 分发/回退均已落地；Windows/WSL 与真实 SSH 容器测试通过。先读 `docs/process/REQUIREMENTS.md`、`docs/specs/PROTOCOL.md` 与 `docs/design/ADAPTER.md`。
 
 > 架构：**中心化 termx service**。终端归服务所有；opencode 模型/Web/CLI 都是客户端，经**本机 WebSocket（环回）+ token** 访问。opencode 会话重启只 detach，不杀终端。
 
@@ -19,22 +19,23 @@
 - 生命周期：默认 `idle_timeout=0`（永不超时）；opencode 会话重启只 detach，不中断终端；用户可配置超时/显式断开。
 
 ## 文档
-- `docs/REQUIREMENTS.md`：目标、场景、范围冻结、功能/非功能需求、决策记录（已确认）、可测验收。
-- `docs/PROTOCOL.md`：**术语/状态/事件/RPC 的唯一权威**（传输、鉴权、序号/游标、背压、错误码、版本）。
-- `docs/DEV_PLAN.md`：技术选型、crate 结构、里程碑 M0–M6、门禁、测试策略、风险。
-- `docs/ARCHITECTURE.md`：分层、事件状态机、依赖与质量门禁。
-- `docs/REFERENCE_AND_PITFALLS.md`：旧实现可参考点、已知坑、设计约束。
-- `docs/ADAPTER.md`：opencode `termx_*` 工具 → RPC 映射与事件通知契约。
-- `docs/ASYNC.md`：并发交互点清单（共享状态/保护手段/顺序契约）。
+- `docs/process/REQUIREMENTS.md`：目标、场景、范围冻结、功能/非功能需求、决策记录（已确认）、可测验收。
+- `docs/specs/PROTOCOL.md`：**术语/状态/事件/RPC 的唯一权威**（传输、鉴权、序号/游标、背压、错误码、版本）。
+- `docs/process/DEV_PLAN.md`：技术选型、crate 结构、里程碑 M0–M6、门禁、测试策略、风险。
+- `docs/design/ARCHITECTURE.md`：分层、事件状态机、依赖与质量门禁。
+- `docs/reference/REFERENCE_AND_PITFALLS.md`：旧实现可参考点、已知坑、设计约束。
+- `docs/design/ADAPTER.md`：opencode `termx_*` 工具 → RPC 映射与事件通知契约。
+- `docs/specs/ASYNC.md`：并发交互点清单（共享状态/保护手段/顺序契约）。
+- `docs/design/FRAMEWORK_REDESIGN.md`：Runtime 自带 + 下拉选择、产物分发/缓存、协议 v2 与目标目录的重构方案（设计提案）。
 
 ## 实现顺序
-见 `docs/DEV_PLAN.md` 的里程碑 M0–M6：工程骨架 → service 骨架 → 本地 PTY → stdio/流控 → 交互识别 → CLI/adapter → SSH/helper。
+见 `docs/process/DEV_PLAN.md` 的里程碑 M0–M6：工程骨架 → service 骨架 → 本地 PTY → stdio/流控 → 交互识别 → CLI/adapter → SSH/helper。
 
 ## opencode 插件（项目内）
 - **包名**：`@xiaoqiong0v0/opencode-termx`（`private: true`，当前为本地插件，不发布）。
 - **源码（跟踪）**：`opencode-plugin/termx/`（`src/termx.ts` + `src/termx-rpc.mjs` + `package.json` + `tsconfig.json`）。
 - **生成**：`node scripts/build-opencode-plugin.mjs` → 用 esbuild 打包为 `.opencode/plugins/termx.js`，并写 `.opencode/package.json`。
-- **全局配置**：`~/.config/opencode/termx.jsonc`（首次生成模板；语言、service autostart/端口/token、web 端口、日志保留、限额）。详见 `docs/CONFIG.md`。
+- **全局配置**：`~/.config/opencode/termx.jsonc`（首次生成模板；语言、service autostart/端口/token、web 端口、日志保留、限额）。详见 `docs/specs/CONFIG.md`。
 - **自动启动**：service 不可连时插件按配置拉起 `termx-service`，显式传 configDir/port/token/日志目录与开关；日志落 `~/.opencode/plugins-cache/@xiaoqiong0v0/opencode-termx/termx-service/`。
 - **类型检查/构建**：`cd opencode-plugin/termx && npm run typecheck`、`npm run build`（产出 `dist/`，`npm pack --dry-run` 校验发布内容）。
 - **日志**：使用 `@xiaoqiong0v0/opencode-plugin-logger`；开关见 `~/.config/opencode/plugin-logger.jsonc` 的 `enabled`（默认关）。

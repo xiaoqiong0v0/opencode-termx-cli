@@ -20,6 +20,8 @@ fn params(name: &str) -> CreateParams {
         force: false,
         idle_timeout: None,
         ssh: None,
+        allow_injection: false,
+        runtime_id: None,
     }
 }
 

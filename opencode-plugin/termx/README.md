@@ -5,7 +5,8 @@ opencode 插件：通过本机 `termx-service` 提供单个 **`termx_cli`** 终�
 ## 前置与配置
 
 - 默认配置：`~/.config/opencode/termx.jsonc`（首次运行自动生成模板；`TERMX_CONFIG` 可覆盖路径）。
-- 插件按配置自动启动 `termx-service`（显式传 `--config-dir/--port/--token-file/--log-*`），
+- 插件加载时按配置**后台预热** `termx-service`（不 await、不阻塞 opencode；已有手动实例会被探测复用），
+  首次工具调用复用同一启动 Promise 并在失败时重试。启动时显式传 `--config-dir/--port/--token-file/--log-*`；
   配置目录默认在 `~/.opencode/plugins-cache/@xiaoqiong0v0/opencode-termx/termx-service/config`。
 - 若设置 `service.endpoint` 则直接连接、不自动启动；`service.autostart=false` 时只复用已运行实例。
 - 常用环境覆盖：`TERMX_CONFIG_DIR`、`TERMX_ENDPOINT`、`TERMX_TOKEN`、`TERMX_TOOL_LANG`（en/zh）。

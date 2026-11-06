@@ -1,0 +1,15 @@
+[package]
+name = "termx-shell-events"
+description = "shell 带外事件通道：named pipe / Unix socket、token 握手与 JSON Lines 帧"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 事件类型由主协议统一维护，本地通道与远端 helper 共用同一词表。
+termx-protocol = { path = "../termx-protocol" }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true }

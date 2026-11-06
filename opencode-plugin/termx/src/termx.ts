@@ -1,8 +1,8 @@
 // opencode 项目内插件：把 termx-service 的 RPC 暴露为单工具 `termx_cli`。
 //
 // 工具只接受完整命令行字符串；子命令解析与 RPC 映射见 `cli.ts`。
-// 配置在插件初始化时读取（仅本地文件，不阻塞）；连接/自动启动推迟到首次
-// 工具调用，避免插件加载被 service 启动拖住。
+// 配置在插件初始化时读取（仅本地文件，不阻塞）；service.autostart=true 时
+// 后台预热 service（不 await），已有手动启动的 service 会直接复用。
 
 import { tool } from "@opencode-ai/plugin";
 import type { Plugin, PluginModule } from "@opencode-ai/plugin";
@@ -21,13 +21,15 @@ import type { TermxClient } from "./termx-rpc.mjs";
 const z = tool.schema;
 const log = createLogger("opencode-termx");
 
-/** 连接管理器：首次调用时解析/启动 service，连接失败重置后重试一次。 */
+/** 连接管理器：启动时预热 service，首次工具调用复用同一 Promise。 */
 interface ConnectionManager {
+  /** 后台预启动/探测 service；不阻塞插件加载。 */
+  warmup(): void;
   /** 取指定 opencode 会话的独立连接。 */
   client(rootSessionId: string): Promise<TermxClient>;
 }
 
-/** 创建连接管理器（延迟到 execute 内执行）。 */
+/** 创建连接管理器；`warmup` 与首次 `client` 共用同一启动 Promise。 */
 function createConnection(config: TermxConfig): ConnectionManager {
   let pending: Promise<TermxConnection> | null = null;
 
@@ -42,6 +44,15 @@ function createConnection(config: TermxConfig): ConnectionManager {
   };
 
   return {
+    warmup(): void {
+      // 与旧项目一致：刻意不 await，启动慢/失败都不阻塞插件加载。
+      void resolve().catch((error: unknown) => {
+        log.warn(
+          "termx-service 后台预热失败（首次工具调用会重试）",
+          error instanceof Error ? error.message : String(error),
+        );
+      });
+    },
     async client(rootSessionId: string): Promise<TermxClient> {
       const connection = await resolve();
       try {
@@ -76,6 +87,8 @@ const server: Plugin = async () => {
   const config = loadConfig();
   const t: Translator = createI18n(config.toolLang);
   const connection = createConnection(config);
+  // 参考旧项目：插件初始化即后台启动 service，不阻塞 opencode；已有实例会被 probe 复用。
+  if (config.service.autostart) connection.warmup();
   /** read/exec -w 的每终端增量游标。 */
   const cursors = new Map<string, number>();
 

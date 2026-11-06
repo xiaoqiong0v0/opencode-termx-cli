@@ -1,6 +1,6 @@
 //! 客户端错误类型。
 //!
-//! 错误分层对齐 `docs/PROTOCOL.md` §10：握手阶段的 `auth_failed` /
+//! 错误分层对齐 `docs/specs/PROTOCOL.md` §10：握手阶段的 `auth_failed` /
 //! `version_mismatch` 单独成变体，其余协议错误原样保留 [`ProtocolError`]，
 //! 便于调用方按 `code` 做业务分支。
 

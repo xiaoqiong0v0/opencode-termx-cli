@@ -2,7 +2,7 @@
 
 日期：2026-11-02
 状态：**M0–M6 已实现并通过 Windows/WSL + 真实 SSH 容器测试**
-依赖：`docs/REQUIREMENTS.md`（范围/验收）、`docs/PROTOCOL.md`（协议权威）
+依赖：`docs/process/REQUIREMENTS.md`（范围/验收）、`docs/specs/PROTOCOL.md`（协议权威）
 
 ## 1. 原则
 - 先做对所有权与进程语义，再做交互识别，最后 SSH/helper。
@@ -41,7 +41,7 @@ termx/
 │  ├─ termx-client/          # 客户端库：发现/hello/请求配对/事件广播（CLI 与 adapter 共用）
 │  ├─ termx-cli/             # 客户端：local/ssh/exec/status/read/send/...
 │  └─ termx-helper/          # 远端 sidecar（可单独构建/交叉编译）
-└─ adr/                      # 架构决策记录（选型留痕）
+└─ docs/adr/                 # 架构决策记录（选型留痕）
 ```
 依赖方向：`protocol` ← `terminal`/`proc`/`ssh` ← `core` ← `service`；`termx-client` 只依赖 `protocol`，由 `cli`/adapter 复用；`helper` 只依赖 `protocol`+`proc` 子集。
 
@@ -107,5 +107,5 @@ termx/
 
 ## 8. 交付与回滚
 - 代码按里程碑提交；文档变更随里程碑同批。
-- 选型/架构变化写 `adr/`，可回溯。
+- 选型/架构变化写 `docs/adr/`，可回溯。
 - 未过门禁不合并下一阶段。

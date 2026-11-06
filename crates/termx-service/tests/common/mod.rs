@@ -11,7 +11,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use termx_core::Registry;
+use termx_core::{BackendFactory, Registry};
 use termx_protocol::{CreateResult, Event, PROTOCOL_VERSION, Response, from_json};
 use termx_service::{Service, ServiceConfig, ServiceError};
 use tokio::{net::TcpStream, sync::oneshot, task::JoinHandle, time::timeout};
@@ -48,7 +48,20 @@ impl TestService {
 
     /// 用自定义配置启动真实 PTY/ConPTY 后端服务。
     pub async fn start_with_config(config: ServiceConfig) -> Self {
-        let service = Service::bind(config).await.expect("服务绑定失败");
+        Self::start_with_config_and_factory(config, None).await
+    }
+
+    /// 用自定义配置与可选后端工厂启动服务；`None` 走真实 PTY/stdio。
+    pub async fn start_with_config_and_factory(
+        config: ServiceConfig,
+        factory: Option<Arc<dyn BackendFactory>>,
+    ) -> Self {
+        let service = match factory {
+            Some(factory) => Service::bind_with_factory(config, factory)
+                .await
+                .expect("服务绑定失败"),
+            None => Service::bind(config).await.expect("服务绑定失败"),
+        };
         let addr = service.local_addr();
         let registry = service.registry();
         let token = fs::read_to_string(service.config().token_path())

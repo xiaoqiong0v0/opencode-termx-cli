@@ -59,6 +59,7 @@ async fn collect(rx: &mut Receiver<ProcEvent>) -> Collected {
                 }) => panic!("stdio 不应产生 pty 流"),
                 Some(ProcEvent::Exited(code)) => return Terminal::Exited(code),
                 Some(ProcEvent::Signaled(signal)) => return Terminal::Signaled(signal),
+                Some(ProcEvent::ShellEvent(_)) => panic!("stdio 后端不应产生带外 shell 事件"),
                 None => panic!("事件通道在终态前关闭"),
             }
         }
@@ -359,6 +360,9 @@ async fn read_until(rx: &mut Receiver<ProcEvent>, needle: &str) -> (String, Stri
                 Some(ProcEvent::Signaled(signal)) => {
                     panic!("进程在找到 {needle:?} 前被信号 {signal} 终止")
                 }
+                Some(ProcEvent::ShellEvent(_)) => {
+                    panic!("stdio 后端不应产生带外 shell 事件")
+                }
                 None => panic!("事件通道在找到 {needle:?} 前关闭"),
             }
         }
@@ -463,6 +467,7 @@ async fn terminal_event_is_emitted_exactly_once() {
             match event {
                 ProcEvent::Output { .. } => outputs += 1,
                 ProcEvent::Exited(_) | ProcEvent::Signaled(_) => terminal_events += 1,
+                ProcEvent::ShellEvent(_) => {} // stdio 后端不产生带外事件。
             }
         }
     })

@@ -71,6 +71,15 @@ pub struct TerminalEntry {
     pub name: String,
     /// 创建模式。
     pub mode: Mode,
+    /// 是否为 SSH 终端（远端 shell，不做本地 marker 包装）。
+    pub ssh: bool,
+    /// 是否使用带外 shell 事件通道（本地通道或远端 helper 通道）。
+    ///
+    /// 为 `true` 时 transcript 的 `C`/`D` 只由宿主事件建立，`terminal.send`
+    /// 不再预记录命令，避免同一命令出现 send 与宿主两条来源。
+    pub shell_events: bool,
+    /// 创建时指定的 runtime ID；旧 cmd/args 终端为 `None`。
+    pub runtime_id: Option<String>,
     /// 启动程序（`CreateParams.cmd` 原值）。
     pub command: String,
     /// 启动参数（`CreateParams.args` 原值）。
@@ -151,7 +160,7 @@ impl TerminalEntry {
     ///
     /// `last_activity` 只在**活动事件**（`started` / `output` / `attached`）时
     /// 刷新：交互、状态与终态事件不刷新，否则周期性 `waiting_input` 会让
-    /// `idle_timeout` 永不触发（对齐 `docs/PROTOCOL.md` §6）。
+    /// `idle_timeout` 永不触发（对齐 `docs/specs/PROTOCOL.md` §6）。
     pub fn emit_with_drops(&mut self, kind: EventKind) -> (EventRecord, Vec<EventRecord>) {
         let refreshes_activity = refreshes_activity(&kind);
         let record = self.events.emit(kind);
@@ -212,6 +221,7 @@ impl TerminalEntry {
             terminal_id: self.id.0.clone(),
             state: self.state,
             mode: self.mode,
+            runtime_id: self.runtime_id.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
             cwd: self.cwd.clone(),
@@ -232,7 +242,7 @@ impl TerminalEntry {
 
 /// 判断事件是否刷新 `last_activity`。
 ///
-/// 对齐 `docs/PROTOCOL.md` §6：`started` 初始化，`output` 与 `attached` 刷新；
+/// 对齐 `docs/specs/PROTOCOL.md` §6：`started` 初始化，`output` 与 `attached` 刷新；
 /// `send` / `resize` 由 [`TerminalEntry::touch`] 显式续期。交互、订阅状态与
 /// 终态事件不刷新，避免周期性 `waiting_input` 让 `idle_timeout` 永不触发。
 fn refreshes_activity(kind: &EventKind) -> bool {
@@ -264,6 +274,9 @@ mod tests {
             root_session_id: "ses-1".to_string(),
             name: "build".to_string(),
             mode: Mode::Pty,
+            ssh: false,
+            shell_events: false,
+            runtime_id: None,
             command: "mock".to_string(),
             args: Vec::new(),
             cwd: None,

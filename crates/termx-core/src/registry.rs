@@ -21,7 +21,7 @@ use termx_protocol::{
     IdleTimeout, IdleTimeoutAction, IdleTimeoutUnit, InteractionState, LifecycleState, ListItem,
     ListParams, Mode, ProcNode, PruneBasis, PruneParams, PruneResult, ReadChunk, ReadResult,
     RebindResult, ResetReason, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
-    TranscriptResult, TranscriptStatus, WEB_ROOT_SESSION_ID,
+    TranscriptResult, TranscriptSource, TranscriptStatus, WEB_ROOT_SESSION_ID,
 };
 use time::OffsetDateTime;
 use tokio::sync::{
@@ -406,6 +406,22 @@ impl Registry {
         backend: Arc<dyn TerminalBackend>,
         foreground_pgrp: Option<u32>,
     ) -> Result<(CreateResult, Option<Arc<dyn TerminalBackend>>), CoreError> {
+        self.register_create_with(params, backend, foreground_pgrp, true)
+    }
+
+    /// 注册一个已启动的后端，并指定是否解析 stdout 上的 in-band OSC。
+    ///
+    /// `in_band_osc=false` 用于自带带外事件通道的运行时（本地 `termx-pwsh`
+    /// 或远端 helper 通道）：子程序输出的 `133/633` 不再结束命令，退出码只来自
+    /// 事件通道；同时 `terminal.send` 不再预记录 transcript 命令。
+    /// 其他语义与 [`Registry::register_create`] 完全一致。
+    pub fn register_create_with(
+        &mut self,
+        params: CreateParams,
+        backend: Arc<dyn TerminalBackend>,
+        foreground_pgrp: Option<u32>,
+        in_band_osc: bool,
+    ) -> Result<(CreateResult, Option<Arc<dyn TerminalBackend>>), CoreError> {
         validate_create(&params)?;
 
         let key = (params.root_session_id.clone(), params.name.clone());
@@ -446,12 +462,17 @@ impl Registry {
         let created_at = now_rfc3339();
         let pid = backend.pid();
         let pgid = backend.pgid();
+        let ssh = params.ssh.is_some();
+        let runtime_id = params.runtime_id.clone();
 
         let entry = TerminalEntry {
             id: id.clone(),
             root_session_id: params.root_session_id,
             name: params.name,
             mode: params.mode,
+            ssh,
+            shell_events: !in_band_osc,
+            runtime_id,
             // 保存创建时的启动信息原值，供 status/list 展示（SSH 也保留原始 cmd/args）。
             command: params.cmd,
             args: params.args,
@@ -478,7 +499,7 @@ impl Registry {
             clientless_since: None,
             pending_interrupt: None,
             capabilities: backend.capabilities(),
-            transcript: TranscriptBuffer::new(self.transcript_capacity),
+            transcript: TranscriptBuffer::with_in_band_osc(self.transcript_capacity, in_band_osc),
             analyzer: InteractionAnalyzer::with_start_time(
                 self.interaction_config,
                 OffsetDateTime::now_utc(),
@@ -539,6 +560,7 @@ impl Registry {
             .map(|entry| ListItem {
                 terminal_id: entry.id.0.clone(),
                 root_session_id: entry.root_session_id.clone(),
+                runtime_id: entry.runtime_id.clone(),
                 name: entry.name.clone(),
                 state: entry.state,
                 mode: entry.mode,
@@ -614,6 +636,55 @@ impl Registry {
         Ok(entry.transcript.record_command(text, now))
     }
 
+    /// 取出并清除 `terminal.send` 记录留下的 pending 代次。
+    ///
+    /// 宿主 `C` 事件到达时先调用本方法：有 pending 表示该命令已由
+    /// `terminal.send` 记录，应原地更新而不是重复插入。
+    pub fn take_pending_transcript_generation(
+        &mut self,
+        id: &TerminalId,
+    ) -> Result<Option<u64>, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.take_pending_generation())
+    }
+
+    /// 撤销 pending 的 transcript 命令（多行输入未执行时使用）。
+    ///
+    /// 仅当 pending 代次指向最后一条仍在运行、尚无结束时间的记录时删除它；
+    /// 其余情况保持不变。返回是否删除了记录。
+    pub fn cancel_pending_transcript(&mut self, id: &TerminalId) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.cancel_pending())
+    }
+
+    /// 按代次更新已记录命令的文本与开始时间（宿主 `C` 事件携带的值）。
+    /// 字段为 `None` 时保持原值；返回是否发生变更。
+    pub fn update_transcript_start(
+        &mut self,
+        id: &TerminalId,
+        generation: u64,
+        command: Option<&str>,
+        started_at: Option<OffsetDateTime>,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry
+            .transcript
+            .update_command_for_generation(generation, command, started_at))
+    }
+
+    /// 记录宿主 `C` 事件新建的命令（没有 `terminal.send` 前置记录）。
+    ///
+    /// 返回新记录的命令代次，供后续 `D` 事件精确结束。
+    pub fn record_transcript_command_at(
+        &mut self,
+        id: &TerminalId,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<u64, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.record_command_at(text, now))
+    }
+
     /// 追加一段原始输出文本（保留 ANSI）；空文本或尚无命令时跳过。
     pub fn record_transcript_output(
         &mut self,
@@ -626,6 +697,68 @@ impl Registry {
         }
         let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
         Ok(entry.transcript.record_output(text, now))
+    }
+
+    /// 以 `shell_integration` 来源结束当前命令。
+    ///
+    /// 用于不携带代次证据的调用方（如 in-band OSC）；带外事件通道应使用
+    /// [`Registry::record_transcript_end_for_generation`] 以免迟到 `D` 结束
+    /// 新命令。只结束当前（最后一条）处于 `running` 的命令，或可被真实证据
+    /// 覆盖的 `best_effort` `done`；其他终态保持原样。
+    /// 返回是否发生变更；未知终端返回 [`CoreError::NotFound`]。
+    pub fn record_transcript_end(
+        &mut self,
+        id: &TerminalId,
+        exit_code: Option<i32>,
+        now: OffsetDateTime,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry
+            .transcript
+            .record_command_end(exit_code, TranscriptSource::ShellIntegration, now))
+    }
+
+    /// 读取当前最后一条 transcript 命令的代次；无命令时为 0。
+    ///
+    /// 供带外事件通道在 `C` 事件到来时绑定代次；未知终端返回
+    /// [`CoreError::NotFound`]。
+    pub fn current_transcript_generation(&self, id: &TerminalId) -> Result<u64, CoreError> {
+        let entry = self.by_id.get(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.current_generation())
+    }
+
+    /// 以 `shell_integration` 来源按代次结束当前命令。
+    ///
+    /// 只有当前最后一条命令的 generation 与 `generation` 一致时才结束，
+    /// 其余语义与 [`Registry::record_transcript_end`] 相同。返回是否发生变更。
+    pub fn record_transcript_end_for_generation(
+        &mut self,
+        id: &TerminalId,
+        exit_code: Option<i32>,
+        generation: u64,
+        now: OffsetDateTime,
+    ) -> Result<bool, CoreError> {
+        self.record_transcript_end_for_generation_at(id, exit_code, generation, now)
+    }
+
+    /// 按代次结束当前命令，并使用宿主 `D` 提供的结束时间。
+    ///
+    /// 与 [`Registry::record_transcript_end_for_generation`] 相同，但
+    /// `ended_at` 来自事件时间而非 service 处理时间。
+    pub fn record_transcript_end_for_generation_at(
+        &mut self,
+        id: &TerminalId,
+        exit_code: Option<i32>,
+        generation: u64,
+        ended_at: OffsetDateTime,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.record_command_end_for_generation_at(
+            exit_code,
+            TranscriptSource::ShellIntegration,
+            generation,
+            ended_at,
+        ))
     }
 
     /// 对所有终端执行静默结束判定，返回被标记为 `done` 的命令数。
@@ -792,7 +925,7 @@ impl Registry {
     /// - 已被他人持有且 `force = false`：`permission_denied`。
     /// - 已被他人持有且 `force = true`：先向订阅者广播 `lease_revoked`，再授予。
     ///
-    /// 终态终端拒绝 claim，对齐 `docs/PROTOCOL.md` §13。
+    /// 终态终端拒绝 claim，对齐 `docs/specs/PROTOCOL.md` §13。
     pub fn claim(
         &mut self,
         locator: &TerminalLocator,
@@ -833,7 +966,7 @@ impl Registry {
 
     /// 释放输入 lease；仅 owner 可释放，非 owner 或空闲时返回 `permission_denied`。
     ///
-    /// 终态终端拒绝 release，对齐 `docs/PROTOCOL.md` §13；连接断开时用
+    /// 终态终端拒绝 release，对齐 `docs/specs/PROTOCOL.md` §13；连接断开时用
     /// [`Registry::release_all`] 绕过该限制做兜底清理。
     pub fn release(&mut self, locator: &TerminalLocator, client_id: &str) -> Result<(), CoreError> {
         let id = self.resolve(locator)?;
@@ -859,6 +992,42 @@ impl Registry {
             },
         )?;
         Ok(())
+    }
+
+    /// 返回终端创建时的启动程序（`CreateParams.cmd` 原值）。
+    ///
+    /// service 用它识别 shell 类型以决定是否追加 marker；只读借用，避免克隆。
+    pub fn shell_command(&self, locator: &TerminalLocator) -> Result<&str, CoreError> {
+        let id = self.resolve(locator)?;
+        self.by_id
+            .get(&id)
+            .map(|entry| entry.command.as_str())
+            .ok_or(CoreError::NotFound)
+    }
+
+    /// 是否为 SSH 终端。
+    ///
+    /// service 用它强制跳过本地 shell marker：远端 shell 无法保证本地追加的
+    /// 语法成立，也不能把本机 `exit_code` 语义套到远端。
+    pub fn is_ssh(&self, locator: &TerminalLocator) -> Result<bool, CoreError> {
+        let id = self.resolve(locator)?;
+        self.by_id
+            .get(&id)
+            .map(|entry| entry.ssh)
+            .ok_or(CoreError::NotFound)
+    }
+
+    /// 该终端是否应在 `terminal.send` 时预记录 transcript 命令。
+    ///
+    /// 返回 `true` 表示依赖 in-band OSC 或静默判定，需要 send-time fallback；
+    /// 返回 `false` 表示使用带外事件通道，命令记录只由宿主 `C` 事件创建，
+    /// 避免同一命令出现两条来源。终端不存在时返回 [`CoreError::NotFound`]。
+    pub fn records_transcript_on_send(&self, locator: &TerminalLocator) -> Result<bool, CoreError> {
+        let id = self.resolve(locator)?;
+        self.by_id
+            .get(&id)
+            .map(|entry| !entry.shell_events)
+            .ok_or(CoreError::NotFound)
     }
 
     /// 返回终端创建模式；`terminal.send` 据此决定 `enter` 追加 `\r` 还是 `\n`。
@@ -2281,6 +2450,8 @@ mod tests {
             force,
             idle_timeout: None,
             ssh: None,
+            allow_injection: false,
+            runtime_id: None,
         }
     }
 

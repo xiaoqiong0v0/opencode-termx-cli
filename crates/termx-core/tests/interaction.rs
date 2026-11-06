@@ -36,6 +36,8 @@ fn create(registry: &mut Registry, name: &str) -> (TerminalId, u32) {
         force: false,
         idle_timeout: None,
         ssh: None,
+        allow_injection: false,
+        runtime_id: None,
     };
     let created = registry.create(params).expect("create 应成功");
     let id = TerminalId::new(created.terminal_id);

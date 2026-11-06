@@ -16,8 +16,12 @@ path = "src/main.rs"
 [dependencies]
 termx-protocol = { path = "../termx-protocol" }
 termx-proc = { path = "../termx-proc" }
+termx-shell-events = { path = "../termx-shell-events" }
 base64 = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

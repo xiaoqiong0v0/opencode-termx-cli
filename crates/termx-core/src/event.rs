@@ -4,7 +4,7 @@
 //! `output` 序号按**连续区间**记账，随后各落成一条新的 `output_dropped`
 //! 事件（各自占用新的单调 `seq`）。状态、终态与交互事件永不淘汰：容量只
 //! 约束可淘汰的输出类记录，状态事件持续写入时 ring 会按 FIFO 持续增长
-//! （不设额外上限），直到终端被删除。对齐 `docs/PROTOCOL.md` §7/§8/§9。
+//! （不设额外上限），直到终端被删除。对齐 `docs/specs/PROTOCOL.md` §7/§8/§9。
 
 use std::collections::VecDeque;
 

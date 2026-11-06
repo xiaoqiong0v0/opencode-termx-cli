@@ -183,8 +183,14 @@ function buildServiceArgs(config: TermxConfig): string[] {
   ];
 }
 
-/** 组装子进程环境；仅当配置了密码时注入 `TERMX_WEB_PASSWORD`。 */
+/**
+ * 组装子进程环境。
+ *
+ * 密码只在配置了才注入；远端注入的路径覆盖为空表示“用 service 默认值”，因此也不注入。
+ * 本地 helper 路径为空表示“不自动上传”，此时不注入。
+ */
 function buildServiceEnv(config: TermxConfig): NodeJS.ProcessEnv {
+  const injection = config.remote.injection;
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     TERMX_MAX_TERMINALS: String(config.limits.maxTerminals),
@@ -192,8 +198,17 @@ function buildServiceEnv(config: TermxConfig): NodeJS.ProcessEnv {
     TERMX_CLIENT_IDLE_TIMEOUT_MS: String(config.limits.clientIdleTimeoutMs),
     TERMX_INTERACTION_TICK_MS: String(config.interaction.tickMs),
     TERMX_INTERACTION_NO_OUTPUT_MS: String(config.interaction.noOutputMs),
+    TERMX_REMOTE_INJECTION_CONSENT: injection.consent,
+    TERMX_REMOTE_INJECTION_ROOT: injection.root,
   };
   if (config.web.password) env.TERMX_WEB_PASSWORD = config.web.password;
+  if (injection.helperLocal) {
+    env.TERMX_REMOTE_INJECTION_HELPER_LOCAL = injection.helperLocal;
+  }
+  if (injection.paths.helper) env.TERMX_REMOTE_INJECTION_HELPER = injection.paths.helper;
+  if (injection.paths.pwsh) env.TERMX_REMOTE_INJECTION_PWSH = injection.paths.pwsh;
+  if (injection.paths.bash) env.TERMX_REMOTE_INJECTION_BASH = injection.paths.bash;
+  if (injection.paths.sh) env.TERMX_REMOTE_INJECTION_SH = injection.paths.sh;
   return env;
 }
 

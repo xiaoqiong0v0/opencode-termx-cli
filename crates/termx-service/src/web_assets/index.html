@@ -32,9 +32,6 @@
         </button>
         <button id="termx-rebind-open" class="termx-button" type="button" disabled>迁移…</button>
       </div>
-      <span id="termx-status" class="termx-status" role="status" aria-live="polite">
-        正在初始化…
-      </span>
     </header>
     <dialog id="termx-rebind-dialog" class="termx-dialog" aria-labelledby="termx-rebind-title">
       <form id="termx-rebind-form" class="termx-dialog-form">
@@ -99,24 +96,30 @@
         </div>
 
         <div id="termx-create-local" class="termx-form-section">
-          <label class="termx-field" for="termx-create-cmd">程序</label>
-          <input
-            id="termx-create-cmd"
-            class="termx-input"
-            type="text"
-            placeholder="/bin/bash 或 cmd.exe"
-            autocomplete="off"
-            spellcheck="false"
-          />
-          <label class="termx-field" for="termx-create-args">参数（空格分隔，可加引号）</label>
-          <input
-            id="termx-create-args"
-            class="termx-input"
-            type="text"
-            placeholder="例如 -l 或 --foo &quot;bar baz&quot;"
-            autocomplete="off"
-            spellcheck="false"
-          />
+          <label class="termx-field" for="termx-create-runtime">运行环境</label>
+          <select id="termx-create-runtime" class="termx-select">
+            <option value="">自定义 cmd/args</option>
+          </select>
+          <div id="termx-create-custom">
+            <label class="termx-field" for="termx-create-cmd">程序</label>
+            <input
+              id="termx-create-cmd"
+              class="termx-input"
+              type="text"
+              placeholder="/bin/bash 或 cmd.exe"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <label class="termx-field" for="termx-create-args">参数（空格分隔，可加引号）</label>
+            <input
+              id="termx-create-args"
+              class="termx-input"
+              type="text"
+              placeholder="例如 -l 或 --foo &quot;bar baz&quot;"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
           <label class="termx-field" for="termx-create-cwd">工作目录（可选）</label>
           <input
             id="termx-create-cwd"
@@ -167,20 +170,11 @@
               autocomplete="new-password"
             />
           </div>
-          <label class="termx-field" for="termx-create-ssh-cmd">启动程序（留空 = 交互式 shell）</label>
-          <input id="termx-create-ssh-cmd" class="termx-input" type="text" autocomplete="off" spellcheck="false" />
-          <label class="termx-field" for="termx-create-helper-path">远端 helper 路径（可选）</label>
-          <input id="termx-create-helper-path" class="termx-input" type="text" autocomplete="off" spellcheck="false" />
-          <label class="termx-check">
-            <input id="termx-create-upload-helper" type="checkbox" />
-            上传本地 helper
-          </label>
-          <div id="termx-create-upload-group" class="termx-form-hidden">
-            <label class="termx-field" for="termx-create-helper-local">本地 helper 路径</label>
-            <input id="termx-create-helper-local" class="termx-input" type="text" autocomplete="off" spellcheck="false" />
-            <label class="termx-field" for="termx-create-helper-sha">helper sha256（可选）</label>
-            <input id="termx-create-helper-sha" class="termx-input" type="text" autocomplete="off" spellcheck="false" />
-          </div>
+          <label class="termx-field" for="termx-create-ssh-runtime">运行环境</label>
+          <select id="termx-create-ssh-runtime" class="termx-select">
+            <option value="termx-pwsh">termx-pwsh（带外事件）</option>
+            <option value="">系统 shell</option>
+          </select>
           <label class="termx-check">
             <input id="termx-create-any-host-key" type="checkbox" />
             接受任意主机密钥（accept-any-host-key）
@@ -206,10 +200,31 @@
         </div>
       </form>
     </dialog>
+    <dialog
+      id="termx-consent-dialog"
+      class="termx-dialog termx-dialog-wide"
+      aria-labelledby="termx-consent-title"
+      aria-describedby="termx-consent-notes"
+    >
+      <form id="termx-consent-form" class="termx-dialog-form">
+        <h2 id="termx-consent-title" class="termx-dialog-title">确认远端写入</h2>
+        <p id="termx-consent-host" class="termx-dialog-hint"></p>
+        <ul id="termx-consent-writes" class="termx-consent-writes"></ul>
+        <p id="termx-consent-notes" class="termx-consent-notes">
+          将使用当前 SSH 用户权限写入以上文件；不会覆盖其他文件；不会自动删除旧版本。本次授权只对本次创建有效。
+        </p>
+        <p id="termx-consent-error" class="termx-dialog-error" role="alert" hidden></p>
+        <div class="termx-dialog-actions">
+          <button id="termx-consent-cancel" class="termx-button" type="button">取消</button>
+          <button id="termx-consent-confirm" class="termx-button termx-primary" type="submit">
+            允许并创建
+          </button>
+        </div>
+      </form>
+    </dialog>
     <main class="termx-main">
       <section id="termx-view-info" class="termx-view termx-info-view" role="tabpanel" aria-labelledby="termx-tab-info">
         <div id="termx-info-meta" class="termx-info-meta" hidden></div>
-        <p id="termx-info-notice" class="termx-info-notice" role="status" hidden></p>
         <div id="termx-transcript" class="termx-transcript" aria-live="polite"></div>
         <form id="termx-info-form" class="termx-info-form">
           <input id="termx-info-input" class="termx-input termx-info-input" type="text" placeholder="输入命令并回车" autocomplete="off" spellcheck="false" disabled />
@@ -220,6 +235,7 @@
         <div id="termx-term" class="termx-term" aria-label="终端输出"></div>
       </section>
     </main>
+    <div id="termx-statusbar" class="termx-statusbar" role="status" aria-live="polite" hidden></div>
     <script src="/static/xterm.js"></script>
     <script src="/static/app.js"></script>
   </body>

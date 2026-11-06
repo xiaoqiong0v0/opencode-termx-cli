@@ -1,7 +1,7 @@
 //! 交互识别状态机：组合 shell integration（OSC 133/633）、前台进程组与
 //! 静默时长，产出 `waiting_input` / `interactive_changed` 更新。
 //!
-//! 设计约束（对齐 `docs/REFERENCE_AND_PITFALLS.md` §4 与 `docs/PROTOCOL.md` §7）：
+//! 设计约束（对齐 `docs/reference/REFERENCE_AND_PITFALLS.md` §4 与 `docs/specs/PROTOCOL.md` §7）：
 //! - **不自动判定完成、不自动退出**；本模块只产生非终态提示事件。
 //! - 置信度：OSC prompt/command 结束 = `high`；前台进程组进入/切换/退出 =
 //!   `medium`；无输出启发式在前台子进程存在时为 `medium`，仅 shell 静默时为
@@ -206,7 +206,7 @@ impl InteractionAnalyzer {
             match event {
                 // `A`/`B`/`D` 都是 shell 已把提示符交还给输入的信号：
                 // `B` 是 prompt 结束（输入行开始），不能按“命令开始”清除等待。
-                OscEvent::PromptStart(_) | OscEvent::PromptEnd(_) | OscEvent::CommandEnd(_) => {
+                OscEvent::PromptStart(_) | OscEvent::PromptEnd(_) | OscEvent::CommandEnd { .. } => {
                     if let Some(update) = self.consider_waiting(
                         now,
                         WaitingSource::ShellIntegration,

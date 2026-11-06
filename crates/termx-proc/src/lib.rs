@@ -145,6 +145,11 @@ pub enum ProcEvent {
     ///
     /// 仅 Unix 后端会发送；Windows 永不发送。
     Signaled(i32),
+    /// shell 带外事件（prompt / command 生命周期）。
+    ///
+    /// 本地 PTY/stdio 后端不产生该事件；远端 helper 通道会把子进程经 UDS
+    /// 上报的 `A/B/C/D` 原样转成该变体，交给 service 复用 transcript 判定。
+    ShellEvent(termx_protocol::shell_events::ShellEvent),
 }
 
 #[cfg(test)]

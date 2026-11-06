@@ -4,20 +4,21 @@
 //! - 请求以 `method` 为标签（`hello` / `spawn` / `input` / `resize` / `signal` /
 //!   `terminate` / `tree`）；
 //! - 响应与事件以 `type` 为标签（`hello_ok` / `started` / `output` / `exited` /
-//!   `signaled` / `tree` / `error`）。
+//!   `signaled` / `shell_event` / `tree` / `error`）。
 //!
 //! 复用主协议的 [`Stream`] 与 [`ErrorCode`]：helper 是主协议链路的延伸，
 //! 客户端已经按同一套错误码与流语义做映射；额外定义一套只会增加两处漂移风险。
-//! 字段统一 snake_case，一行一个 JSON 对象（见 `docs/PROTOCOL.md` §11）。
+//! 字段统一 snake_case，一行一个 JSON 对象（见 `docs/specs/PROTOCOL.md` §11）。
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ErrorCode, ProcNode, Stream};
+use crate::{ErrorCode, ProcNode, SHELL_EVENTS_CAPABILITY, Stream};
 
 /// helper 声明的能力列表，顺序固定，便于测试与文档核对。
-pub const HELPER_CAPABILITIES: &[&str] = &["pty", "proc_tree", "exit_status"];
+pub const HELPER_CAPABILITIES: &[&str] =
+    &["pty", "proc_tree", "exit_status", SHELL_EVENTS_CAPABILITY];
 
 /// helper 请求（客户端 → helper），以 `method` 为标签。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +50,9 @@ pub enum HelperRequest {
         /// 行数；缺省使用 24。
         #[serde(skip_serializing_if = "Option::is_none")]
         rows: Option<u16>,
+        /// 是否请求带外 shell 事件通道；旧 helper 忽略该字段。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        events: bool,
     },
     /// 向 PTY 写入原始字节（base64）。
     Input {
@@ -90,6 +94,9 @@ pub enum HelperEvent {
         pid: u32,
         /// 进程组 ID（Windows 上等于 `pid`）。
         pgid: u32,
+        /// 是否实际建立了带外 shell 事件通道。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        events: bool,
     },
     /// 一段 PTY 输出。
     Output {
@@ -107,6 +114,26 @@ pub enum HelperEvent {
     Signaled {
         /// 信号名，如 `SIGTERM`；未知编号回退为 `SIG<num>`。
         signal: String,
+    },
+    /// 远端 shell 带外事件；`event` 为 `A` / `B` / `C` / `D`。
+    ShellEvent {
+        /// 单字母事件名。
+        event: String,
+        /// `D` 的退出码。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+        /// `C`/`D` 的 command-id。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// `C` 实际执行的完整命令文本；旧 helper 不填。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// `C` 命令开始的 Unix 毫秒时间戳（UTC）；旧 helper 不填。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<i64>,
+        /// `D` 命令结束的 Unix 毫秒时间戳（UTC）；旧 helper 不填。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_at_ms: Option<i64>,
     },
     /// 进程树快照，对应一次 `tree` 请求。
     ///
@@ -148,6 +175,7 @@ mod tests {
                 env: Some(env),
                 cols: Some(120),
                 rows: Some(30),
+                events: true,
             },
             HelperRequest::Input {
                 data: "bHM=".to_string(),
@@ -196,6 +224,7 @@ mod tests {
             HelperEvent::Started {
                 pid: 123,
                 pgid: 123,
+                events: true,
             },
             HelperEvent::Output {
                 data: "aGVsbG8=".to_string(),
@@ -204,6 +233,14 @@ mod tests {
             HelperEvent::Exited { code: 4 },
             HelperEvent::Signaled {
                 signal: "SIGTERM".to_string(),
+            },
+            HelperEvent::ShellEvent {
+                event: "D".to_string(),
+                code: Some(7),
+                id: Some("cmd-1".to_string()),
+                command: Some("echo hi".to_string()),
+                started_at_ms: Some(1_700_000_000_000),
+                ended_at_ms: Some(1_700_000_001_000),
             },
             HelperEvent::Tree {
                 processes: vec![crate::ProcNode {
@@ -219,7 +256,14 @@ mod tests {
             },
         ];
         let tags = [
-            "hello_ok", "started", "output", "exited", "signaled", "tree", "error",
+            "hello_ok",
+            "started",
+            "output",
+            "exited",
+            "signaled",
+            "shell_event",
+            "tree",
+            "error",
         ];
 
         for (event, tag) in events.into_iter().zip(tags) {
@@ -242,13 +286,58 @@ mod tests {
             env: None,
             cols: None,
             rows: None,
+            events: false,
         };
         let value: JsonValue =
             serde_json::from_str(&serde_json::to_string(&request).expect("序列化失败"))
                 .expect("JSON 解析失败");
-        for key in ["cwd", "env", "cols", "rows"] {
+        for key in ["cwd", "env", "cols", "rows", "events"] {
             assert!(value.get(key).is_none(), "{key} 不应出现");
         }
+
+        // 旧 helper 的 `started` 没有 `events`：必须按 false 反序列化。
+        let started: HelperEvent = serde_json::from_str(r#"{"type":"started","pid":1,"pgid":1}"#)
+            .expect("旧 started 应兼容");
+        assert_eq!(
+            started,
+            HelperEvent::Started {
+                pid: 1,
+                pgid: 1,
+                events: false,
+            }
+        );
+
+        // shell_event 的可选字段缺省时不出现。
+        let shell_event = HelperEvent::ShellEvent {
+            event: "A".to_string(),
+            code: None,
+            id: None,
+            command: None,
+            started_at_ms: None,
+            ended_at_ms: None,
+        };
+        let value: JsonValue =
+            serde_json::from_str(&serde_json::to_string(&shell_event).expect("序列化失败"))
+                .expect("JSON 解析失败");
+        for key in ["code", "id", "command", "started_at_ms", "ended_at_ms"] {
+            assert!(value.get(key).is_none(), "{key} 不应出现");
+        }
+
+        // 旧 helper 的 shell_event 没有 command/start/end：必须按 None 兼容。
+        let legacy: HelperEvent =
+            serde_json::from_str(r#"{"type":"shell_event","event":"C","id":"cmd-1"}"#)
+                .expect("旧 shell_event 应兼容");
+        assert_eq!(
+            legacy,
+            HelperEvent::ShellEvent {
+                event: "C".to_string(),
+                code: None,
+                id: Some("cmd-1".to_string()),
+                command: None,
+                started_at_ms: None,
+                ended_at_ms: None,
+            }
+        );
 
         let event = HelperEvent::Output {
             data: "aGk=".to_string(),

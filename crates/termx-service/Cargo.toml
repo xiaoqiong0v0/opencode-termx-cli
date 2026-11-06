@@ -15,7 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 termx-protocol = { path = "../termx-protocol" }
+termx-shell-events = { path = "../termx-shell-events" }
 termx-core = { path = "../termx-core" }
+termx-runtime = { path = "../termx-runtime" }
 # 事件摄取任务直接消费 termx-proc 的 `ProcEvent` 流。
 termx-proc = { path = "../termx-proc" }
 axum = { workspace = true }

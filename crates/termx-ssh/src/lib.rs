@@ -27,7 +27,9 @@ use russh::{
     keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key},
 };
 use termx_proc::{OutputStream, ProcEvent};
-use termx_protocol::{Capabilities, ProcNode, SshAuth, SshConfig};
+use termx_protocol::{
+    Capabilities, InjectionConsent, ProcNode, SshAuth, SshConfig, validate_path_spec,
+};
 use thiserror::Error;
 use tokio::{
     runtime::Runtime,
@@ -36,6 +38,9 @@ use tokio::{
 
 /// fallback 会话默认终端类型。
 pub const DEFAULT_TERM: &str = "xterm-256color";
+
+/// 需要带外 shell 事件通道的远端程序名（按 basename 匹配）。
+pub const SHELL_EVENT_PROGRAM: &str = "termx-pwsh";
 
 /// TCP 建连 + 认证的总超时。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,8 +54,8 @@ const INIT_TIMEOUT: Duration =
 
 /// helper 是否被配置为启用（不代表远端实际可用）。
 ///
-/// `upload_helper=true` 与 `helper_path` 互斥；该判定同时供 core 工厂在建立
-/// 连接前拒绝 fallback 无法支持的 `cwd`/`env`。
+/// `upload_helper=true` 或显式 `helper_path` 都视为启用；该判定同时供 core
+/// 工厂在建立连接前拒绝 fallback 无法支持的 `cwd`/`env`。
 pub fn helper_enabled(config: &SshConfig) -> bool {
     config.upload_helper
         || config
@@ -61,7 +66,7 @@ pub fn helper_enabled(config: &SshConfig) -> bool {
 
 /// 无 `exit-status` 可用的 best-effort 退出码。
 ///
-/// 对齐 `docs/REFERENCE_AND_PITFALLS.md` §5：无 helper 时只能得到 channel 级结果，
+/// 对齐 `docs/reference/REFERENCE_AND_PITFALLS.md` §5：无 helper 时只能得到 channel 级结果，
 /// 不得伪造真实退出码。
 pub const BEST_EFFORT_EXIT_CODE: i32 = -1;
 
@@ -101,6 +106,28 @@ pub enum SshError {
     /// 不支持的信号名。
     #[error("不支持的信号: {0}")]
     UnsupportedSignal(String),
+    /// 远端注入需要用户授权；调用方应把载荷上报，不得 fallback。
+    #[error("远端注入需要授权（host={host}, user={user}）", host = .0.host, user = .0.user)]
+    ConsentRequired(InjectionConsent),
+    /// 远端 helper 注入失败（预检/路径/权限/安装/写入等）；必须直接失败，
+    /// 不得 fallback。消息只包含目标路径与原因，不含任何凭据。
+    #[error("远端 helper 注入失败（{path}）: {message}")]
+    InjectionFailed {
+        /// 注入目标路径（`~/...` 未展开时保留原始 spec）。
+        path: String,
+        /// 失败原因（不含 token/密码）。
+        message: String,
+    },
+}
+
+/// 该错误是否必须直接上报、不能回退 fallback。
+///
+/// 仅 helper 协议/版本/握手等普通错误保留 fallback；授权与注入失败直接失败。
+fn must_not_fallback(error: &SshError) -> bool {
+    matches!(
+        error,
+        SshError::ConsentRequired(_) | SshError::InjectionFailed { .. }
+    )
 }
 
 /// 远端 channel 的请求类型。
@@ -140,6 +167,9 @@ pub struct SshConnectRequest {
     pub env: Option<BTreeMap<String, String>>,
     /// helper 模式直接启动的程序；`None` 时按 `mode` 推导。
     pub program: Option<HelperProgram>,
+    /// 是否请求 helper 带外 shell 事件通道；仅 `from_create` 在 pty + 远端
+    /// `termx-pwsh` 时置 `true`。
+    pub events: bool,
 }
 
 impl SshConnectRequest {
@@ -154,6 +184,7 @@ impl SshConnectRequest {
             cwd: None,
             env: None,
             program: None,
+            events: false,
         }
     }
 
@@ -168,6 +199,7 @@ impl SshConnectRequest {
             cwd: None,
             env: None,
             program: None,
+            events: false,
         }
     }
 
@@ -182,6 +214,7 @@ impl SshConnectRequest {
             cwd: None,
             env: None,
             program: None,
+            events: false,
         }
     }
 
@@ -189,6 +222,9 @@ impl SshConnectRequest {
     ///
     /// `cmd` 为空或等于 `shell` 时申请交互式 shell；否则把 `cmd + args`
     /// 按 POSIX 单引号规则拼成远端命令，并保留原始程序/参数供 helper 使用。
+    ///
+    /// 只有 pty + `basename(cmd) == "termx-pwsh"` 才请求带外 shell 事件通道；
+    /// 其他 SSH 命令保持原有 in-band 行为，避免误关闭普通远端会话的 OSC 判定。
     pub fn from_create(cmd: &str, args: &[String], cols: u16, rows: u16) -> Self {
         let trimmed = cmd.trim();
         if trimmed.is_empty() || trimmed == "shell" {
@@ -196,6 +232,7 @@ impl SshConnectRequest {
         }
         let line = build_command_line(cmd, args);
         let mut request = Self::exec(line, cols, rows);
+        request.events = request.pty && is_shell_event_program(cmd);
         request.program = Some(HelperProgram {
             cmd: cmd.to_string(),
             args: args.to_vec(),
@@ -213,6 +250,17 @@ impl SshConnectRequest {
         self.env = env;
         self
     }
+}
+
+/// 判断 `cmd` 的 basename 是否需要带外 shell 事件通道。
+///
+/// 同时接受 `/usr/local/bin/termx-pwsh` 与 Windows 风格分隔符；只比较文件名，
+/// 不依赖远端路径存在。命令来自协议字符串，不按本机路径语义解析。
+fn is_shell_event_program(cmd: &str) -> bool {
+    cmd.trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name == SHELL_EVENT_PROGRAM)
 }
 
 /// 把程序与参数拼成 POSIX shell 命令行。
@@ -259,12 +307,14 @@ impl Prepared {
                 pgid: session.pgid,
                 capabilities: session.capabilities(),
                 helper: true,
+                events_active: session.shell_events_active(),
             },
             Self::Fallback { .. } => SessionInfo {
                 pid: 0,
                 pgid: 0,
                 capabilities: fallback_capabilities(),
                 helper: false,
+                events_active: false,
             },
         }
     }
@@ -292,6 +342,8 @@ struct SessionInfo {
     capabilities: Capabilities,
     /// 是否为 helper 模式。
     helper: bool,
+    /// 远端带外 shell 事件通道是否实际生效（helper + `started.events=true`）。
+    events_active: bool,
 }
 
 /// 已建立的 SSH 会话句柄。
@@ -313,6 +365,7 @@ impl fmt::Debug for SshSession {
             .debug_struct("SshSession")
             .field("peer", &self.peer)
             .field("helper", &self.info.helper)
+            .field("events_active", &self.info.events_active)
             .field("pid", &self.info.pid)
             .field("pgid", &self.info.pgid)
             .finish()
@@ -439,6 +492,14 @@ impl SshSession {
         self.info.capabilities.clone()
     }
 
+    /// 远端是否已启用带外 shell 事件通道。
+    ///
+    /// 只有 helper 模式、helper 声明 `shell_events` 能力且 `started.events=true`
+    /// 时才为 `true`；service 据此关闭该终端的 in-band OSC 解析。
+    pub fn shell_events(&self) -> bool {
+        self.info.helper && self.info.events_active
+    }
+
     /// 前台进程组；helper 模式返回根进程组，fallback 无值。
     pub fn foreground_pgrp(&self) -> Option<u32> {
         if self.info.helper && self.info.pgid > 0 {
@@ -481,6 +542,7 @@ fn fallback_capabilities() -> Capabilities {
         helper: false,
         version: "russh-fallback".to_string(),
         best_effort: true,
+        runtime_catalog: false,
     }
 }
 
@@ -555,10 +617,11 @@ fn validate(config: &SshConfig, request: &SshConnectRequest) -> Result<(), SshEr
 
 /// 校验 helper 相关配置的一致性与路径安全。
 ///
-/// - `upload_helper=true` 必须提供 `helper_local_path`，且不得同时给
-///   `helper_path`（上传模式只写专用临时目录，绝不复用/覆盖用户路径）；
-/// - 不上传时 `helper_path` 必须是单个路径（拒绝空白/控制字符），
-///   `helper_local_path` 无意义，明确拒绝；
+/// - `upload_helper=true` 必须提供 `helper_local_path`；`helper_path` 可选，
+///   给出时表示**持久安装目标**（可以是绝对路径或 `~/...`）；
+/// - 不上传时 `helper_path` 表示远端已存在文件，`helper_local_path` 无意义；
+/// - 任何显式 helper 路径都必须满足注入路径规则（绝对路径或 `~/`，拒绝
+///   空白/控制字符/`..`/相对路径）；
 /// - 只读模式允许配置 `helper_sha256` 做远端摘要校验，但必须有 `helper_path`。
 fn validate_helper(config: &SshConfig) -> Result<(), SshError> {
     let path = config
@@ -566,33 +629,38 @@ fn validate_helper(config: &SshConfig) -> Result<(), SshError> {
         .as_deref()
         .map(str::trim)
         .filter(|path| !path.is_empty());
-    let local = config
-        .helper_local_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty());
 
     if config.upload_helper {
-        if path.is_some() {
-            return Err(SshError::BadRequest(
-                "upload_helper=true 时不能同时设置 helper_path（上传只写专用临时目录）".to_string(),
-            ));
-        }
-        if local.is_none() {
+        if config
+            .helper_local_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .is_none()
+        {
             return Err(SshError::BadRequest(
                 "upload_helper=true 但缺少 helper_local_path".to_string(),
             ));
         }
+        if let Some(path) = path {
+            validate_injection_path(path, "helper_path")?;
+        }
         return Ok(());
     }
 
-    if local.is_some() {
+    if config
+        .helper_local_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .is_some()
+    {
         return Err(SshError::BadRequest(
             "未启用 upload_helper 时不应设置 helper_local_path".to_string(),
         ));
     }
     match path {
-        Some(path) => validate_helper_path(path),
+        Some(path) => validate_injection_path(path, "helper_path"),
         None => {
             if configured_sha(config).is_some() {
                 return Err(SshError::BadRequest(
@@ -604,14 +672,9 @@ fn validate_helper(config: &SshConfig) -> Result<(), SshError> {
     }
 }
 
-/// 只接受单个远端路径；空白/控制字符属于命令拼接风险面，直接拒绝。
-fn validate_helper_path(path: &str) -> Result<(), SshError> {
-    if path.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
-        return Err(SshError::BadRequest(
-            "helper_path 不能包含空白或控制字符".to_string(),
-        ));
-    }
-    Ok(())
+/// 校验注入路径；错误里保留字段名便于定位。
+fn validate_injection_path(path: &str, field: &str) -> Result<(), SshError> {
+    validate_path_spec(path).map_err(|error| SshError::BadRequest(format!("{field} 非法: {error}")))
 }
 
 /// 归一化期望摘要，供校验与 bootstrap 共用。
@@ -643,7 +706,7 @@ fn runtime() -> Result<&'static Runtime, SshError> {
 ///
 /// 各阶段使用独立超时：建连/认证受 [`CONNECT_TIMEOUT`] 限制，helper 分发与
 /// 握手受 [`helper::HELPER_BOOTSTRAP_TIMEOUT`] 限制；外层等待更宽，避免内外层
-/// 同时到期。内层超时会正常返回错误并触发远端清理。
+/// 同时到期。内层超时会正常返回错误；已安装文件不会被删除。
 async fn open_prepared(
     config: SshConfig,
     request: &SshConnectRequest,
@@ -663,8 +726,6 @@ async fn open_prepared(
             match tokio::time::timeout(helper::HELPER_BOOTSTRAP_TIMEOUT, bootstrap).await {
                 Ok(result) => result,
                 Err(_) => {
-                    // bootstrap future 被取消时，其内部 `UploadGuard` 的 Drop 会把
-                    // 本次临时目录清理与断开派发到后台（见 helper.rs）。
                     return Err(SshError::Connect {
                         message: format!(
                             "helper 分发/握手超过 {} 秒",
@@ -676,9 +737,15 @@ async fn open_prepared(
         match bootstrapped {
             Ok((handle, session)) => return Ok(Prepared::Helper { handle, session }),
             Err((handle, error)) => {
-                // helper 失败不阻塞：仅在请求依赖 helper 能力时才明确报错，
+                // 需要授权或注入失败必须原样上报，绝不能用 fallback 掩盖；
+                // 只有 helper 协议/版本/握手等普通错误才继续走 fallback。
+                if must_not_fallback(&error) {
+                    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                    return Err(error);
+                }
+                // helper 协议不可用不阻塞：仅在请求依赖 helper 能力时才明确报错，
                 // 否则复用同一连接回退 fallback。
-                tracing::info!(reason = %error, "helper 不可用，回退 SSH fallback");
+                tracing::info!(reason = %error, "helper 协议不可用，回退 SSH fallback");
                 if request.cwd.is_some() || request.env.as_ref().is_some_and(|env| !env.is_empty())
                 {
                     let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
@@ -970,6 +1037,24 @@ mod tests {
             SshConnectRequest::from_create(" uptime ", &[], 80, 24).mode,
             SshChannelMode::Exec("' uptime '".to_string())
         );
+
+        // 只有 pty + basename(cmd)==termx-pwsh 才请求带外事件。
+        for cmd in [
+            SHELL_EVENT_PROGRAM,
+            "/usr/local/bin/termx-pwsh",
+            "C:\\termx\\termx-pwsh",
+        ] {
+            assert!(
+                SshConnectRequest::from_create(cmd, &[], 80, 24).events,
+                "{cmd:?} 应请求 shell 事件"
+            );
+        }
+        for cmd in ["pwsh", "termx-pwsh-old", "shell", ""] {
+            assert!(
+                !SshConnectRequest::from_create(cmd, &[], 80, 24).events,
+                "{cmd:?} 不应请求 shell 事件"
+            );
+        }
     }
 
     /// 测试用配置：默认不启用 helper。
@@ -986,12 +1071,53 @@ mod tests {
             helper_sha256: None,
             upload_helper: false,
             accept_any_host_key: true,
+            injection: termx_protocol::InjectionPlan::default(),
         }
     }
 
     /// 校验在联网前完成，配置非法时直接返回 `BadRequest`。
     fn connect_error(config: SshConfig, request: SshConnectRequest) -> SshError {
         SshSession::connect(&config, request).expect_err("非法配置应被拒绝")
+    }
+
+    /// 注入失败与授权要求都必须直接上报；只有协议/连接错误才允许 fallback。
+    #[test]
+    fn injection_failures_never_fall_back() {
+        let failed = SshError::InjectionFailed {
+            path: "~/.termx/bin/termx-helper".to_string(),
+            message: "目标不可写".to_string(),
+        };
+        assert!(must_not_fallback(&failed));
+        assert!(must_not_fallback(&SshError::ConsentRequired(
+            termx_protocol::InjectionConsent {
+                host: "h".to_string(),
+                user: "u".to_string(),
+                writes: Vec::new(),
+            }
+        )));
+        assert!(!must_not_fallback(&SshError::Connect {
+            message: "握手失败".to_string(),
+        }));
+    }
+
+    /// 注入失败消息带目标路径，且不泄露配置里的凭据。
+    #[test]
+    fn injection_failure_message_has_path_without_credentials() {
+        let config = base_config();
+        let password = match &config.auth {
+            SshAuth::Password { password } => password.clone(),
+            _ => unreachable!("测试配置固定使用密码认证"),
+        };
+        let text = SshError::InjectionFailed {
+            path: "/opt/termx-helper".to_string(),
+            message: "预检失败".to_string(),
+        }
+        .to_string();
+        assert!(
+            text.contains("/opt/termx-helper"),
+            "消息应包含目标路径: {text}"
+        );
+        assert!(!text.contains(&password), "消息不得包含凭据: {text}");
     }
 
     #[test]
@@ -1005,23 +1131,35 @@ mod tests {
     }
 
     #[test]
-    fn upload_mode_rejects_helper_path() {
+    fn upload_mode_accepts_helper_path_as_install_target() {
         let mut config = base_config();
         config.upload_helper = true;
         config.helper_local_path = Some("./termx-helper".to_string());
-        config.helper_path = Some("/usr/local/bin/termx-helper".to_string());
-        let error = connect_error(config, SshConnectRequest::shell(80, 24));
-        assert!(matches!(error, SshError::BadRequest(message) if message.contains("helper_path")));
+        config.helper_path = Some("~/.termx/bin/termx-helper".to_string());
+        assert!(validate_helper(&config).is_ok(), "helper_path 是安装目标");
+
+        config.helper_path = Some("relative/helper".to_string());
+        assert!(matches!(
+            validate_helper(&config),
+            Err(SshError::BadRequest(message)) if message.contains("helper_path")
+        ));
     }
 
     #[test]
-    fn helper_path_must_be_single_path() {
-        let mut config = base_config();
-        config.helper_path = Some("/usr/local/bin/termx helper".to_string());
-        let error = connect_error(config, SshConnectRequest::shell(80, 24));
-        assert!(
-            matches!(error, SshError::BadRequest(message) if message.contains("空白或控制字符"))
-        );
+    fn helper_path_must_follow_injection_rules() {
+        for path in [
+            "/usr/local/bin/termx helper",
+            "relative/helper",
+            "/usr/local/../termx-helper",
+        ] {
+            let mut config = base_config();
+            config.helper_path = Some(path.to_string());
+            let error = connect_error(config, SshConnectRequest::shell(80, 24));
+            assert!(
+                matches!(error, SshError::BadRequest(message) if message.contains("helper_path")),
+                "路径 {path:?} 应被拒绝"
+            );
+        }
     }
 
     #[test]

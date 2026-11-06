@@ -307,6 +307,7 @@ async fn hello_with_valid_token_succeeds() {
     assert!(!result.capabilities.helper);
     assert_eq!(result.capabilities.version, HELPER_PROTOCOL_VERSION);
     assert!(!result.capabilities.best_effort);
+    assert!(result.capabilities.runtime_catalog);
 }
 
 #[tokio::test]

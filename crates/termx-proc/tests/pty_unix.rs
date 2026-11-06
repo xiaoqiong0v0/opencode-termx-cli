@@ -48,6 +48,7 @@ async fn wait_terminal(rx: &mut Receiver<ProcEvent>) -> (Vec<u8>, Terminal) {
                 Some(ProcEvent::Output { data, .. }) => output.extend_from_slice(&data),
                 Some(ProcEvent::Exited(code)) => return Terminal::Exited(code),
                 Some(ProcEvent::Signaled(signal)) => return Terminal::Signaled(signal),
+                Some(ProcEvent::ShellEvent(_)) => panic!("PTY 后端不应产生带外 shell 事件"),
                 None => panic!("事件通道在收到终态事件前关闭"),
             }
         }

@@ -270,6 +270,11 @@ pub struct Cli {
     /// 直接指定 WebSocket 地址；与 `--config-dir` 至少给一个，不推导平台默认。
     #[arg(long, global = true, value_name = "URL")]
     pub endpoint: Option<String>,
+    /// 使用服务端 runtime catalog 中的内置 runtime（如 `termx-pwsh`）。
+    ///
+    /// 当前仅 `local` 使用；与 `--cmd`/参数互斥。
+    #[arg(long, global = true, value_name = "ID")]
+    pub runtime: Option<String>,
     /// 事件/结果输出为单行 JSON。
     #[arg(long, global = true)]
     pub json: bool,

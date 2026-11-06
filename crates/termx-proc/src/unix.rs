@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CString, c_char, c_int};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork, getpgrp};
 use termx_protocol::ProcNode;
@@ -100,6 +101,13 @@ impl PtySession {
         let pty = openpty(Some(&winsize), None).map_err(|err| ProcError::PtyFailed {
             message: format!("openpty 失败: {err}"),
         })?;
+
+        // 只有 termx-pwsh 需要这项配置：它依赖 .NET Console 的 DSR（`ESC[6n`）
+        // 光标查询，而前端应答若走行缓冲/回显会被当成用户输入。bash/cat/sh 等
+        // 程序自行管理 termios，保持 PTY 默认值，避免影响它们的行编辑与回显。
+        if is_termx_pwsh(&cfg.program) {
+            configure_slave_terminal(&pty.slave)?;
+        }
 
         let (status_read, status_write) =
             nix::unistd::pipe().map_err(|err| ProcError::PtyFailed {
@@ -873,6 +881,46 @@ fn set_cloexec(fd: RawFd) -> Result<(), ProcError> {
     Ok(())
 }
 
+/// 判断程序是否为 termx-pwsh（只比较 basename，允许绝对路径）。
+///
+/// 该配置只对 termx-pwsh 生效，不能改其他程序（bash/cat/sh）的 termios：
+/// 它们自己会在交互模式下配置行缓冲与回显。
+fn is_termx_pwsh(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "termx-pwsh")
+}
+
+/// 关闭 PTY 从端的行缓冲与回显，保留信号和输出处理。
+///
+/// 只清除输入侧语义（`ECHO` / `ECHONL` / `ICANON`）：前端按 DSR（`ESC[6n`）
+/// 返回的 `ESC[row;colR` 若仍回显，就会被行编辑器当成用户键入（表现为
+/// `lsls`、`1R6`）；关闭 `ICANON` 同时让该应答无需换行即可被读到。`ISIG`
+/// 与 `OPOST`（含 `ONLCR`）保持不变，故 Ctrl-C 与换行输出不受影响——这里
+/// 不能用 `cfmakeraw`，它会连 `OPOST` 一并清掉。
+///
+/// termios 属于终端设备本身而非单个 fd，fork 前设置在从端上即可让子进程
+/// `dup2` 得到的 0/1/2 继承同一份配置。
+///
+/// # 参数
+/// - `slave`：`openpty` 返回、尚未 fork 的从端句柄。
+///
+/// # 错误
+/// `tcgetattr` / `tcsetattr` 失败时返回 [`ProcError::PtyFailed`]。
+fn configure_slave_terminal(slave: impl AsFd) -> Result<(), ProcError> {
+    let mut attrs = tcgetattr(&slave).map_err(|err| ProcError::PtyFailed {
+        message: format!("读取 PTY 从端 termios 失败: {err}"),
+    })?;
+    attrs
+        .local_flags
+        .remove(LocalFlags::ECHO | LocalFlags::ECHONL | LocalFlags::ICANON);
+    tcsetattr(&slave, SetArg::TCSANOW, &attrs).map_err(|err| ProcError::PtyFailed {
+        message: format!("设置 PTY 从端 termios 失败: {err}"),
+    })?;
+    Ok(())
+}
+
 /// 把列/行转换为 `winsize`，限制在 1..=u16::MAX。
 fn make_winsize(cols: u16, rows: u16) -> Winsize {
     Winsize {
@@ -1020,5 +1068,58 @@ fn sanitize_cmd(text: &str) -> String {
         format!("{truncated}…")
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nix::pty::openpty;
+    use nix::sys::termios::{LocalFlags, OutputFlags, tcgetattr};
+
+    use super::{configure_slave_terminal, is_termx_pwsh};
+
+    #[test]
+    fn termx_pwsh_detection_is_scoped_to_basename() {
+        for matched in ["termx-pwsh", "/usr/local/bin/termx-pwsh", "bin/termx-pwsh"] {
+            assert!(is_termx_pwsh(matched), "{matched} 应匹配 termx-pwsh");
+        }
+
+        for unmatched in [
+            "pwsh",
+            "/usr/bin/bash",
+            "cat",
+            "termx-pwsh-old",
+            "termx-pwsh.exe",
+        ] {
+            assert!(!is_termx_pwsh(unmatched), "{unmatched} 不应匹配 termx-pwsh");
+        }
+    }
+
+    #[test]
+    fn slave_disables_echo_and_canonical_mode() {
+        let pty = openpty(None, None).expect("openpty 失败");
+        let before = tcgetattr(&pty.slave).expect("读取初始 termios 失败");
+        assert!(
+            before.local_flags.contains(LocalFlags::ECHO),
+            "默认 PTY 从端应带回显，测试前提不成立"
+        );
+
+        configure_slave_terminal(&pty.slave).expect("配置从端失败");
+
+        let after = tcgetattr(&pty.slave).expect("读取配置后 termios 失败");
+        for flag in [LocalFlags::ECHO, LocalFlags::ECHONL, LocalFlags::ICANON] {
+            assert!(!after.local_flags.contains(flag), "{flag:?} 应已关闭");
+        }
+        // Ctrl-C 仍由终端驱动转成 SIGINT。
+        assert!(after.local_flags.contains(LocalFlags::ISIG), "ISIG 应保留");
+        // 输出处理保持原样，换行仍经 ONLCR 转成 CRLF。
+        assert!(
+            after.output_flags.contains(OutputFlags::OPOST),
+            "OPOST 应保留"
+        );
+        assert!(
+            after.output_flags.contains(OutputFlags::ONLCR),
+            "ONLCR 应保留"
+        );
     }
 }

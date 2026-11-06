@@ -70,19 +70,20 @@
 ## 6. RPC 方法
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
-| `hello` | `{ proto, token, client, root_session_id?, admin? }` | `{ proto, server, capabilities }` |
+| `hello` | `{ proto, token, client, root_session_id?, admin? }` | `{ proto, server, capabilities }`；`capabilities.runtime_catalog` 表示支持 runtime RPC |
 | `heartbeat` | `{ root_session_id? }` | `{ ok }` |
 | `session_closed` | `{ root_session_id }` | `{ ok }` |
 | `session.list` | `{}` | `{ sessions: [{ root_session_id, live, last_seen_ms?, terminals }] }` |
-| `terminal.create` | `{ mode: "pty"\|"stdio", cmd, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, accept_any_host_key? } }` | `{ terminal_id, cursor }` |
+| `runtime.list` | `{}` | `{ runtimes: [{ id, name, version, platform, arch, available }] }`；只含当前平台兼容项，不含本机路径 |
+| `terminal.create` | `{ mode: "pty"\|"stdio", cmd?, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, accept_any_host_key? }, runtime_id?, allow_injection? }` | `{ terminal_id, cursor }` |
 | `terminal.claim` | `{ locator, force? }` | `{ owner, lease }` |
 | `terminal.release` | `{ locator }` | `{ ok }` |
 | `terminal.attach` | `{ locator, cursor? }` | `{ cursor, snapshot, reset? }` |
 | `terminal.detach` | `{ locator }` | `{ ok }` |
-| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, command, args, cwd?, pid?, idle_timeout?, last_activity?, created_at }]`；`limit` 取最近活动的前 N 条 |
+| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, runtime_id?, command, args, cwd?, pid?, idle_timeout?, last_activity?, created_at }]`；`limit` 取最近活动的前 N 条 |
 | `terminal.status` | `{ locator }` | `{ snapshot }` |
 | `terminal.read` | `{ locator, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
-| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output}], revision }` |
+| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output, exit_code?, source?, best_effort?}], revision }` |
 | `terminal.send` | `{ locator, data(base64)?, text?, enter? }` | `{ ok }` |
 | `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
 | `terminal.signal` | `{ locator, signal }` | `{ ok }` |
@@ -94,15 +95,18 @@
 
 约束：
 - `pty` 必带 `cols/rows`（可默认）；`stdio` 忽略尺寸。
+- `runtime_id?`：从服务端 `<config_dir>/runtimes/index.json` 解析内置 runtime。此时 `cmd`/`args` 必须缺省或为空；服务端用 manifest 的 `bin`/`args` 覆盖，不解回退到请求里的自定义命令。未知 ID → `not_found`；平台不兼容、路径越界、文件缺失/不可执行 → `bad_request`。无 `runtime_id` 时保持旧 `cmd`/`args` 行为。P1 只读本地目录，不下载/不远程传输。
 - `ssh?`：存在时 `mode` 必须为 `pty`，由 SSH 后端建立远端会话；`cmd` 为空或 `"shell"` 时申请交互式 shell，否则把 `cmd + args` 按 POSIX 单引号规则拼成远端命令（helper 模式下直接作为 `spawn.cmd/args`，不经 shell 二次分词）。
   - `auth`：`{ type:"password", password }` 或 `{ type:"key", path, passphrase? }`；`Debug` 输出遮蔽密码/口令，凭据不落日志。
   - `accept_any_host_key` 缺省 `false`：要求 known_hosts 存在可信记录；缺失/不匹配以明确错误失败。仅测试或用户显式开启时置 `true`。
-  - helper 启用判定：`helper_path` 非空，或 `upload_helper=true`；两者互斥。
-    - `upload_helper` 缺省 `false`：使用 `helper_path` 指向的**远端已存在** helper，不写远端文件；`helper_sha256` 可选，用于 `sha256sum` 校验该文件。
-    - `upload_helper=true`：必须同时提供 `helper_local_path`（本地二进制），不得再设 `helper_path`；二进制上传到远端 `mktemp -d` 新建的 700 私有目录内固定文件名 `termx-helper`，`chmod 700` + `sha256sum` 校验后执行。`helper_sha256` 可选，用于校验本地与远端二进制。
-    - 非法组合（`upload_helper=true` 缺 `helper_local_path`、与 `helper_path` 同时出现、`helper_path` 含空白/控制字符、未上传却设 `helper_local_path`、`helper_sha256` 缺 `helper_path`）一律 `bad_request`，不静默回退。
+  - helper 启用判定：`helper_path` 非空，或 `upload_helper=true`。路径只允许绝对路径或 `~/...`（`~` 为远端用户 home），拒绝空白/控制字符/`..`/相对路径。
+    - `upload_helper` 缺省 `false`：`helper_path` 指向**远端已存在**的 helper；连接前只读预检目录/文件/可执行/`helper_sha256`，有效直接使用，缺失或不符合时回退 fallback，**不写任何文件**。
+    - `upload_helper=true`：必须提供 `helper_local_path`；`helper_path` 可选，表示**持久安装目标**（缺省由服务端注入计划补齐）。写前先做同样的只读预检，已存在且摘要/可执行检查通过则直接复用，不触发授权。
+    - 需要写入时按 `remote.injection.consent` 决策：`deny` → 不写并回退；`ask` 且请求未带 `allow_injection=true` → 返回 `consent_required`（`error.injection` 列出 host/user、目标路径、大小、sha256、动作与原因），不 mkdir、不写；`allow` 或 `allow_injection=true` → 持久安装。
+    - 持久安装：`mkdir -p -m 700` 父目录 → 同目录 `mktemp` → 上传 → `sha256sum` 校验 → `chmod 700` → 旧文件改名为 `.old.<ts>` → `mv` 原子替换；不删除已安装文件。
+    - 非法组合（`upload_helper=true` 缺 `helper_local_path`、`helper_path` 非法、未上传却设 `helper_local_path`、`helper_sha256` 缺 `helper_path`）一律 `bad_request`。
   - helper 成功时 `started` 带远端真实 `pid`/`pgid`，`foreground_pgrp` 为根进程组，`tree` 由 helper 提供，`cwd`/`env` 生效。
-  - helper 不可用（未配置、上传/摘要/握手/版本/`spawn` 失败）：关闭 helper 通道并回退 fallback（`helper:false`、`bestEffort:true`、`version:"russh-fallback"`），不阻塞普通命令。请求包含 `cwd`/`env` 时因 fallback 无法应用而返回 `bad_request`（SSH 层同样拒绝，不只依赖 core 工厂）。
+  - helper 不可用（未配置、预检失败、注入不可用、上传/摘要/握手/版本/`spawn` 失败）：关闭 helper 通道并回退 fallback（`helper:false`、`bestEffort:true`、`version:"russh-fallback"`），不阻塞普通命令。`consent_required` 例外：必须原样返回给客户端，不 fallback。请求包含 `cwd`/`env` 时因 fallback 无法应用而返回 `bad_request`（SSH 层同样拒绝，不只依赖 core 工厂）。
   - fallback 远端 `pid`/`pgid` 为 `0`；`foreground_pgrp` 缺省、`tree` 为空；无 `exit-status`（仅 channel 关闭）时退出码为 `-1`（best-effort）。
   - 终端级能力经 `attach`/`status` 的 `snapshot.capabilities` 暴露（见 §7）；`hello.capabilities` 是服务级声明，不代表任一终端的 helper 状态。
 - `env?` 为 **JSON 对象 map**（如 `{"TERM":"xterm-256color"}`），不是元组/二元数组。
@@ -133,7 +137,8 @@
 - `terminal.claim` 取得输入 lease；同一终端同一时刻只有一个 lease owner。`force=true` 抢占时向订阅者广播 `lease_revoked{old_client_id}`，随后授予新 owner。未 claim 或非 owner 的 `send` 返回 `permission_denied`。
 - `terminal.transcript`：读取 service 侧记录的信息页**命令记录**（**不是事件流**）。
   - 每条命令：`command`（仅 `terminal.send` 成功且 `enter=true`，去掉末尾 CR/LF）、`started_at`/`ended_at`（RFC3339 UTC）、`status`、`output`（已清洗）。`enter=false` 的按键/密码不记录。
-  - `status`：`running` → `done`（新命令到来或静默达到阈值）/ `exited` / `interrupted` / `error`（终端终态）。
+  - `status`：`running` → `done`（新命令到来、静默达到阈值或收到 shell marker）/ `exited` / `interrupted` / `error`（终端终态）。
+  - **二级执行不拆**：嵌套 shell、`bash -c`、`pwsh -Command`、子命令与 pipeline 都归属父命令；不为子 shell 生成独立记录，`exit_code` 取父命令/管道最终结果。
   - 输出清洗：去 ANSI 与控制字符；CR/CRLF 统一为 LF；首行包含命令文本时视为回显删除；删除末尾提示符行（cmd `...>`、PowerShell `PS ...>`、bash/zsh `user@host:...$/#`）；去首尾空行，保留其余原文。
   - 每终端有界（默认 **200** 条，`TERMX_TRANSCRIPT_CAPACITY` 覆盖），超出淘汰最旧命令。
   - 单条命令 `output` 最多保留 **64 KiB**（含截断标记）；超出后按 UTF-8 字符边界截断并只追加一次 `\n[output truncated]\n`，后续输出不再追加。
@@ -176,8 +181,9 @@
 | `capabilities` | `helper, version, bestEffort` | 某终端的 SSH/helper 能力与降级标识（终端级） |
 
 - `capabilities` 的层级语义：
-  - `hello.capabilities` 是**服务级**声明（当前 `helper:false`、`version` 为协议版本），只表示服务自身能力，不代表任何终端的 helper 状态；
+  - `hello.capabilities` 是**服务级**声明（当前 `helper:false`、`version` 为协议版本、`runtime_catalog:true`），只表示服务自身能力，不代表任何终端的 helper 状态；旧客户端缺省 `runtime_catalog:false`；
   - 终端级能力只通过 `attach`/`status` 的 `snapshot.capabilities` 或该终端的事件流暴露；客户端不得用 `hello.capabilities` 推断某个 SSH 终端是否启用 helper。
+  - 带外 shell 事件通道（本地 named pipe / 远端 helper）是 service 内部判定，不新增 `Capabilities` 字段；客户端仍只从 `terminal.transcript` 的 `source`/`exit_code` 观察结果。
 - `snapshot.foreground_pgrp` 以后端上报为准：helper 模式为会话根进程组（当前实现不随前台作业切换），fallback 无值（字段缺省）。
 - 所有事件共用每终端单调 `seq`；`output_dropped` 作为**新事件**分配自己的单调 `seq`（不复用被丢输出的 `seq`），使缺口可检测。
 - `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
@@ -194,19 +200,32 @@
 - 快照 `snapshot` 结构：
   ```jsonc
   { "terminal_id": "...", "state": "running", "mode": "pty",
+    "runtime_id": "termx-pwsh",
     "command": "/bin/bash", "args": ["-l"], "cwd": "/home/me",
     "pid": 123, "pgid": 123, "ppid": 1, "foreground_pgrp": 123,
     "tree": [ /* {pid,ppid,pgid,cmd} */ ],
     "interactive": "none", "confidence": "low", "cols": 120, "rows": 30, "cursor": 42 }
   ```
   - `command` / `args` / `cwd` 为 `terminal.create` 的原值（SSH 也保留原始 `cmd`/`args`），供 Web 信息页展示；`cwd` 未指定时缺省。`terminal.list` 的条目同样包含这三个字段。
+  - 使用 `runtime_id` 时，持久化的 `command`/`args` 是解析后的 manifest `bin`/`args`；原始 `runtime_id` 单独保留（旧终端缺省）。
 - `terminal.read.chunks`：`[{ seq, ts, data(base64) }]`，按 `seq` 升序。
 - `terminal.transcript.commands`：
   ```jsonc
   [{ "command": "ls", "started_at": "2026-01-01T00:00:00Z",
-     "ended_at": "2026-01-01T00:00:01Z", "status": "done", "output": "a.txt\nb.txt" }]
+     "ended_at": "2026-01-01T00:00:01Z", "status": "done", "output": "a.txt\nb.txt",
+     "exit_code": 0, "source": "shell_integration", "best_effort": false }]
   ```
   `ended_at` 在 `running` 时为 `null`；`output` 已由 service 清洗。
+  - `exit_code`：可选退出码；无法确定时缺省（不得伪造）。旧客户端可忽略。
+  - `source`：结束证据来源，`shell_integration` / `process_group` / `unknown`；未结束时缺省。
+  - `best_effort`：结束判定是否为 best-effort（如静默推断）；缺省 `false`。
+  - 三个字段均向后兼容：旧 JSON 缺失时分别默认为 `null`/`null`/`false`，且默认值不参与序列化。
+  - **P1 本地单行 marker（当前默认关闭）**：命令内 marker 会被 shell 回显并写入历史，污染 raw/历史记录；`TRANSCRIPT_MARKER_ENABLED=false` 时完全不注入，精确 `exit_code` 暂不产出，等待 hook-based integration。开启时才在本地 `pty` 终端满足 `enter=true`、`text` 存在且 `data` 缺省时，服务端按 shell 追加不可见 OSC 序列（不改变 transcript 记录的原始 `command`）：
+    - bash/zsh/sh：`<cmd>; __termx_ec=$?; printf '\033]133;D;%s\007' "$__termx_ec"`；
+    - pwsh/powershell：先取 `$?`，再回落 `$LASTEXITCODE`，最后回落到 `1`，用 `[Console]::Write` 输出同一 `133;D` marker。
+    - transcript 增量扫描输出中的 `133;D`/`633;D`，收到后以 `source=shell_integration` 结束当前命令并写入真实 `exit_code`；marker 文本在 `output` 清洗时去掉。静默结束不覆盖已写入的退出码；已静默结束的命令可被随后到达的真实 marker 覆盖。
+    - **显式降级**（不追加 marker、退回静默判定、不伪造 `done`）：`enter=false`、`data`（base64）、`stdio`、SSH 终端（无论启动程序）、`cmd.exe`/未知 shell、多行文本、末尾为 `\`/`&`/`|`/`;`、含未闭合引号（简单检测）。
+    - 单行与引号判定是保守启发式（非完整 shell 解析）；无法确定时宁可跳过。
 
 ## 8. 序号、游标与重连（责任划分）
 - **服务端**维护每终端事件缓冲与单调 `seq`（从 1 开始），并负责按游标回放。
@@ -240,8 +259,11 @@
 | `ssh_connect_failed` | SSH 连接失败 | true |
 | `helper_failed` | helper 握手/启动失败 | true |
 | `protocol_error` | 帧/状态机违例 | false |
+| `consent_required` | 远端注入需要用户授权；`error.injection` 描述将写入的文件 | false |
 | `service_lost` | 服务崩溃/重启（客户端合成） | true（重建） |
 | `internal` | 未分类 | true |
+
+**注入错误映射**：`termx-ssh` 的 `ConsentRequired` 经 core 原样映射为 `consent_required`，`error.injection` 填 `host`/`user`/`writes`（路径、大小、sha256、动作、原因）；不得降级为 `bad_request` 或 fallback。`InjectionFailed`（路径展开失败、预检失败、deny、目标为目录/不可写、mkdir/mktemp/上传/sha/chmod/mv 失败）直接导致 `terminal.create` 失败，经 core 映射为 `bad_request`（消息含目标路径与原因，不含凭据），**不回退 fallback**。只有 helper 协议/版本/握手等普通错误才允许 fallback。服务端只校验本次 `terminal.create.allow_injection`，不写会话缓存、不维护主机信任表，下次创建重新判定。
 
 ## 11. 版本协商
 - 主协议 `proto: "termx/1"`；helper 协议 `termx-helper/1`。
@@ -258,7 +280,7 @@
   // client -> helper（首帧）
   { "method": "hello", "proto": "termx-helper/1", "version": "0.1.0" }
   // helper -> client
-  { "type": "hello_ok", "proto": "termx-helper/1", "capabilities": ["pty","proc_tree","exit_status"] }
+  { "type": "hello_ok", "proto": "termx-helper/1", "capabilities": ["pty","proc_tree","exit_status","shell_events"] }
 
   // 请求
   { "method": "spawn", "cmd": "bash", "args": ["-l"], "cwd": "/tmp", "env": { "TERM": "xterm-256color" }, "cols": 120, "rows": 30 }
@@ -273,6 +295,7 @@
   { "type": "output", "data": "aGVsbG8=", "stream": "pty" }
   { "type": "exited", "code": 0 }
   { "type": "signaled", "signal": "SIGTERM" }
+  { "type": "shell_event", "event": "D", "code": 7, "id": "cmd-1" }
   { "type": "tree", "processes": [{ "pid": 123, "ppid": 100, "pgid": 123, "cmd": "sh" }] }
   { "type": "error", "code": "spawn_failed", "message": "启动失败" }
   ```
@@ -285,6 +308,14 @@
   - 校验通过后 `exec <helper> serve`，握手 `hello`/`hello_ok`（`proto` 必须为 `termx-helper/1`），再 `spawn` 取得 `started.pid/pgid`；
   - 成功时能力为 `{helper:true, version:"termx-helper/1", bestEffort:false}`，`pid`/`pgid`/`tree` 由 helper 提供，`foreground_pgrp` 为根进程组，`cwd`/`env` 生效；
   - 上传失败、摘要不符、握手失败、版本不符或 `spawn` 失败：关闭 helper 通道、清理本次临时目录并回退 fallback（`helper:false`、`bestEffort:true`），不阻塞普通命令；请求包含 `cwd`/`env` 时因 fallback 无法应用而返回明确错误。
+- **helper 带外 shell 事件（能力协商，不升协议版本）**：
+  - `hello_ok.capabilities` 含 `shell_events` 表示 helper 支持事件通道；旧 helper 无该能力时客户端不下发事件请求，行为与之前一致。
+  - `spawn.events`（缺省 `false`）仅在客户端需要且 helper 声明能力时置 `true`；`started.events`（缺省 `false`）回报本次是否实际建立通道，创建失败只降级、不阻断 spawn。
+  - Unix 远端：helper 为每个会话创建私有临时目录（`0700`）与 Unix domain socket（`0600`），生成随机 token，并通过 `TERMX_EVENT_ENDPOINT=unix:<path>` / `TERMX_EVENT_TOKEN` 注入子进程环境；只 accept 一次、首行校验 token、单帧上限，会话结束后清理 socket。不在 stdout 输出事件，也不新增 TCP 端口。
+  - 子进程按 JSON Lines 发送 `A/B/C/D`；helper 转成 `shell_event{event, code?, id?}` 协议帧。Windows 远端 named pipe 暂不启用（仅保留编译分支）。
+  - `termx-ssh` 把 `shell_event` 映射为 `ProcEvent::ShellEvent`；service 复用本地通道的 command-id + transcript 代次判定，`D` 命中时以 `source: "shell_integration"` 写入真实 `exit_code`，不匹配/迟到 `D` 被忽略。
+  - 关闭 in-band OSC 的判定是严格三级门槛：`ssh + pty + basename(cmd) == "termx-pwsh"`（后端快照 `shell_events()`）、helper 声明 `shell_events`、`started.events=true`；任一不满足（含旧 helper、普通 SSH、fallback）都保持 in-band 解析，不伪造退出码。
+  - 公开 WebSocket `Capabilities` 不新增字段；事件通道状态只影响 service 内部 transcript 判定。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全

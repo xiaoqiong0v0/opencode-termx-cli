@@ -44,4 +44,10 @@ pub enum CoreError {
     /// 超过资源上限（终端数量、stdio 写队列等），对应 `limit_exceeded`。
     #[error("超过资源上限: {0}")]
     LimitExceeded(String),
+    /// 远端注入需要用户授权；必须原样上报，不得 fallback。
+    #[error("远端注入需要授权（host={host}, user={user}，待写入 {} 个文件）", .details.writes.len(), host = .details.host, user = .details.user)]
+    ConsentRequired {
+        /// 本次将写入的远端文件与主机信息。
+        details: termx_protocol::injection::InjectionConsent,
+    },
 }

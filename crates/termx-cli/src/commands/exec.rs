@@ -72,6 +72,8 @@ fn build_params(
         force: cli.force,
         idle_timeout: None,
         ssh: None,
+        allow_injection: false,
+        runtime_id: None,
     })
 }
 

@@ -1,0 +1,89 @@
+#!/bin/sh
+# 远端 shell 事件探针（T5）：模拟 termx-pwsh 的带外事件通道。
+#
+# helper 在 Spawn.events=true 时注入 TERMX_EVENT_ENDPOINT / TERMX_EVENT_TOKEN；
+# 探针连接 unix: UDS 后发送 hello、C(id=cmd-1)、D(code=7,id=cmd-1)，
+# 输出一行 remote_shell_event_hi，短暂停留后退出 0。
+# 没有 endpoint 时仍输出并退出 0，便于单独验证远端可执行性。
+
+exec python3 -c '
+import json, os, select, socket, sys, time
+
+ENDPOINT_ENV = "TERMX_EVENT_ENDPOINT"
+TOKEN_ENV = "TERMX_EVENT_TOKEN"
+OUTPUT_LINE = "remote_shell_event_hi"
+UNIX_PREFIX = "unix:"
+COMMAND_ID = "cmd-1"
+EXIT_CODE = 7
+INPUT_WAIT_SECONDS = 10.0
+DRAIN_BYTES = 4096
+HOLD_SECONDS = 0.5
+
+endpoint = os.environ.get(ENDPOINT_ENV, "")
+token = os.environ.get(TOKEN_ENV, "")
+
+
+def emit_events(endpoint, token):
+    path = endpoint[len(UNIX_PREFIX):] if endpoint.startswith(UNIX_PREFIX) else endpoint
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    try:
+        sock.connect(path)
+    except OSError:
+        sock.close()
+        return
+    stream = sock.makefile("w", encoding="utf-8")
+
+    def send(frame):
+        stream.write(json.dumps(frame) + "\n")
+        stream.flush()
+
+    try:
+        send({"v": 1, "token": token})
+        # 等到服务端 terminal.send 的输入后再上报，保证 C 绑定到已记录的命令。
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], INPUT_WAIT_SECONDS)
+            if ready:
+                os.read(0, DRAIN_BYTES)
+        except OSError:
+            pass
+        send(
+            {
+                "v": 1,
+                "event": "C",
+                "id": COMMAND_ID,
+                "command": "run",
+                "started_at_ms": int(time.time() * 1000),
+            }
+        )
+        time.sleep(0.1)
+        send(
+            {
+                "v": 1,
+                "event": "D",
+                "id": COMMAND_ID,
+                "code": EXIT_CODE,
+                "ended_at_ms": int(time.time() * 1000),
+            }
+        )
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+if endpoint:
+    try:
+        emit_events(endpoint, token)
+    except OSError:
+        pass
+
+print(OUTPUT_LINE, flush=True)
+time.sleep(HOLD_SECONDS)
+sys.exit(0)
+'

@@ -70,6 +70,14 @@ pub trait TerminalBackend: Send + Sync {
     fn capabilities(&self) -> Option<Capabilities> {
         None
     }
+
+    /// 是否已启用带外 shell 事件通道。
+    ///
+    /// 默认 `false`；只有远端 helper 明确协商并实际建立通道的 SSH 会话返回
+    /// `true`。service 据此决定是否关闭该终端的 in-band OSC 解析。
+    fn shell_events(&self) -> bool {
+        false
+    }
 }
 
 /// 后端工厂：把 `terminal.create` 参数变成真实进程或 mock 进程。
@@ -343,6 +351,10 @@ impl TerminalBackend for SshBackend {
     fn capabilities(&self) -> Option<Capabilities> {
         Some(self.session.capabilities())
     }
+
+    fn shell_events(&self) -> bool {
+        self.session.shell_events()
+    }
 }
 
 /// 把 `termx-ssh` 错误映射为 core 错误。
@@ -350,6 +362,11 @@ fn map_ssh_error(error: SshError) -> CoreError {
     match error {
         SshError::UnsupportedSignal(name) => CoreError::UnsupportedSignal(name),
         SshError::BadRequest(message) => CoreError::BadRequest(message),
+        // 需要授权必须原样上报；注入失败转为明确的 `BadRequest`，绝不回退 fallback。
+        SshError::ConsentRequired(details) => CoreError::ConsentRequired { details },
+        SshError::InjectionFailed { path, message } => {
+            CoreError::BadRequest(format!("远端 helper 注入失败（{path}）: {message}"))
+        }
         other => CoreError::BackendFailed(other.to_string()),
     }
 }
@@ -388,6 +405,13 @@ impl BackendFactory for SshFactory {
         let (session, events) =
             SshSession::connect(config, request).map_err(|error| match error {
                 SshError::BadRequest(message) => CoreError::BadRequest(message),
+                // 授权要求不能被折叠成 `spawn_failed`，否则 service 无法回传
+                // `consent_required` 载荷，客户端会把它当成普通连接失败。
+                SshError::ConsentRequired(details) => CoreError::ConsentRequired { details },
+                // 注入失败必须直接失败，不能折叠成可回退的连接错误。
+                SshError::InjectionFailed { path, message } => {
+                    CoreError::BadRequest(format!("远端 helper 注入失败（{path}）: {message}"))
+                }
                 other => CoreError::SpawnFailed {
                     message: other.to_string(),
                 },
@@ -614,6 +638,32 @@ impl BackendFactory for MockFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_consent_required_maps_to_core_consent_error() {
+        let details = termx_protocol::InjectionConsent {
+            host: "example.com".to_string(),
+            user: "alice".to_string(),
+            writes: Vec::new(),
+        };
+        let mapped = map_ssh_error(SshError::ConsentRequired(details.clone()));
+        assert_eq!(mapped, CoreError::ConsentRequired { details });
+    }
+
+    #[test]
+    fn ssh_injection_failed_maps_to_bad_request_without_secrets() {
+        let mapped = map_ssh_error(SshError::InjectionFailed {
+            path: "~/.termx/bin/termx-helper".to_string(),
+            message: "目标目录不可写".to_string(),
+        });
+        match mapped {
+            CoreError::BadRequest(message) => {
+                assert!(message.contains("~/.termx/bin/termx-helper"));
+                assert!(message.contains("目标目录不可写"));
+            }
+            other => panic!("注入失败应映射为 BadRequest，实际 {other:?}"),
+        }
+    }
 
     #[test]
     fn mock_backend_allocates_increasing_pids_and_tracks_termination() {

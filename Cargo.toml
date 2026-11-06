@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "crates/termx-protocol",
+    "crates/termx-shell-events",
+    "crates/termx-runtime",
     "crates/termx-terminal",
     "crates/termx-proc",
     "crates/termx-ssh",

@@ -45,6 +45,41 @@ export interface WebConfig {
 /** 无存活会话到期策略。 */
 export type ClientIdlePolicy = "never" | "no_children" | "any";
 
+/** 远端注入授权策略：ask 每次确认 / allow 直接允许 / deny 一律拒绝。 */
+export type InjectionConsent = "ask" | "allow" | "deny";
+
+/** 远端注入路径覆盖；空串表示使用 `<root>` 下的默认路径。 */
+export interface InjectionPaths {
+  helper: string;
+  pwsh: string;
+  bash: string;
+  sh: string;
+}
+
+/** 注入配置（本地/远端共用的结构：授权策略、根目录与各脚本路径）。 */
+export interface InjectionConfig {
+  /** 写入授权策略：ask 每次确认 / allow 直接允许 / deny 一律拒绝。 */
+  consent: InjectionConsent;
+  /** 目标主机根目录；`~` 由远端 shell 展开。 */
+  root: string;
+  /** 各脚本路径（默认按 `root` 派生，见 `deriveInjectionPaths`）。 */
+  paths: InjectionPaths;
+  /** 本地 controller 上的 helper 产物路径；空串表示不自动上传。 */
+  helperLocal: string;
+}
+
+/** 本地相关配置。 */
+export interface LocalConfig {
+  /** 本地注入配置：按字段覆盖顶层 `injection`。 */
+  injection: InjectionConfig;
+}
+
+/** 远端相关配置。 */
+export interface RemoteConfig {
+  /** 远端注入配置：按字段覆盖顶层 `injection`。 */
+  injection: InjectionConfig;
+}
+
 /** 插件完整配置。 */
 export interface TermxConfig {
   toolLang: Lang;
@@ -52,6 +87,12 @@ export interface TermxConfig {
   service: ServiceConfig;
   /** Web 服务配置：`password` 只经子进程环境变量传递。 */
   web: WebConfig;
+  /** 注入默认值：`local.injection` / `remote.injection` 未覆盖的字段继承这里。 */
+  injection: InjectionConfig;
+  /** 本地注入配置（合并顶层默认值后的生效值）。 */
+  local: LocalConfig;
+  /** 远端注入配置（合并顶层默认值后的生效值）。 */
+  remote: RemoteConfig;
   log: { maxDays: number };
   limits: {
     maxTerminals: number;
@@ -87,6 +128,10 @@ const DEFAULT_NO_OUTPUT_MS = 5000;
 const DEFAULT_WEB_PORT = 0;
 /** 默认只允许本机访问 Web。 */
 const DEFAULT_WEB_ALLOW_REMOTE = false;
+/** 默认远端注入策略：每次创建 SSH 时询问。 */
+const DEFAULT_INJECTION_CONSENT: InjectionConsent = "ask";
+/** 默认远端注入根目录（远端用户主目录下的 .termx）。 */
+const DEFAULT_INJECTION_ROOT = "~/.termx";
 
 /** 首次生成到配置文件的模板。 */
 const TEMPLATE = `{
@@ -116,6 +161,26 @@ const TEMPLATE = `{
     // Web 登录密码；远程访问必填（经环境变量传给 service，不写命令行/日志）
     "password": ""
   },
+  // 注入默认值：创建会话时可能向目标主机写入 helper/shell 脚本
+  "injection": {
+    // 写入授权策略：ask 每次确认 / allow 直接允许 / deny 一律拒绝（非法值回退 ask）
+    "consent": "${DEFAULT_INJECTION_CONSENT}",
+    // 注入根目录；~ 表示目标用户主目录
+    "root": "${DEFAULT_INJECTION_ROOT}",
+    // 本地 controller 上的 helper 产物路径；留空表示不自动上传（使用远端预装 helper）
+    "helperLocal": "",
+    // 各脚本路径；留空按 <root> 派生（<root>/bin/termx-helper、<root>/runtimes/{pwsh,bash,sh}）
+    "paths": {
+      "helper": "",
+      "pwsh": "",
+      "bash": "",
+      "sh": ""
+    }
+  },
+  // 可选覆盖：local.injection / remote.injection 结构与 injection 相同，
+  // 标量非空才覆盖，paths 逐字段覆盖，未覆盖字段继承 injection。例如：
+  // "local": { "injection": { "consent": "allow" } },
+  // "remote": { "injection": { "root": "/opt/termx", "paths": { "helper": "/opt/termx/bin/helper" } } },
   "log": { "maxDays": ${DEFAULT_LOG_MAX_DAYS} },
   "limits": {
     // 同时运行终端上限
@@ -207,6 +272,9 @@ function normalizeConfig(raw: unknown): TermxConfig {
   const root = asRecord(raw);
   const service = asRecord(root.service);
   const web = asRecord(root.web);
+  const baseInjection = asRecord(root.injection);
+  const localInjection = asRecord(asRecord(root.local).injection);
+  const remoteInjection = asRecord(asRecord(root.remote).injection);
   const logCfg = asRecord(root.log);
   const limits = asRecord(root.limits);
   const interaction = asRecord(root.interaction);
@@ -236,6 +304,9 @@ function normalizeConfig(raw: unknown): TermxConfig {
       allowRemote: asBool(web.allowRemote, DEFAULT_WEB_ALLOW_REMOTE),
       password: resolveWebPassword(web.password),
     },
+    injection: resolveInjection(baseInjection, {}),
+    local: { injection: resolveInjection(baseInjection, localInjection) },
+    remote: { injection: resolveInjection(baseInjection, remoteInjection) },
     log: { maxDays: asInt(logCfg.maxDays, DEFAULT_LOG_MAX_DAYS, 1, 3650) },
     limits: {
       maxTerminals: asInt(limits.maxTerminals, DEFAULT_MAX_TERMINALS, 1, 4096),
@@ -253,6 +324,55 @@ function normalizeConfig(raw: unknown): TermxConfig {
     },
     logDir: cacheDir(),
     loggerEnabled: loggerEnabled(),
+  };
+}
+
+/**
+ * 合并注入配置：`base` 为顶层 `injection`，`override` 为 local/remote 的可选覆盖。
+ *
+ * 标量只有非空/合法才覆盖；`paths` 逐字段覆盖；都没有给出时按生效根目录派生。
+ */
+function resolveInjection(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): InjectionConfig {
+  const baseRoot = asText(base.root, "").trim();
+  const overrideRoot = asText(override.root, "").trim();
+  const root = overrideRoot || baseRoot || DEFAULT_INJECTION_ROOT;
+  const derived = deriveInjectionPaths(root);
+  const basePaths = asRecord(base.paths);
+  const overridePaths = asRecord(override.paths);
+  const pick = (field: keyof InjectionPaths): string =>
+    asText(overridePaths[field], "").trim() || asText(basePaths[field], "").trim() || derived[field];
+  return {
+    consent: asInjectionConsent(override.consent, asInjectionConsent(base.consent)),
+    root,
+    // helperLocal 是本地路径：非空时展开为绝对路径，空串保持“不自动上传”。
+    helperLocal: resolveHelperLocal(
+      asText(override.helperLocal, "").trim() || asText(base.helperLocal, "").trim(),
+    ),
+    paths: {
+      helper: pick("helper"),
+      pwsh: pick("pwsh"),
+      bash: pick("bash"),
+      sh: pick("sh"),
+    },
+  };
+}
+
+/** 本地 helper 路径：空串原样返回，否则展开 `~` 并转绝对路径。 */
+function resolveHelperLocal(value: string): string {
+  return value ? toAbsolute(value) : "";
+}
+
+/** 由注入根目录派生默认脚本路径（与 termx-service 的默认值一致）。 */
+function deriveInjectionPaths(root: string): InjectionPaths {
+  const base = root.replace(/[\\/]+$/, "") || DEFAULT_INJECTION_ROOT;
+  return {
+    helper: `${base}/bin/termx-helper`,
+    pwsh: `${base}/runtimes/pwsh`,
+    bash: `${base}/runtimes/bash`,
+    sh: `${base}/runtimes/sh`,
   };
 }
 
@@ -314,6 +434,17 @@ function asClientIdlePolicy(value: unknown): ClientIdlePolicy {
   }
   if (policy === "no-children" || policy === "nochildren") return "no_children";
   return DEFAULT_CLIENT_IDLE_POLICY;
+}
+
+/** 取注入授权策略：只接受 ask/allow/deny，其他值回退 `fallback`（默认 ask）。 */
+function asInjectionConsent(
+  value: unknown,
+  fallback: InjectionConsent = DEFAULT_INJECTION_CONSENT,
+): InjectionConsent {
+  if (typeof value !== "string") return fallback;
+  const consent = value.trim().toLowerCase();
+  if (consent === "ask" || consent === "allow" || consent === "deny") return consent;
+  return fallback;
 }
 
 /** 把非对象归一为空对象。 */

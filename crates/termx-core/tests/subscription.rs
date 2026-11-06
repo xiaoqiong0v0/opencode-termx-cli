@@ -26,6 +26,8 @@ fn params(root_session_id: &str, name: &str) -> CreateParams {
         force: false,
         idle_timeout: None,
         ssh: None,
+        allow_injection: false,
+        runtime_id: None,
     }
 }
 

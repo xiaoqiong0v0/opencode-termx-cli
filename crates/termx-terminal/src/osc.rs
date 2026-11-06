@@ -35,8 +35,13 @@ pub enum OscEvent {
     PromptEnd(OscSource),
     /// `C`：命令已执行，输出开始。
     CommandStart(OscSource),
-    /// `D`：命令结束。
-    CommandEnd(OscSource),
+    /// `D`：命令结束；`exit_code` 来自 `D;<code>`，缺省或非法时为 `None`。
+    CommandEnd {
+        /// 序列来源（`OSC 133` / `OSC 633`）。
+        source: OscSource,
+        /// 可选退出码；无法解析时不报错，填 `None`。
+        exit_code: Option<i32>,
+    },
 }
 
 /// 增量解析状态。
@@ -58,7 +63,7 @@ enum ParseState {
 /// 调用方把终端输出按任意分块交给 [`OscScanner::push`]，扫描器跨分块
 /// 保持状态，返回本批字节中新识别的事件。缓冲区有界，未终止的 OSC
 /// 超过 [`MAX_OSC_PAYLOAD`] 会被丢弃并恢复普通解析。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OscScanner {
     /// 当前解析状态。
     state: ParseState,
@@ -151,7 +156,7 @@ impl OscScanner {
     }
 }
 
-/// 解析 OSC 载荷（`133;A[;...]` / `633;D[;...]`）为事件。
+/// 解析 OSC 载荷（`133;A[;...]` / `633;D[;exit_code]`）为事件。
 fn parse_payload(payload: &[u8]) -> Option<OscEvent> {
     let mut params = payload.split(|&byte| byte == PARAM_SEPARATOR);
     let code = params.next()?;
@@ -167,10 +172,18 @@ fn parse_payload(payload: &[u8]) -> Option<OscEvent> {
         b"A" => OscEvent::PromptStart(source),
         b"B" => OscEvent::PromptEnd(source),
         b"C" => OscEvent::CommandStart(source),
-        b"D" => OscEvent::CommandEnd(source),
+        b"D" => OscEvent::CommandEnd {
+            source,
+            exit_code: params.next().and_then(parse_exit_code),
+        },
         _ => return None,
     };
     Some(event)
+}
+
+/// 解析可选的退出码；非 UTF-8、空串或非整数一律返回 `None`。
+fn parse_exit_code(raw: &[u8]) -> Option<i32> {
+    std::str::from_utf8(raw).ok()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -190,7 +203,13 @@ mod tests {
     fn parses_single_osc_633_st() {
         let mut scanner = OscScanner::new();
         let events = scanner.push(b"\x1b]633;D\x1b\\");
-        assert_eq!(events, vec![OscEvent::CommandEnd(OscSource::Osc633)]);
+        assert_eq!(
+            events,
+            vec![OscEvent::CommandEnd {
+                source: OscSource::Osc633,
+                exit_code: None
+            }]
+        );
     }
 
     /// 序列被拆分到多次 push（逐字节）仍能识别。
@@ -223,7 +242,10 @@ mod tests {
             events,
             vec![
                 OscEvent::PromptStart(OscSource::Osc133),
-                OscEvent::CommandEnd(OscSource::Osc633),
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc633,
+                    exit_code: None
+                },
             ]
         );
     }
@@ -239,20 +261,102 @@ mod tests {
                 OscEvent::PromptStart(OscSource::Osc133),
                 OscEvent::PromptEnd(OscSource::Osc133),
                 OscEvent::CommandStart(OscSource::Osc633),
-                OscEvent::CommandEnd(OscSource::Osc633),
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc633,
+                    exit_code: None
+                },
             ]
         );
     }
 
-    /// 命令后的附加参数（如退出码）不影响识别。
+    /// `133;D` / `633;D` 携带的退出码被正确解析。
     #[test]
-    fn ignores_trailing_parameters() {
+    fn parses_exit_codes_from_133_and_633() {
         let mut scanner = OscScanner::new();
-        let events = scanner.push(b"\x1b]133;D;0\x07\x1b]633;A;cl=m\x07");
+        let events = scanner.push(b"\x1b]133;D;0\x07\x1b]633;D;1\x07");
         assert_eq!(
             events,
             vec![
-                OscEvent::CommandEnd(OscSource::Osc133),
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc133,
+                    exit_code: Some(0),
+                },
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc633,
+                    exit_code: Some(1),
+                },
+            ]
+        );
+    }
+
+    /// `D` 后的退出码可以跨 chunk 拆分。
+    #[test]
+    fn parses_exit_code_across_chunk_boundaries() {
+        let mut scanner = OscScanner::new();
+        let mut events = Vec::new();
+        for &byte in b"\x1b]133;D;25\x07" {
+            events.extend(scanner.push(&[byte]));
+        }
+        assert_eq!(
+            events,
+            vec![OscEvent::CommandEnd {
+                source: OscSource::Osc133,
+                exit_code: Some(25),
+            }]
+        );
+    }
+
+    /// 负数是合法 `i32`，按原值保留。
+    #[test]
+    fn keeps_negative_exit_code() {
+        let mut scanner = OscScanner::new();
+        let events = scanner.push(b"\x1b]633;D;-1\x07");
+        assert_eq!(
+            events,
+            vec![OscEvent::CommandEnd {
+                source: OscSource::Osc633,
+                exit_code: Some(-1),
+            }]
+        );
+    }
+
+    /// 空串、非数字与溢出值都填 `None`，且不影响后续解析。
+    #[test]
+    fn invalid_exit_codes_become_none() {
+        let mut scanner = OscScanner::new();
+        let events =
+            scanner.push(b"\x1b]133;D;\x07\x1b]633;D;abc\x07\x1b]133;D;99999999999999999999\x07");
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc133,
+                    exit_code: None,
+                },
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc633,
+                    exit_code: None,
+                },
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc133,
+                    exit_code: None,
+                },
+            ]
+        );
+    }
+
+    /// `D` 的额外参数只取第一个作为退出码；`A` 的附加信息仍被忽略。
+    #[test]
+    fn ignores_trailing_parameters() {
+        let mut scanner = OscScanner::new();
+        let events = scanner.push(b"\x1b]133;D;0;extra\x07\x1b]633;A;cl=m\x07");
+        assert_eq!(
+            events,
+            vec![
+                OscEvent::CommandEnd {
+                    source: OscSource::Osc133,
+                    exit_code: Some(0),
+                },
                 OscEvent::PromptStart(OscSource::Osc633),
             ]
         );
@@ -277,7 +381,13 @@ mod tests {
         assert!(scanner.payload.len() <= MAX_OSC_PAYLOAD);
 
         let events = scanner.push(b"\x1b]633;D\x07");
-        assert_eq!(events, vec![OscEvent::CommandEnd(OscSource::Osc633)]);
+        assert_eq!(
+            events,
+            vec![OscEvent::CommandEnd {
+                source: OscSource::Osc633,
+                exit_code: None
+            }]
+        );
     }
 
     /// `reset` 丢弃半截状态，之后的输入从干净状态开始。

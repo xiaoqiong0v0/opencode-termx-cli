@@ -531,6 +531,7 @@ async function doSsh(tokens: string[], env: CommandEnv): Promise<string> {
     "upload-helper": { type: "boolean" },
     "helper-local": { type: "string" },
     "helper-sha": { type: "string" },
+    "allow-injection": { type: "boolean" },
     cols: { type: "string" },
     rows: { type: "string" },
     force: { type: "boolean" },
@@ -566,6 +567,8 @@ async function doSsh(tokens: string[], env: CommandEnv): Promise<string> {
       helper_sha256: helper.helperSha256,
       upload_helper: helper.uploadHelper,
       accept_any_host_key: boolValue(parsed.values, "any-host-key"),
+      // 仅本次创建生效，默认 false，不写入任何持久化状态。
+      allow_injection: boolValue(parsed.values, "allow-injection"),
     },
   });
   env.deps.cursors.set(cursorKey(env.ctx, name), created.cursor);

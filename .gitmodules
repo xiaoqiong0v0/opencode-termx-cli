@@ -1,0 +1,3 @@
+[submodule "termx-pwsh"]
+	path = terminals/termx-pwsh
+	url = https://github.com/xiaoqiong0v0/PowerShell.git
