@@ -14,7 +14,8 @@ Usage:
   termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--allow-injection] [--cols N] [--rows N] [--force]
   termx_cli exec "<command>" [-n name] [-w] [--timeout ms]
   termx_cli run "<cmd>" [-n name] [--pty] [--cwd dir] [--env K=V]... [--timeout ms] [--force]
-  termx_cli read [-n name] [--cursor N] [--max-bytes N]
+  termx_cli read [-n name] [--cursor N [--max-bytes N] | --tail-lines N | --tail-chars N]
+  termx_cli search [-n name] --pattern <pattern> [--nth N] [--only-matches]
   termx_cli transcript [-n name] [--json]
   termx_cli send "<text>" [-n name] [--enter]
   termx_cli resize [-n name] --cols N --rows N
@@ -40,9 +41,16 @@ Rules:
   - exec sends to an existing terminal and returns after submitting. -w records a cursor, waits
     about 1s of silence (or timeout/terminal end), then returns new output. This is not an exact
     command boundary.
-  - read continues from the per-terminal cursor unless --cursor is given.
+  - read continues from the per-terminal cursor unless --cursor is given. --tail-lines /
+    --tail-chars return only the last N raw lines / Unicode characters and do not advance the
+    cursor. --max-bytes applies only with --cursor.
+  - search scans raw output backwards. --nth 1 is the last match; default returns from that
+    match to the end; --only-matches returns just the matched line. No line numbers or
+    absolute positions are returned, and trimmed history may make old positions unavailable.
   - transcript returns recorded commands (start/end time, status, cleaned output) for the
     information page; --json returns the raw structure. Prompts and command echo are removed.
+    It is only meaningful for structured terminals (for example termx-pwsh); use read/search
+    for ordinary programs and shells.
   - Use -- before a positional that starts with "-".
   - --allow-injection authorizes writing the helper/shell scripts to the remote host when
     creating the SSH terminal; it applies to this creation only and is not persisted.
@@ -59,7 +67,8 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--allow-injection] [--cols N] [--rows N] [--force]
   termx_cli exec "<command>" [-n name] [-w] [--timeout ms]
   termx_cli run "<cmd>" [-n name] [--pty] [--cwd dir] [--env K=V]... [--timeout ms] [--force]
-  termx_cli read [-n name] [--cursor N] [--max-bytes N]
+  termx_cli read [-n name] [--cursor N [--max-bytes N] | --tail-lines N | --tail-chars N]
+  termx_cli search [-n name] --pattern <pattern> [--nth N] [--only-matches]
   termx_cli transcript [-n name] [--json]
   termx_cli send "<text>" [-n name] [--enter]
   termx_cli resize [-n name] --cols N --rows N
@@ -83,9 +92,14 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
     需要 shell 语法时用 "bash -lc '<command>'"。
   - exec 向已存在终端发送命令，提交后即返回。-w 会记录 cursor，等待约 1 秒静默
     （或超时/终态）后返回新增输出；这不是精确命令边界。
-  - read 默认从该终端的增量 cursor 继续；可用 --cursor 指定。
+  - read 默认从该终端的增量 cursor 继续；可用 --cursor 指定。--tail-lines / --tail-chars
+    只返回最后 N 行原始文本 / 最多 N 个 Unicode 字符，不推进 cursor；--max-bytes 仅配合
+    --cursor 使用。
+  - search 从末尾倒搜原始输出；--nth 1 为最后一个匹配。默认返回该匹配到末尾；
+    --only-matches 只返回匹配所在行。不返回行号或绝对位置，历史被裁剪后旧位置不保证可用。
   - transcript 返回信息页记录的命令（起止时间、状态、清洗后输出）；--json 返回原始结构。
-    提示符与命令回显已由 service 去除。
+    提示符与命令回显已由 service 去除。只有结构化终端（如 termx-pwsh）才有信息页；
+    普通程序/shell 请用 read/search。
   - 以 - 开头的 positional 请放在 -- 之后。
   - --allow-injection 表示本次创建 SSH 终端时允许向远端写入 helper/shell 脚本；
     仅对本次创建生效，不做持久化保存。
@@ -106,6 +120,10 @@ const en = {
   "cli.err.unknownFlag": "Error: unknown option: {flag}",
   "cli.err.missingValue": "Error: option requires a value: {flag}",
   "cli.err.badNumber": "Error: invalid number for {flag}: {value}",
+  "cli.err.readMode":
+    "Error: use exactly one of --cursor, --tail-lines or --tail-chars (and --max-bytes only with --cursor)",
+  "cli.err.missingPattern": "Error: --pattern is required",
+  "cli.err.badNth": "Error: --nth must be >= 1",
   "cli.err.badEnv": "Error: --env must be K=V: {value}",
   "cli.err.badTarget": "Error: invalid SSH target: {target} (expected user@host[:port])",
   "cli.err.needUser": "Error: SSH target requires a user: {target}",
@@ -161,6 +179,10 @@ const zh: Record<MessageKey, string> = {
   "cli.err.unknownFlag": "错误：未知参数：{flag}",
   "cli.err.missingValue": "错误：参数缺少取值：{flag}",
   "cli.err.badNumber": "错误：参数 {flag} 的数字非法：{value}",
+  "cli.err.readMode":
+    "错误：--cursor、--tail-lines、--tail-chars 只能三选一（--max-bytes 仅配合 --cursor）",
+  "cli.err.missingPattern": "错误：必须提供 --pattern",
+  "cli.err.badNth": "错误：--nth 必须 >= 1",
   "cli.err.badEnv": "错误：--env 必须为 K=V：{value}",
   "cli.err.badTarget": "错误：SSH 目标非法：{target}（应为 user@host[:port]）",
   "cli.err.needUser": "错误：SSH 目标必须包含用户：{target}",

@@ -568,6 +568,11 @@ impl ServiceConfig {
             .unwrap_or_else(|| self.config_dir.join("runtimes"))
     }
 
+    /// SSH known_hosts 文件路径：固定放在 service 配置目录下。
+    pub fn known_hosts_path(&self) -> PathBuf {
+        self.config_dir.join("known_hosts")
+    }
+
     /// 覆盖监听地址（便于测试或后续配置项扩展）。
     #[must_use]
     pub fn with_bind_addr(mut self, bind_addr: SocketAddr) -> Self {
@@ -1464,6 +1469,9 @@ mod tests {
             helper_sha256: None,
             upload_helper,
             accept_any_host_key: false,
+            host_key_policy: None,
+            trusted_host_key: None,
+            known_hosts_path: None,
             injection: InjectionPlan::default(),
         }
     }

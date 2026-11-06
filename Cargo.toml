@@ -48,6 +48,9 @@ sha2 = "0.11"
 # M5b：CLI 子命令解析。
 clap = { version = "4", features = ["derive"] }
 
+# SSH known_hosts 并发写锁（跨进程）。
+fs2 = "0.4.3"
+
 # W1：内置 Web 服务（HTTP 静态页 + WebSocket 代理）。
 axum = { version = "0.8", features = ["ws", "form"] }
 # 登录密码常量时间比较。

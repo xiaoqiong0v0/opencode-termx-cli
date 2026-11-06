@@ -13,6 +13,7 @@ termx-proc = { path = "../termx-proc" }
 termx-ssh = { path = "../termx-ssh" }
 # 交互识别复用 terminal 的 OSC 133/633 增量扫描器。
 termx-terminal = { path = "../termx-terminal" }
+base64 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

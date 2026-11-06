@@ -141,6 +141,11 @@ body.termx-body {
   border-radius: 6px;
 }
 
+.termx-tab[hidden],
+.termx-tab.termx-tab-disabled {
+  display: none;
+}
+
 .termx-tab:hover {
   color: var(--termx-fg);
 }
@@ -415,6 +420,40 @@ body.termx-body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* 高级/不安全选项：默认折叠，避免误开 accept-any-host-key。 */
+.termx-advanced {
+  border: 1px solid var(--termx-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.termx-advanced summary {
+  cursor: pointer;
+  color: var(--termx-muted);
+  font-size: 12px;
+}
+
+.termx-advanced > * + * {
+  margin-top: 8px;
+}
+
+.termx-danger-hint {
+  color: var(--termx-danger);
+}
+
+.termx-host-key-fingerprint {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--termx-border);
+  border-radius: 6px;
+  background: #0b0f14;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
 
 .termx-dialog-actions {
   display: flex;

@@ -13,6 +13,7 @@ mod backend;
 mod error;
 mod event;
 mod interaction;
+mod output;
 mod registry;
 mod terminal;
 
@@ -30,6 +31,7 @@ pub use interaction::{
     DEFAULT_NO_OUTPUT_THRESHOLD, DEFAULT_REPEAT_INTERVAL, InteractionAnalyzer, InteractionConfig,
     InteractionUpdate, InteractiveTarget, REASON_NO_OUTPUT, REASON_SHELL_INTEGRATION,
 };
+pub use output::{clean_raw_output, search, tail_chars, tail_lines};
 pub use registry::{
     CLIENT_TIMEOUT_SOURCE, ClientlessCandidate, DEFAULT_READ_MAX_BYTES,
     DEFAULT_SUBSCRIBER_QUEUE_CAPACITY, DETACH_REASON_DISCONNECT, ExitOutcome, IDLE_DETACH_REASON,

@@ -13,6 +13,7 @@ termx-proc = { path = "../termx-proc" }
 # 在 Windows 上额外依赖 C 工具链。
 russh = { version = "0.63.1", default-features = false, features = ["ring"] }
 base64 = { workspace = true }
+fs2 = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

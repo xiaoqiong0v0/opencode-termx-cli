@@ -29,6 +29,7 @@ pub async fn run(cli: &Cli) -> Result<i32, CliError> {
         Command::Status(args) => terminal::status(cli, args).await,
         Command::List(args) => terminal::list(cli, args).await,
         Command::Read(args) => terminal::read(cli, args).await,
+        Command::Search(args) => terminal::search(cli, args).await,
         Command::Transcript(args) => terminal::transcript(cli, args).await,
         Command::Send(args) => terminal::send(cli, args).await,
         Command::Resize(args) => terminal::resize(cli, args).await,

@@ -11,6 +11,8 @@ use termx_protocol::{TranscriptCommand, TranscriptResult, TranscriptSource, Tran
 use termx_terminal::{OscEvent, OscScanner};
 use time::OffsetDateTime;
 
+use crate::output::{normalize_controls, strip_ansi};
+
 /// 默认 transcript 容量（命令条数）。
 pub const DEFAULT_TRANSCRIPT_CAPACITY: usize = 200;
 
@@ -433,6 +435,27 @@ impl TranscriptBuffer {
         }
     }
 
+    /// 按时间顺序拼接各命令**清洗后**的输出文本（命令块之间以换行分隔）。
+    ///
+    /// 供 `read`/`search` 在结构化终端上以“命令输出行”为语义读取：不包含
+    /// raw PTY 的 ANSI/OSC、命令回显与提示符。空输出的命令被跳过；没有任何
+    /// 输出时返回空串。命令块之间显式插入 `\n`，避免相邻命令的输出粘成
+    /// 同一行（否则 `--only-matches` 会跨命令夹带内容）。
+    pub fn output_text(&self) -> String {
+        let mut text = String::new();
+        for record in &self.commands {
+            let cleaned = clean_output(&record.command, &record.output);
+            if cleaned.is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&cleaned);
+        }
+        text
+    }
+
     /// 当前保留条数。
     pub fn len(&self) -> usize {
         self.commands.len()
@@ -713,81 +736,6 @@ fn strip_trailing_prompt(line: &str) -> String {
     }
 
     trimmed.to_string()
-}
-
-/// 去掉 ANSI 转义序列（CSI / OSC / 其它单字符 ESC 序列）。
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' {
-            out.push(ch);
-            continue;
-        }
-        match chars.peek() {
-            // CSI：ESC [ ... 终止字节 0x40..=0x7e。
-            // PowerShell 表格常用 `ESC[row;colH` 绝对定位代替换行；转成换行，
-            // 否则删除转义后会把上一行末尾和下一行开头粘在一起。
-            Some('[') => {
-                chars.next();
-                let mut final_byte = None;
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        final_byte = Some(next);
-                        break;
-                    }
-                }
-                if matches!(final_byte, Some('H' | 'f')) && !out.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            // OSC：ESC ] ... BEL 或 ST(ESC \)
-            Some(']') => {
-                chars.next();
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' {
-                        break;
-                    }
-                    if next == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            // 其它两字符 ESC 序列。
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
-}
-
-/// 统一换行并丢弃不可打印控制字符（保留换行与制表）。
-fn normalize_controls(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push('\n');
-            }
-            '\u{8}' => {
-                if !out.is_empty() && !out.ends_with('\n') {
-                    out.pop();
-                }
-            }
-            ch if ch.is_control() && ch != '\n' && ch != '\t' => {}
-            ch => out.push(ch),
-        }
-    }
-    out
 }
 
 /// 判断一行是否是常见 shell 提示符。

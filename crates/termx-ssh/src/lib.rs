@@ -13,22 +13,25 @@
 //! 的摄取路径。
 
 mod helper;
+mod known_hosts;
 
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, OnceLock, mpsc::Sender},
+    sync::{Arc, Mutex, OnceLock, mpsc::Sender},
     time::Duration,
 };
 
+use known_hosts::{HostKeyInfo, HostKeyTarget, KnownHostVerdict, KnownHosts, KnownHostsError};
 use russh::{
     Channel, ChannelMsg, Disconnect, Sig,
     client::{self, Msg},
-    keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key},
+    keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key},
 };
 use termx_proc::{OutputStream, ProcEvent};
 use termx_protocol::{
-    Capabilities, InjectionConsent, ProcNode, SshAuth, SshConfig, validate_path_spec,
+    Capabilities, InjectionConsent, ProcNode, SshAuth, SshConfig, SshHostKeyPolicy,
+    validate_path_spec,
 };
 use thiserror::Error;
 use tokio::{
@@ -94,11 +97,39 @@ pub enum SshError {
     /// 用户名/密码（或私钥）未被服务器接受。
     #[error("SSH 认证失败")]
     AuthFailed,
-    /// 主机密钥未被信任；需 known_hosts 记录或显式 `accept_any_host_key`。
+    /// 主机密钥未被信任；需 known_hosts 记录或显式确认。
     #[error("SSH 主机密钥未被信任: {message}")]
     HostKeyRejected {
         /// 可读原因（不含凭据）。
         message: String,
+    },
+    /// 未知主机密钥；`ask` 策略下客户端确认指纹后可重试。
+    #[error("SSH 主机密钥未知（{host}:{port} {algorithm} {fingerprint}）")]
+    HostKeyUnknown {
+        /// 目标主机。
+        host: String,
+        /// 目标端口。
+        port: u16,
+        /// 密钥算法。
+        algorithm: String,
+        /// 当前密钥 SHA256 指纹。
+        fingerprint: String,
+    },
+    /// 主机密钥与 known_hosts 不一致；可能被中间人替换。
+    #[error(
+        "SSH 主机密钥已变化（{host}:{port} {algorithm} {fingerprint}，原记录 {recorded_fingerprint}），可能遭遇中间人攻击"
+    )]
+    HostKeyChanged {
+        /// 目标主机。
+        host: String,
+        /// 目标端口。
+        port: u16,
+        /// 当前密钥算法。
+        algorithm: String,
+        /// 当前密钥 SHA256 指纹。
+        fingerprint: String,
+        /// known_hosts 中记录的旧指纹。
+        recorded_fingerprint: String,
     },
     /// 会话已结束，无法再写/缩放/发信号。
     #[error("SSH 会话已关闭")]
@@ -546,14 +577,118 @@ fn fallback_capabilities() -> Capabilities {
     }
 }
 
+/// 校验失败时记录的细节；连接失败后由 [`map_connect_error`] 转成明确错误。
+#[derive(Debug, Clone)]
+enum HostKeyFailure {
+    /// 未知主机。
+    Unknown {
+        algorithm: String,
+        fingerprint: String,
+    },
+    /// 与 known_hosts 记录不一致。
+    Changed {
+        algorithm: String,
+        fingerprint: String,
+        recorded_fingerprint: String,
+    },
+    /// 证书或存储错误等明确拒绝原因。
+    Rejected(String),
+}
+
+/// 单次校验结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostKeyDecision {
+    /// 接受连接。
+    Accept,
+    /// 未知主机；`ask` 策略需要客户端确认。
+    Unknown,
+    /// 密钥变化，必须硬失败。
+    Changed { recorded: HostKeyInfo },
+}
+
+impl HostKeyDecision {
+    /// 便于在 `match` 中区分；仅测试使用。
+    #[cfg(test)]
+    fn is_accept(&self) -> bool {
+        matches!(self, Self::Accept)
+    }
+}
+
 /// 主机密钥校验策略。
 pub(crate) struct HostKeyPolicy {
-    /// 是否接受任意主机密钥。
-    accept_any: bool,
+    /// 策略。
+    mode: SshHostKeyPolicy,
     /// 目标主机。
     host: String,
     /// 目标端口。
     port: u16,
+    /// known_hosts 存储；`accept_any` 时可为空。
+    known_hosts: Option<KnownHosts>,
+    /// 本次请求允许首次信任的指纹。
+    trusted_fingerprint: Option<String>,
+    /// 校验失败细节，供连接错误分类。
+    failure: Arc<Mutex<Option<HostKeyFailure>>>,
+}
+
+impl HostKeyPolicy {
+    /// 构造策略；`failure` 与调用方共享。
+    fn new(
+        config: &SshConfig,
+        mode: SshHostKeyPolicy,
+        failure: Arc<Mutex<Option<HostKeyFailure>>>,
+    ) -> Self {
+        Self {
+            mode,
+            host: config.host.clone(),
+            port: config.port,
+            known_hosts: config
+                .known_hosts_path
+                .as_ref()
+                .map(|path| KnownHosts::new(path.clone())),
+            trusted_fingerprint: config
+                .trusted_host_key
+                .as_deref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            failure,
+        }
+    }
+
+    /// 纯策略判定；不依赖 russh 类型，便于单测。
+    fn evaluate(&self, info: &HostKeyInfo) -> Result<HostKeyDecision, KnownHostsError> {
+        if self.mode == SshHostKeyPolicy::AcceptAny {
+            return Ok(HostKeyDecision::Accept);
+        }
+        let store = self.known_hosts.as_ref().ok_or_else(|| {
+            KnownHostsError::Io("未配置 known_hosts 路径，无法校验主机密钥".to_string())
+        })?;
+        let target = HostKeyTarget::new(self.host.clone(), self.port);
+        match store.check(&target, info)? {
+            KnownHostVerdict::Match => Ok(HostKeyDecision::Accept),
+            KnownHostVerdict::Unknown => {
+                if self.mode == SshHostKeyPolicy::Ask
+                    && self.trusted_fingerprint.as_deref() == Some(info.fingerprint.as_str())
+                {
+                    store.trust(&target, info)?;
+                    Ok(HostKeyDecision::Accept)
+                } else {
+                    Ok(HostKeyDecision::Unknown)
+                }
+            }
+            KnownHostVerdict::Changed { recorded } => Ok(HostKeyDecision::Changed { recorded }),
+        }
+    }
+
+    /// 记录失败原因；覆盖更具体的拒绝原因，保证错误分类稳定。
+    fn record_failure(&self, failure: HostKeyFailure) {
+        let mut slot = self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
+    }
 }
 
 impl client::Handler for HostKeyPolicy {
@@ -563,16 +698,98 @@ impl client::Handler for HostKeyPolicy {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        if self.accept_any {
-            return Ok(true);
-        }
-        match server_public_key {
-            PublicKeyOrCertificate::PublicKey { key, .. } => {
-                Ok(russh::keys::check_known_hosts(&self.host, self.port, key)?)
+        let key = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            // 证书链校验尚未实现；明确拒绝，避免静默放行。
+            PublicKeyOrCertificate::Certificate(_) => {
+                self.record_failure(HostKeyFailure::Rejected(
+                    "暂不支持 SSH 主机证书".to_string(),
+                ));
+                return Ok(false);
             }
-            // 证书链校验属 M6b-2；当前明确拒绝，避免静默放行。
-            PublicKeyOrCertificate::Certificate(_) => Ok(false),
+        };
+        let info = HostKeyInfo::new(
+            key.algorithm().to_string(),
+            key.fingerprint(HashAlg::Sha256).to_string(),
+        );
+        match self.evaluate(&info) {
+            Ok(HostKeyDecision::Accept) => Ok(true),
+            Ok(HostKeyDecision::Unknown) => {
+                self.record_failure(HostKeyFailure::Unknown {
+                    algorithm: info.algorithm,
+                    fingerprint: info.fingerprint,
+                });
+                Ok(false)
+            }
+            Ok(HostKeyDecision::Changed { recorded }) => {
+                self.record_failure(HostKeyFailure::Changed {
+                    algorithm: info.algorithm,
+                    fingerprint: info.fingerprint,
+                    recorded_fingerprint: recorded.fingerprint,
+                });
+                Ok(false)
+            }
+            Err(KnownHostsError::KeyChanged { recorded }) => {
+                self.record_failure(HostKeyFailure::Changed {
+                    algorithm: info.algorithm,
+                    fingerprint: info.fingerprint,
+                    recorded_fingerprint: recorded.fingerprint,
+                });
+                Ok(false)
+            }
+            Err(error) => {
+                self.record_failure(HostKeyFailure::Rejected(error.to_string()));
+                Ok(false)
+            }
         }
+    }
+}
+
+/// 把策略解析后的连接错误转成明确的主机密钥错误。
+fn map_connect_error(
+    error: russh::Error,
+    config: &SshConfig,
+    failure: &Mutex<Option<HostKeyFailure>>,
+) -> SshError {
+    let failure = failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    match failure {
+        Some(HostKeyFailure::Unknown {
+            algorithm,
+            fingerprint,
+        }) => SshError::HostKeyUnknown {
+            host: config.host.clone(),
+            port: config.port,
+            algorithm,
+            fingerprint,
+        },
+        Some(HostKeyFailure::Changed {
+            algorithm,
+            fingerprint,
+            recorded_fingerprint,
+        }) => SshError::HostKeyChanged {
+            host: config.host.clone(),
+            port: config.port,
+            algorithm,
+            fingerprint,
+            recorded_fingerprint,
+        },
+        Some(HostKeyFailure::Rejected(message)) => SshError::HostKeyRejected { message },
+        None => map_russh_error(error),
+    }
+}
+
+/// 解析生效策略：显式字段优先，否则兼容旧 `accept_any_host_key`。
+fn host_key_policy(config: &SshConfig) -> Result<SshHostKeyPolicy, SshError> {
+    match (config.host_key_policy, config.accept_any_host_key) {
+        (Some(policy), true) if policy != SshHostKeyPolicy::AcceptAny => Err(SshError::BadRequest(
+            "accept_any_host_key 与 host_key_policy 冲突".to_string(),
+        )),
+        (Some(policy), _) => Ok(policy),
+        (None, true) => Ok(SshHostKeyPolicy::AcceptAny),
+        (None, false) => Ok(SshHostKeyPolicy::Ask),
     }
 }
 
@@ -590,6 +807,22 @@ fn validate(config: &SshConfig, request: &SshConnectRequest) -> Result<(), SshEr
     if let SshAuth::Key { path, .. } = &config.auth {
         if path.trim().is_empty() {
             return Err(SshError::BadRequest("私钥路径不能为空".to_string()));
+        }
+    }
+    // 非 AcceptAny 必须有服务端 known_hosts 路径；否则无法校验也不应静默接受。
+    let policy = host_key_policy(config)?;
+    if policy != SshHostKeyPolicy::AcceptAny && config.known_hosts_path.is_none() {
+        return Err(SshError::BadRequest(
+            "未配置 known_hosts 路径，无法校验 SSH 主机密钥".to_string(),
+        ));
+    }
+    if policy == SshHostKeyPolicy::Ask {
+        if let Some(fingerprint) = config.trusted_host_key.as_deref() {
+            if !fingerprint.trim().starts_with("SHA256:") {
+                return Err(SshError::BadRequest(
+                    "trusted_host_key 必须是 SHA256 指纹".to_string(),
+                ));
+            }
         }
     }
     validate_helper(config)?;
@@ -765,15 +998,13 @@ async fn open_prepared(
 
 /// 建立 TCP/SSH 连接并完成认证。
 async fn open_connection(config: &SshConfig) -> Result<client::Handle<HostKeyPolicy>, SshError> {
-    let policy = HostKeyPolicy {
-        accept_any: config.accept_any_host_key,
-        host: config.host.clone(),
-        port: config.port,
-    };
+    let mode = host_key_policy(config)?;
+    let failure = Arc::new(Mutex::new(None));
+    let policy = HostKeyPolicy::new(config, mode, Arc::clone(&failure));
     let ssh_config = Arc::new(client::Config::default());
     let mut handle = client::connect(ssh_config, (config.host.as_str(), config.port), policy)
         .await
-        .map_err(map_russh_error)?;
+        .map_err(|error| map_connect_error(error, config, &failure))?;
     authenticate(&mut handle, config).await?;
     Ok(handle)
 }
@@ -1071,6 +1302,9 @@ mod tests {
             helper_sha256: None,
             upload_helper: false,
             accept_any_host_key: true,
+            host_key_policy: None,
+            trusted_host_key: None,
+            known_hosts_path: None,
             injection: termx_protocol::InjectionPlan::default(),
         }
     }
@@ -1227,5 +1461,165 @@ mod tests {
         assert!(matches!(parse_signal(" SIGTERM "), Some(Sig::TERM)));
         assert!(matches!(parse_signal("KILL"), Some(Sig::KILL)));
         assert!(parse_signal("SIGHUP").is_none());
+    }
+
+    /// 构造策略测试配置。
+    fn host_key_config(
+        mode: SshHostKeyPolicy,
+        path: Option<std::path::PathBuf>,
+        trusted: Option<&str>,
+    ) -> SshConfig {
+        let mut config = base_config();
+        config.accept_any_host_key = false;
+        config.host_key_policy = Some(mode);
+        config.known_hosts_path = path;
+        config.trusted_host_key = trusted.map(str::to_string);
+        config
+    }
+
+    /// 测试用主机密钥信息。
+    fn host_key_info(fingerprint: &str) -> HostKeyInfo {
+        HostKeyInfo::new("ssh-ed25519", format!("SHA256:{fingerprint}"))
+    }
+
+    #[test]
+    fn policy_resolves_legacy_accept_any_and_rejects_conflicts() {
+        let mut config = base_config();
+        assert_eq!(
+            host_key_policy(&config).expect("旧开关"),
+            SshHostKeyPolicy::AcceptAny
+        );
+
+        config.accept_any_host_key = false;
+        assert_eq!(
+            host_key_policy(&config).expect("默认 Ask"),
+            SshHostKeyPolicy::Ask
+        );
+
+        config.accept_any_host_key = true;
+        config.host_key_policy = Some(SshHostKeyPolicy::Strict);
+        assert!(matches!(
+            host_key_policy(&config),
+            Err(SshError::BadRequest(message)) if message.contains("冲突")
+        ));
+    }
+
+    #[test]
+    fn ask_policy_requires_explicit_fingerprint_and_writes_once() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("known_hosts");
+        let info = host_key_info("abc");
+
+        let policy = HostKeyPolicy::new(
+            &host_key_config(SshHostKeyPolicy::Ask, Some(path.clone()), None),
+            SshHostKeyPolicy::Ask,
+            Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(
+            policy.evaluate(&info).expect("未知"),
+            HostKeyDecision::Unknown
+        );
+        assert!(!path.exists(), "未经确认不得写 known_hosts");
+
+        let policy = HostKeyPolicy::new(
+            &host_key_config(
+                SshHostKeyPolicy::Ask,
+                Some(path.clone()),
+                Some("SHA256:abc"),
+            ),
+            SshHostKeyPolicy::Ask,
+            Arc::new(Mutex::new(None)),
+        );
+        assert!(policy.evaluate(&info).expect("首次信任").is_accept());
+        assert_eq!(
+            policy.evaluate(&info).expect("二次匹配"),
+            HostKeyDecision::Accept
+        );
+        assert!(path.exists(), "确认后应落盘");
+    }
+
+    #[test]
+    fn strict_policy_never_trusts_unknown_even_with_fingerprint() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("known_hosts");
+        let info = host_key_info("abc");
+        let policy = HostKeyPolicy::new(
+            &host_key_config(
+                SshHostKeyPolicy::Strict,
+                Some(path.clone()),
+                Some("SHA256:abc"),
+            ),
+            SshHostKeyPolicy::Strict,
+            Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(
+            policy.evaluate(&info).expect("严格拒绝"),
+            HostKeyDecision::Unknown
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn changed_key_is_hard_failure() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("known_hosts");
+        let old = host_key_info("old");
+        let config = host_key_config(
+            SshHostKeyPolicy::Ask,
+            Some(path.clone()),
+            Some("SHA256:old"),
+        );
+        let policy = HostKeyPolicy::new(&config, SshHostKeyPolicy::Ask, Arc::new(Mutex::new(None)));
+        assert!(policy.evaluate(&old).expect("首次信任").is_accept());
+
+        let new = host_key_info("new");
+        let decision = policy.evaluate(&new).expect("查询");
+        assert!(
+            matches!(decision, HostKeyDecision::Changed { ref recorded } if recorded.fingerprint == "SHA256:old"),
+            "指纹变化必须拒绝: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn accept_any_never_writes_known_hosts() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("known_hosts");
+        let config = host_key_config(SshHostKeyPolicy::AcceptAny, Some(path.clone()), None);
+        let policy = HostKeyPolicy::new(
+            &config,
+            SshHostKeyPolicy::AcceptAny,
+            Arc::new(Mutex::new(None)),
+        );
+        assert!(
+            policy
+                .evaluate(&host_key_info("any"))
+                .expect("接受")
+                .is_accept()
+        );
+        assert!(!path.exists(), "AcceptAny 不得落盘");
+    }
+
+    #[test]
+    fn validate_requires_known_hosts_path_for_non_accept_any() {
+        let mut config = base_config();
+        config.accept_any_host_key = false;
+        let error = connect_error(config, SshConnectRequest::shell(80, 24));
+        assert!(
+            matches!(&error, SshError::BadRequest(message) if message.contains("known_hosts")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_malformed_trusted_fingerprint() {
+        let mut config = base_config();
+        config.accept_any_host_key = false;
+        config.known_hosts_path = Some(std::path::PathBuf::from("known_hosts"));
+        config.trusted_host_key = Some("not-a-fingerprint".to_string());
+        let error = connect_error(config, SshConnectRequest::shell(80, 24));
+        assert!(
+            matches!(&error, SshError::BadRequest(message) if message.contains("trusted_host_key")),
+            "{error:?}"
+        );
     }
 }

@@ -98,19 +98,47 @@ fn web_assets_expose_remote_injection_consent() {
     );
 }
 
-/// SSH 创建表单：运行环境下拉、helper 字段移除、回环主机默认信任。
+/// 无结构化事件能力的终端必须隐藏/禁用信息页；能力来自 `structured_events`。
+#[test]
+fn web_hides_info_view_for_non_structured_terminals() {
+    let app = include_str!("../src/web_assets/app.js");
+    let css = include_str!("../src/web_assets/app.css");
+    assert!(
+        app.contains("structured_events === true"),
+        "app.js 应按 structured_events 判定能力"
+    );
+    assert!(
+        app.contains("elements.tabInfo.hidden") && app.contains("elements.tabInfo.disabled"),
+        "app.js 应隐藏并禁用信息页入口"
+    );
+    assert!(
+        app.contains("syncStructuredCapability"),
+        "app.js 应在选择/刷新时同步能力"
+    );
+    assert!(
+        css.contains(".termx-tab[hidden]"),
+        "app.css 必须让 hidden 覆盖 inline-flex"
+    );
+}
+
+/// SSH 创建表单：固定 termx-pwsh、默认私钥提示、helper 字段移除、回环主机默认信任。
 #[test]
 fn web_ssh_form_converges_runtime_and_helper_fields() {
     let app = include_str!("../src/web_assets/app.js");
     let index = include_str!("../src/web_assets/index.html");
 
     assert!(
-        index.contains("termx-create-ssh-runtime"),
-        "index.html 应提供 SSH 运行环境下拉"
+        !index.contains("termx-create-ssh-runtime") && !index.contains("系统 shell"),
+        "SSH 表单不应再提供系统 shell 运行环境"
     );
     assert!(
-        index.contains("termx-pwsh") && index.contains("系统 shell"),
-        "运行环境应只有 termx-pwsh 与系统 shell"
+        index.contains("留空自动尝试 ~/.ssh/id_ed25519 / ~/.ssh/id_rsa"),
+        "私钥路径应提示留空探测顺序"
+    );
+    assert!(
+        index.contains("不接入 shell 事件")
+            && index.contains("read --tail-lines/--tail-chars/search"),
+        "自定义程序区应说明 raw-only 与 read/search 获取方式"
     );
     for removed in [
         "termx-create-helper-path",
@@ -123,16 +151,26 @@ fn web_ssh_form_converges_runtime_and_helper_fields() {
     }
 
     assert!(
-        app.contains("params.cmd") && app.contains("\"termx-pwsh\""),
-        "app.js 应把 termx-pwsh 映射为 cmd"
+        app.contains("params.cmd = \"termx-pwsh\""),
+        "app.js 应固定把 termx-pwsh 映射为 cmd"
+    );
+    assert!(
+        !app.contains("私钥路径不能为空") && app.contains("{ type: \"key\", path: path }"),
+        "私钥路径应允许留空并交给 service 探测"
     );
     assert!(
         !app.contains("helper_local_path = ") && !app.contains("upload_helper:"),
         "app.js 不应再传 helper_* 字段"
     );
     assert!(
-        app.contains("isLoopbackHost") && app.contains("127.0.0.1") && app.contains("::1"),
-        "app.js 应对回环主机自动勾选 accept-any-host-key"
+        !app.contains("isLoopbackHost")
+            && app.contains("host_key_policy: acceptAny ? \"accept_any\" : \"ask\"")
+            && index.contains("高级 / 不安全选项"),
+        "SSH 默认应为 Ask，AcceptAny 只能放在高级/不安全选项里"
+    );
+    assert!(
+        app.contains("host_key_unknown") && app.contains("trusted_host_key"),
+        "app.js 应处理未知主机密钥确认并附带一次性指纹"
     );
 }
 

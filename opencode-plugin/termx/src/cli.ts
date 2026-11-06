@@ -137,6 +137,11 @@ interface ReadResult {
   reset?: string | { reason?: string };
 }
 
+/** `terminal.output` 结果：尾部截取或倒搜后的原文。 */
+interface OutputResult {
+  text?: string;
+}
+
 interface ListItem {
   terminal_id: string;
   root_session_id: string;
@@ -197,6 +202,7 @@ const COMMANDS = new Set([
   "exec",
   "run",
   "read",
+  "search",
   "transcript",
   "send",
   "resize",
@@ -251,6 +257,7 @@ const HANDLERS: Record<string, Handler> = {
   exec: doExec,
   run: doRun,
   read: doRead,
+  search: doSearch,
   transcript: doTranscript,
   send: doSend,
   resize: doResize,
@@ -725,12 +732,14 @@ async function doRun(tokens: string[], env: CommandEnv): Promise<string> {
   return formatRun(env.t, outcome);
 }
 
-/** read：增量读取终端 output。 */
+/** read：增量读取 output，或按尾部行/字符读取原始输出。 */
 async function doRead(tokens: string[], env: CommandEnv): Promise<string> {
   const parsed = parseFlags(tokens, {
     name: { short: "n", type: "string" },
     cursor: { type: "string" },
     "max-bytes": { type: "string" },
+    "tail-lines": { type: "string" },
+    "tail-chars": { type: "string" },
   });
   if (!parsed.ok) return fail(env.t, parsed.failure);
 
@@ -738,13 +747,61 @@ async function doRead(tokens: string[], env: CommandEnv): Promise<string> {
   if (!cursor.ok) return fail(env.t, cursor.failure);
   const maxBytes = readInt(parsed.values, "max-bytes");
   if (!maxBytes.ok) return fail(env.t, maxBytes.failure);
+  const tailLines = readInt(parsed.values, "tail-lines");
+  if (!tailLines.ok) return fail(env.t, tailLines.failure);
+  const tailChars = readInt(parsed.values, "tail-chars");
+  if (!tailChars.ok) return fail(env.t, tailChars.failure);
 
   const name = nameOf(parsed.values);
   const target = locator(env.ctx, name);
+  const tailMode = tailLines.value !== undefined || tailChars.value !== undefined;
+  if (tailMode) {
+    if (cursor.value !== undefined || maxBytes.value !== undefined) {
+      return fail(env.t, { key: "cli.err.readMode" });
+    }
+    if (tailLines.value !== undefined && tailChars.value !== undefined) {
+      return fail(env.t, { key: "cli.err.readMode" });
+    }
+    const result = await env.client.request<OutputResult>("terminal.output", {
+      ...target,
+      tail_lines: tailLines.value ?? null,
+      tail_chars: tailChars.value ?? null,
+    });
+    return result.text || "";
+  }
+
   const start = cursor.value ?? env.deps.cursors.get(cursorKey(env.ctx, name)) ?? 0;
   const result = await readOutput(env.client, target, start, maxBytes.value);
   env.deps.cursors.set(cursorKey(env.ctx, name), result.cursor);
   return formatOutput(env.t, result);
+}
+
+/** search：从末尾倒搜原始输出；`--nth 1` 为最后一个匹配。 */
+async function doSearch(tokens: string[], env: CommandEnv): Promise<string> {
+  const parsed = parseFlags(tokens, {
+    name: { short: "n", type: "string" },
+    pattern: { type: "string" },
+    nth: { type: "string" },
+    "only-matches": { type: "boolean" },
+  });
+  if (!parsed.ok) return fail(env.t, parsed.failure);
+
+  const pattern = textValue(parsed.values, "pattern");
+  if (!pattern) return fail(env.t, { key: "cli.err.missingPattern" });
+  const nth = readInt(parsed.values, "nth");
+  if (!nth.ok) return fail(env.t, nth.failure);
+  if (nth.value !== undefined && nth.value < 1) {
+    return fail(env.t, { key: "cli.err.badNth" });
+  }
+
+  const target = locator(env.ctx, nameOf(parsed.values));
+  const result = await env.client.request<OutputResult>("terminal.output", {
+    ...target,
+    pattern,
+    nth: nth.value ?? 1,
+    only_matches: boolValue(parsed.values, "only-matches"),
+  });
+  return result.text || "";
 }
 
 /** transcript：读取信息页命令记录（命令 + 起止时间 + 状态 + 清洗后输出）。 */

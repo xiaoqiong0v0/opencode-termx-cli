@@ -89,7 +89,8 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
 - **信息页顶部**：显示当前终端的 `state`、`pid`、`mode`、启动命令（`command` + `args`）与 `cwd`（来自 `terminal.list` / `terminal.status` 快照）。
 - **新建终端**：header「新建终端」打开表单，绑定会话（含「其他/未绑定」`@web`）、名称（默认 `default`）、类型 `local`/`ssh`。
   - `local`：程序、参数（空格分隔，支持单/双引号）、cwd、环境变量（每行 `KEY=VALUE`）、cols/rows。
-  - `ssh`：host/port/user、密码或私钥路径/口令、运行环境（`termx-pwsh` / 系统 shell）、`accept-any-host-key`、cols/rows；helper 路径/上传/摘要由 service 按注入配置自动处理。主机为 `127.0.0.1`/`localhost`/`::1` 时默认勾选 `accept-any-host-key`，外部主机默认不勾。
+  - `ssh`：host/port/user、密码或私钥路径/口令（私钥路径可留空：service 依次探测本机 `~/.ssh/id_ed25519`、`~/.ssh/id_rsa`，显式路径优先）、固定 `termx-pwsh`（结构化事件；普通 ssh 请用 `local` 自定义程序，raw-only）、cols/rows；helper 路径/上传/摘要由 service 按注入配置自动处理。主机密钥默认 `ask`：未知主机弹出指纹确认，匹配 known_hosts 直接连接，指纹变化硬失败；`accept_any` 仅在高级/不安全选项中显式开启，且不写 known_hosts。回环地址不再默认静默接受。
+  - `local` 自定义 cmd/args 不接入 shell 事件：只显示原始控制台，不生成信息页/transcript；模型用 `read --tail-lines`/`--tail-chars`/`search` 获取输出。
   - 提交 `terminal.create`（`mode:"pty"`）；绑定「其他/未绑定」时 `root_session_id` 使用保留值 `@web`。成功后刷新两级选择并选中新终端，失败在弹窗内显示错误。
   - **密码/口令只随本次创建请求发送**（内存表单 → WebSocket），不写页面文本、日志或 localStorage；关闭弹窗时清空。
 - **`@web` 生命周期**：该会话下的终端不参与无会话超时（clientless 扫描跳过），只能手动终止；非管理员（普通 opencode 会话连接）不可见/不可访问。迁移弹窗也可把终端迁到 `@web`（管理员，等同解绑）。

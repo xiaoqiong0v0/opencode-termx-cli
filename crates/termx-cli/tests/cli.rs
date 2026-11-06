@@ -196,6 +196,117 @@ async fn terminal_id_read_send_round_trip() {
     service.shutdown().await;
 }
 
+/// `read --tail-lines/--tail-chars` 与 `search` 直接读取 raw 输出。
+#[tokio::test]
+async fn read_tail_and_search_round_trip() {
+    let mut service = TestService::start().await;
+    let shell = default_shell();
+    let created = run_cli(
+        &service,
+        &["local", "--json", "--name", "tail-search", "--cmd", &shell],
+    )
+    .await;
+    assert_eq!(created.code, Some(0), "stderr={}", created.stderr_text());
+
+    // send 自动 claim；--force 规避上一连接释放 lease 的竞态。
+    let send = run_cli(
+        &service,
+        &[
+            "send",
+            "--name",
+            "tail-search",
+            "--force",
+            "--text",
+            "echo tail-search-marker",
+            "--enter",
+        ],
+    )
+    .await;
+    assert_eq!(send.code, Some(0), "stderr={}", send.stderr_text());
+    wait_for_marker(&service, &["--name", "tail-search"], "tail-search-marker").await;
+
+    let tail_lines = run_cli(
+        &service,
+        &["read", "--name", "tail-search", "--tail-lines", "50"],
+    )
+    .await;
+    assert_eq!(
+        tail_lines.code,
+        Some(0),
+        "stderr={}",
+        tail_lines.stderr_text()
+    );
+    assert!(
+        tail_lines.stdout_text().contains("tail-search-marker"),
+        "tail-lines={:?}",
+        tail_lines.stdout_text()
+    );
+    assert!(
+        !tail_lines.stdout_text().contains('\u{1b}'),
+        "tail-lines 不应包含 ANSI 控制序列: {:?}",
+        tail_lines.stdout_text()
+    );
+
+    let tail_chars = run_cli(
+        &service,
+        &[
+            "read",
+            "--name",
+            "tail-search",
+            "--tail-chars",
+            "4096",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        tail_chars.code,
+        Some(0),
+        "stderr={}",
+        tail_chars.stderr_text()
+    );
+    assert!(
+        tail_chars.stdout_json()["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("tail-search-marker")),
+        "tail-chars={}",
+        tail_chars.stdout_text()
+    );
+
+    let search = run_cli(
+        &service,
+        &[
+            "search",
+            "--name",
+            "tail-search",
+            "--pattern",
+            "tail-search-marker",
+            "--only-matches",
+        ],
+    )
+    .await;
+    assert_eq!(search.code, Some(0), "stderr={}", search.stderr_text());
+    assert!(
+        search.stdout_text().contains("tail-search-marker"),
+        "search={:?}",
+        search.stdout_text()
+    );
+    assert!(
+        !search.stdout_text().contains('\u{1b}'),
+        "search 不应返回 ANSI 控制序列: {:?}",
+        search.stdout_text()
+    );
+
+    let terminate = run_cli(&service, &["terminate", "--name", "tail-search"]).await;
+    assert_eq!(
+        terminate.code,
+        Some(0),
+        "stderr={}",
+        terminate.stderr_text()
+    );
+    service.shutdown().await;
+}
+
 /// 未知终端返回非零并报告 `not_found`。
 #[tokio::test]
 async fn unknown_terminal_reports_not_found() {

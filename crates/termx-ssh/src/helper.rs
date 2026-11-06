@@ -1544,6 +1544,9 @@ mod tests {
             helper_sha256: None,
             upload_helper: false,
             accept_any_host_key: true,
+            host_key_policy: None,
+            trusted_host_key: None,
+            known_hosts_path: None,
             injection: InjectionPlan {
                 helper: Some("/ignored/helper".to_string()),
                 ..InjectionPlan::default()

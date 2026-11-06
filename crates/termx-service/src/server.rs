@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -21,12 +21,12 @@ use termx_proc::{OutputStream, ProcEvent};
 use termx_protocol::{
     AttachParams, Capabilities, ClaimParams, CreateParams, DetachParams, ErrorCode, Event,
     EventKind, HELPER_PROTOCOL_VERSION, HelloParams, HelloResult, ListItem, ListParams, Mode,
-    PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, RebindParams, ReleaseParams, Request,
-    ResizeParams, Response, RuntimeInfo, RuntimeListResult, SendParams, SessionInfo,
-    SessionListParams, SessionListResult, SignalParams, SimpleResult, StatusParams, StatusResult,
-    Stream, SubscribeParams, SubscribeResult, SubscriptionCursor, TerminalLocator,
-    TerminalSnapshot, TerminateParams, TranscriptParams, UnsubscribeParams, WEB_ROOT_SESSION_ID,
-    from_json, to_json,
+    OutputParams, PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, RebindParams,
+    ReleaseParams, Request, ResizeParams, Response, RuntimeInfo, RuntimeListResult, SendParams,
+    SessionInfo, SessionListParams, SessionListResult, SignalParams, SimpleResult, SshAuth,
+    StatusParams, StatusResult, Stream, SubscribeParams, SubscribeResult, SubscriptionCursor,
+    TerminalLocator, TerminalSnapshot, TerminateParams, TranscriptParams, UnsubscribeParams,
+    WEB_ROOT_SESSION_ID, from_json, to_json,
 };
 use termx_runtime::{RuntimeCatalog, RuntimeError};
 use time::OffsetDateTime;
@@ -540,6 +540,7 @@ impl Service {
                         max_frame_bytes: self.config.max_frame_bytes,
                         subscriber_queue_capacity: self.config.subscriber_queue_capacity,
                         remote_injection: Arc::new(self.config.remote_injection.clone()),
+                        known_hosts_path: Arc::new(self.config.known_hosts_path()),
                     };
                     tokio::spawn(async move {
                         if let Err(error) = handle_connection(stream, token, resources).await {
@@ -827,6 +828,8 @@ struct ConnectionResources {
     subscriber_queue_capacity: usize,
     /// 远端注入授权与路径配置（只读，不保存任何授权状态）。
     remote_injection: Arc<RemoteInjectionConfig>,
+    /// SSH known_hosts 路径；服务端配置目录下，不来自客户端。
+    known_hosts_path: Arc<PathBuf>,
 }
 
 /// 处理单个客户端连接：完成 `hello` 鉴权，成功则保持连接。
@@ -1036,6 +1039,7 @@ where
         max_frame_bytes,
         subscriber_queue_capacity,
         remote_injection,
+        known_hosts_path,
     } = resources;
     let (sink, mut stream) = ws.split();
     let (out_tx, out_rx) = unbounded_channel::<Message>();
@@ -1066,6 +1070,7 @@ where
         runtimes: &runtimes,
         sessions: &sessions,
         remote_injection: &remote_injection,
+        known_hosts_path: known_hosts_path.as_path(),
         out_tx: &out_tx,
         event_tx: &event_tx,
         shutdown: &mut shutdown_rx,
@@ -1162,6 +1167,7 @@ fn send_limit_exceeded(out_tx: &UnboundedSender<Message>) {
             retryable: true,
             terminal_id: None,
             injection: None,
+            host_key: None,
         }),
     };
     match to_json(&response) {
@@ -1189,6 +1195,8 @@ struct ReadContext<'a> {
     sessions: &'a SessionBook,
     /// 远端注入配置；`terminal.create` 组装内部计划时只读。
     remote_injection: &'a RemoteInjectionConfig,
+    /// 服务端 known_hosts 路径。
+    known_hosts_path: &'a Path,
     /// 连接出站队列。
     out_tx: &'a UnboundedSender<Message>,
     /// 订阅事件发送端。
@@ -1247,6 +1255,7 @@ where
                     context.runtimes,
                     context.sessions,
                     context.remote_injection,
+                    context.known_hosts_path,
                     context.out_tx,
                     context.event_tx,
                 )
@@ -1272,6 +1281,7 @@ async fn handle_rpc_text(
     runtimes: &Arc<RuntimeCatalog>,
     sessions: &SessionBook,
     remote_injection: &RemoteInjectionConfig,
+    known_hosts_path: &Path,
     out_tx: &UnboundedSender<Message>,
     event_tx: &Sender<Event>,
 ) -> Result<(), ServiceError> {
@@ -1285,6 +1295,7 @@ async fn handle_rpc_text(
                 runtimes,
                 sessions,
                 remote_injection,
+                known_hosts_path,
                 event_tx,
             )
             .await?
@@ -1313,6 +1324,7 @@ async fn dispatch_request(
     runtimes: &Arc<RuntimeCatalog>,
     sessions: &SessionBook,
     remote_injection: &RemoteInjectionConfig,
+    known_hosts_path: &Path,
     event_tx: &Sender<Event>,
 ) -> Result<Response, ServiceError> {
     let Request { id, method, params } = request;
@@ -1379,7 +1391,16 @@ async fn dispatch_request(
                     ));
                 }
             };
-            handle_create(id, params, caller, registry, runtimes, remote_injection).await
+            handle_create(
+                id,
+                params,
+                caller,
+                registry,
+                runtimes,
+                remote_injection,
+                known_hosts_path,
+            )
+            .await
         }
         "terminal.list" => {
             let params: ListParams = match serde_json::from_value(params) {
@@ -1551,6 +1572,29 @@ async fn dispatch_request(
                 Err(error) => return Ok(response_from_core_error(id, error)),
             };
             match registry.read(&locator, params.cursor, params.max_bytes) {
+                Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
+                Err(error) => Ok(response_from_core_error(id, error)),
+            }
+        }
+        "terminal.output" => {
+            let params: OutputParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("terminal.output 参数非法: {error}"),
+                    ));
+                }
+            };
+
+            // 与 read 一致：只读扫描事件环，不注册订阅、不 cross await 持锁。
+            let registry = lock_registry(registry);
+            let locator = match authorize_locator(&registry, &params.locator, caller) {
+                Ok(locator) => locator,
+                Err(error) => return Ok(response_from_core_error(id, error)),
+            };
+            match registry.output_text(&locator, &params) {
                 Ok(result) => Ok(ok_response(id, serde_json::to_value(result)?)),
                 Err(error) => Ok(response_from_core_error(id, error)),
             }
@@ -1791,14 +1835,48 @@ async fn dispatch_request(
 
 /// SSH 远端程序是否需要 helper（按 basename 匹配 `termx-pwsh`）。
 ///
-/// Web 表单的「运行环境」只允许 `termx-pwsh` 或系统 shell；旧客户端仍可
-/// 直接发 `cmd`，因此按 basename 判断，兼容 `/usr/local/bin/termx-pwsh` 与
-/// Windows 风格分隔符。
+/// Web 的 SSH 表单固定发送 `termx-pwsh`；普通 ssh 由本地自定义程序承载。
+/// 旧客户端仍可直接发 `cmd`，因此按 basename 判断，兼容
+/// `/usr/local/bin/termx-pwsh` 与 Windows 风格分隔符。
 fn ssh_needs_helper(cmd: &str) -> bool {
     cmd.trim()
         .rsplit(['/', '\\'])
         .next()
         .is_some_and(|name| name == SHELL_EVENT_RUNTIME_ID)
+}
+
+/// 默认私钥候选（相对用户 home，按探测顺序）。
+const DEFAULT_SSH_KEY_CANDIDATES: [&str; 2] = [".ssh/id_ed25519", ".ssh/id_rsa"];
+
+/// 解析 SSH 私钥路径：显式路径优先且不改写；留空时探测本机默认私钥。
+fn resolve_ssh_private_key(path: &str) -> Result<String, String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    resolve_ssh_private_key_in(path, home.as_deref())
+}
+
+/// [`resolve_ssh_private_key`] 的可测试实现；`home` 为 `None` 表示无法定位用户目录。
+fn resolve_ssh_private_key_in(path: &str, home: Option<&Path>) -> Result<String, String> {
+    let explicit = path.trim();
+    if !explicit.is_empty() {
+        return Ok(explicit.to_string());
+    }
+    let found = home.and_then(find_default_private_key);
+    found
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            "私钥认证路径为空，且未找到本机默认私钥 ~/.ssh/id_ed25519 或 ~/.ssh/id_rsa；请填写私钥路径"
+                .to_string()
+        })
+}
+
+/// 按固定顺序返回第一个存在的默认私钥。
+fn find_default_private_key(home: &Path) -> Option<PathBuf> {
+    DEFAULT_SSH_KEY_CANDIDATES
+        .iter()
+        .map(|relative| home.join(relative))
+        .find(|candidate| candidate.is_file())
 }
 
 /// 创建终端：预检 → 锁外终止旧后端 → 锁外 spawn → 锁内注册 → 启动事件摄取。
@@ -1813,6 +1891,7 @@ async fn handle_create(
     registry: &Arc<Mutex<Registry>>,
     runtimes: &RuntimeCatalog,
     remote_injection: &RemoteInjectionConfig,
+    known_hosts_path: &Path,
 ) -> Result<Response, ServiceError> {
     // runtime_id 指向本机 runtime，ssh 指向远端主机，两者语义冲突，先拒绝再解析。
     if params.runtime_id.is_some() && params.ssh.is_some() {
@@ -1847,6 +1926,16 @@ async fn handle_create(
         let allow_injection = params.allow_injection;
         let needs_helper = ssh_needs_helper(&params.cmd);
         if let Some(ssh) = params.ssh.as_mut() {
+            // known_hosts 只来自服务端配置目录，客户端无法覆盖。
+            ssh.known_hosts_path = Some(known_hosts_path.to_path_buf());
+            if let SshAuth::Key { path, .. } = &mut ssh.auth {
+                match resolve_ssh_private_key(path) {
+                    Ok(resolved) => *path = resolved,
+                    Err(message) => {
+                        return Ok(error_response(id, ErrorCode::BadRequest, message));
+                    }
+                }
+            }
             if let Err(error) = remote_injection.plan_for_ssh(ssh, allow_injection, needs_helper) {
                 return Ok(error_response(
                     id,
@@ -2549,6 +2638,9 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         // 授权要求必须单独成码并带回写入计划，不能落到普通 bad_request；
         // 注入失败已由 core 映射为 BadRequest，最终返回 bad_request，不回退。
         CoreError::ConsentRequired { .. } => ErrorCode::ConsentRequired,
+        CoreError::HostKeyUnknown { .. } => ErrorCode::HostKeyUnknown,
+        CoreError::HostKeyChanged { .. } => ErrorCode::HostKeyChanged,
+        CoreError::HostKeyRejected { .. } => ErrorCode::SshConnectFailed,
     };
     let terminal_id = match &error {
         CoreError::SessionExists { terminal_id } => Some(terminal_id.clone()),
@@ -2558,6 +2650,12 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         CoreError::ConsentRequired { details } => Some(Box::new(details.clone())),
         _ => None,
     };
+    let host_key = match &error {
+        CoreError::HostKeyUnknown { details } | CoreError::HostKeyChanged { details } => {
+            Some(Box::new(details.clone()))
+        }
+        _ => None,
+    };
 
     ProtocolError {
         code,
@@ -2565,6 +2663,7 @@ fn protocol_error_from_core(error: CoreError) -> ProtocolError {
         retryable: code.is_retryable(),
         terminal_id,
         injection,
+        host_key,
     }
 }
 
@@ -2593,6 +2692,7 @@ fn error_response(id: String, code: ErrorCode, message: impl Into<String>) -> Re
             retryable: code.is_retryable(),
             terminal_id: None,
             injection: None,
+            host_key: None,
         }),
     }
 }
@@ -2780,6 +2880,61 @@ mod tests {
         ] {
             assert!(!is_loopback(addr), "{addr} 不应判定为环回");
         }
+    }
+
+    #[test]
+    fn ssh_private_key_prefers_explicit_path() {
+        let home = tempfile::tempdir().expect("创建临时 home");
+        std::fs::create_dir_all(home.path().join(".ssh")).expect("创建 .ssh");
+        std::fs::write(home.path().join(".ssh/id_ed25519"), "key").expect("写入默认私钥");
+
+        assert_eq!(
+            resolve_ssh_private_key_in("~/keys/custom", Some(home.path())).expect("显式路径应优先"),
+            "~/keys/custom"
+        );
+    }
+
+    #[test]
+    fn ssh_private_key_defaults_prefer_ed25519_then_rsa() {
+        let home = tempfile::tempdir().expect("创建临时 home");
+        let ssh_dir = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).expect("创建 .ssh");
+
+        let ed25519 = ssh_dir.join("id_ed25519");
+        let rsa = ssh_dir.join("id_rsa");
+        std::fs::write(&ed25519, "key").expect("写入 id_ed25519");
+        assert_eq!(
+            PathBuf::from(
+                resolve_ssh_private_key_in("  ", Some(home.path())).expect("应探测 id_ed25519")
+            ),
+            ed25519
+        );
+
+        std::fs::remove_file(&ed25519).expect("删除 id_ed25519");
+        std::fs::write(&rsa, "key").expect("写入 id_rsa");
+        assert_eq!(
+            PathBuf::from(
+                resolve_ssh_private_key_in("", Some(home.path())).expect("应回退 id_rsa")
+            ),
+            rsa
+        );
+    }
+
+    #[test]
+    fn ssh_private_key_reports_missing_defaults() {
+        let home = tempfile::tempdir().expect("创建临时 home");
+        let error =
+            resolve_ssh_private_key_in("", Some(home.path())).expect_err("无默认私钥应报错");
+        assert!(
+            error.contains("id_ed25519") && error.contains("id_rsa"),
+            "{error}"
+        );
+
+        let error = resolve_ssh_private_key_in("", None).expect_err("无 home 应报错");
+        assert!(
+            error.contains("id_ed25519") && error.contains("id_rsa"),
+            "{error}"
+        );
     }
 
     #[test]

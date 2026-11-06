@@ -162,6 +162,35 @@ impl fmt::Debug for SshAuth {
     }
 }
 
+/// SSH 主机密钥信任策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshHostKeyPolicy {
+    /// 默认：已知主机必须匹配；未知主机要求用户确认（首次信任）。
+    #[default]
+    Ask,
+    /// 只接受 known_hosts 中已记录的密钥，未知主机直接拒绝。
+    Strict,
+    /// 高级/测试：接受任意主机密钥，且不写入 known_hosts。
+    AcceptAny,
+}
+
+/// 未知/变化的主机密钥信息，供客户端展示并确认首次信任。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHostKeyInfo {
+    /// 目标主机。
+    pub host: String,
+    /// 目标端口。
+    pub port: u16,
+    /// 密钥算法（如 `ssh-ed25519`）。
+    pub algorithm: String,
+    /// 当前密钥的 SHA256 指纹（`SHA256:...`）。
+    pub fingerprint: String,
+    /// 密钥变化时已记录的旧指纹；未知主机为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_fingerprint: Option<String>,
+}
+
 /// `terminal.create` 的 SSH 连接参数。
 ///
 /// 存在该字段时 `mode` 必须为 [`Mode::Pty`]，由 termx-ssh 建立远端会话。
@@ -193,10 +222,23 @@ pub struct SshConfig {
     pub upload_helper: bool,
     /// 是否接受任意主机密钥。
     ///
-    /// 仅测试或用户显式开启时置 `true`；否则要求 known_hosts 中存在可信记录，
-    /// 缺失/不匹配时连接以明确错误失败。
+    /// 兼容旧客户端的布尔开关：`true` 等价于 [`SshHostKeyPolicy::AcceptAny`]，
+    /// 仅测试或用户显式开启时使用；不写入 known_hosts。
     #[serde(default)]
     pub accept_any_host_key: bool,
+    /// 主机密钥策略；缺省时由 `accept_any_host_key` 推导（`true` → `accept_any`，
+    /// 否则 `ask`）。显式设置且与 `accept_any_host_key` 冲突时连接前拒绝。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_policy: Option<SshHostKeyPolicy>,
+    /// 用户确认后的主机密钥 SHA256 指纹（仅对本次请求生效）。
+    ///
+    /// `ask` 策略下与本次服务端密钥一致时才写入 known_hosts 并继续；不匹配
+    /// 按密钥变化硬失败。`strict` 忽略该字段；`accept_any` 不需要该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_host_key: Option<String>,
+    /// 服务端内部 known_hosts 路径；由 service 注入，**不进入 JSON**。
+    #[serde(skip)]
+    pub known_hosts_path: Option<std::path::PathBuf>,
     /// 内部注入计划；由 service 按配置与本次请求组装，**不进入 JSON**。
     ///
     /// 直接反序列化 `terminal.create` 时取 [`InjectionPlan::default`]
@@ -218,6 +260,12 @@ impl fmt::Debug for SshConfig {
             .field("helper_sha256", &self.helper_sha256)
             .field("upload_helper", &self.upload_helper)
             .field("accept_any_host_key", &self.accept_any_host_key)
+            .field("host_key_policy", &self.host_key_policy)
+            .field(
+                "trusted_host_key",
+                &self.trusted_host_key.as_ref().map(|_| "<set>"),
+            )
+            .field("known_hosts_path", &self.known_hosts_path)
             .field("injection", &self.injection)
             .finish()
     }
@@ -255,6 +303,10 @@ pub enum ErrorCode {
     ProtocolError,
     /// 远端注入需要用户授权；`error.injection` 描述将写入的文件。
     ConsentRequired,
+    /// SSH 主机密钥未知；`error.host_key` 带指纹，客户端确认后可重试。
+    HostKeyUnknown,
+    /// SSH 主机密钥与 known_hosts 记录不一致；可能被中间人劫持，硬失败。
+    HostKeyChanged,
     /// 服务崩溃/重启（客户端合成）。
     ServiceLost,
     /// 未分类错误。
@@ -293,6 +345,9 @@ pub struct ProtocolError {
     /// serde 对 `Box<T>` 透明，JSON 形状不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injection: Option<Box<InjectionConsent>>,
+    /// `host_key_unknown` / `host_key_changed` 时的主机密钥信息。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<Box<SshHostKeyInfo>>,
 }
 
 /// 请求消息。
@@ -505,6 +560,13 @@ pub struct TerminalSnapshot {
     pub rows: u16,
     /// 当前事件缓冲基线游标。
     pub cursor: u64,
+    /// 是否具备结构化 shell 事件（prompt/命令生命周期）能力。
+    ///
+    /// 仅当终端真正建立了带外 shell 事件通道（本地 `termx-pwsh` 或远端
+    /// helper）时为 `true`；普通程序、普通 shell 与降级终端均为 `false`。
+    /// 旧服务端缺省为 `false`，客户端应隐藏信息页。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_events: bool,
     /// 后端能力；SSH fallback 时 `helper=false`、`bestEffort=true`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Capabilities>,
@@ -848,6 +910,9 @@ pub struct ListItem {
     pub name: String,
     /// 生命周期状态。
     pub state: LifecycleState,
+    /// 是否具备结构化 shell 事件能力；普通终端为 `false`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_events: bool,
     /// 创建模式。
     pub mode: Mode,
     /// 启动程序（`terminal.create` 的原始 `cmd`）。
@@ -938,6 +1003,42 @@ pub struct ReadResult {
     /// 需要重置本地视图的原因。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset: Option<ResetReason>,
+}
+
+/// `terminal.output` 参数：对当前保留的原始输出做尾部截取或倒搜。
+///
+/// 三组条件互斥：
+/// - `tail_lines` / `tail_chars`：返回最后 N 行 / N 个 Unicode 字符；
+/// - `pattern`（配合 `nth` / `only_matches`）：从末尾倒搜。
+///
+/// 不提供绝对行号或 `from_line` 语义；历史被背压裁剪后旧位置不保证可用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputParams {
+    /// 终端定位器。
+    #[serde(flatten)]
+    pub locator: TerminalLocator,
+    /// 最后 N 行。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_lines: Option<u32>,
+    /// 最后最多 N 个 Unicode 字符（按 UTF-8 字符边界）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_chars: Option<u64>,
+    /// 倒搜的字面量 pattern。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// 从末尾数第 N 个匹配（1 起）；缺省 1。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nth: Option<u32>,
+    /// 只返回匹配所在行。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_matches: bool,
+}
+
+/// `terminal.output` 结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputResult {
+    /// 截取/搜索结果原文；无匹配时为空串。
+    pub text: String,
 }
 
 /// 游标不可回放时的重置原因。
@@ -1203,10 +1304,12 @@ mod tests {
             (ErrorCode::HelperFailed, "helper_failed"),
             (ErrorCode::ProtocolError, "protocol_error"),
             (ErrorCode::ConsentRequired, "consent_required"),
+            (ErrorCode::HostKeyUnknown, "host_key_unknown"),
+            (ErrorCode::HostKeyChanged, "host_key_changed"),
             (ErrorCode::ServiceLost, "service_lost"),
             (ErrorCode::Internal, "internal"),
         ];
-        assert_eq!(cases.len(), 16, "ErrorCode 变体数量应为 16");
+        assert_eq!(cases.len(), 18, "ErrorCode 变体数量应为 18");
 
         for (code, expected) in cases {
             let json = serde_json::to_value(code).expect("错误码序列化失败");
@@ -1259,6 +1362,7 @@ mod tests {
                 retryable: false,
                 terminal_id: None,
                 injection: None,
+                host_key: None,
             }),
         };
         let err_json: JsonValue =
@@ -1305,6 +1409,8 @@ mod tests {
             ErrorCode::PtyFailed,
             ErrorCode::ProtocolError,
             ErrorCode::ConsentRequired,
+            ErrorCode::HostKeyUnknown,
+            ErrorCode::HostKeyChanged,
         ];
 
         for code in retryable {
@@ -1423,6 +1529,9 @@ mod tests {
             helper_sha256: Some("0123456789abcdef".to_string()),
             upload_helper: true,
             accept_any_host_key: true,
+            host_key_policy: None,
+            trusted_host_key: None,
+            known_hosts_path: None,
             injection: InjectionPlan::default(),
         };
 
@@ -1504,6 +1613,7 @@ mod tests {
             cols: 120,
             rows: 30,
             cursor: 42,
+            structured_events: false,
             capabilities: None,
             runtime_id: None,
         }
@@ -1604,6 +1714,7 @@ mod tests {
             retryable: false,
             terminal_id: None,
             injection: None,
+            host_key: None,
         };
         let error_json: JsonValue =
             serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
@@ -1625,6 +1736,7 @@ mod tests {
             retryable: false,
             terminal_id: Some("01JOLD".to_string()),
             injection: None,
+            host_key: None,
         };
         let json: JsonValue =
             serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");
@@ -1652,6 +1764,7 @@ mod tests {
                     sha256: Some("f".repeat(64)),
                 }],
             })),
+            host_key: None,
         };
         let json: JsonValue =
             serde_json::from_str(&to_json(&error).expect("序列化失败")).expect("JSON 解析失败");

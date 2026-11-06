@@ -190,6 +190,10 @@ async fn create_with_runtime_id_uses_manifest_bin_and_args() {
     assert_eq!(item.runtime_id.as_deref(), Some("termx-pwsh"));
     assert_eq!(std::path::PathBuf::from(&item.command), bin_path);
     assert_eq!(item.args, vec!["--no-profile".to_string()]);
+    assert!(
+        item.structured_events,
+        "本地 termx-pwsh 建立事件通道后应声明结构化能力"
+    );
 }
 
 /// 以 terminal_id 定位。

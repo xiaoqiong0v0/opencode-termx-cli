@@ -50,4 +50,32 @@ pub enum CoreError {
         /// 本次将写入的远端文件与主机信息。
         details: termx_protocol::injection::InjectionConsent,
     },
+    /// SSH 主机密钥未知；客户端确认指纹后可重试。
+    #[error(
+        "SSH 主机密钥未知（{host}:{port} {algorithm} {fingerprint}）",
+        host = .details.host,
+        port = .details.port,
+        algorithm = .details.algorithm,
+        fingerprint = .details.fingerprint
+    )]
+    HostKeyUnknown {
+        /// 主机与指纹信息。
+        details: termx_protocol::SshHostKeyInfo,
+    },
+    /// SSH 主机密钥变化；可能被中间人劫持，硬失败。
+    #[error(
+        "SSH 主机密钥已变化（{host}:{port}），可能遭遇中间人攻击",
+        host = .details.host,
+        port = .details.port
+    )]
+    HostKeyChanged {
+        /// 主机与新旧指纹信息。
+        details: termx_protocol::SshHostKeyInfo,
+    },
+    /// 主机密钥校验本身失败（证书/存储等）。
+    #[error("SSH 主机密钥校验失败: {message}")]
+    HostKeyRejected {
+        /// 可读原因。
+        message: String,
+    },
 }

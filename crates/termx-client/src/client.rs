@@ -21,11 +21,11 @@ use futures_util::{
 };
 use termx_protocol::{
     AttachParams, AttachResult, ClaimParams, ClaimResult, CreateParams, CreateResult, DetachParams,
-    ErrorCode, Event, HelloParams, HelloResult, ListItem, ListParams, PROTOCOL_VERSION,
-    ProtocolError, PruneParams, PruneResult, ReadParams, ReadResult, RebindParams, RebindResult,
-    ReleaseParams, Request, ResizeParams, Response, SendParams, SignalParams, SimpleResult,
-    StatusParams, StatusResult, SubscribeParams, SubscribeResult, TerminateParams,
-    TranscriptParams, TranscriptResult, UnsubscribeParams,
+    ErrorCode, Event, HelloParams, HelloResult, ListItem, ListParams, OutputParams, OutputResult,
+    PROTOCOL_VERSION, ProtocolError, PruneParams, PruneResult, ReadParams, ReadResult,
+    RebindParams, RebindResult, ReleaseParams, Request, ResizeParams, Response, SendParams,
+    SignalParams, SimpleResult, StatusParams, StatusResult, SubscribeParams, SubscribeResult,
+    TerminateParams, TranscriptParams, TranscriptResult, UnsubscribeParams,
 };
 use tokio::{
     net::TcpStream,
@@ -391,6 +391,8 @@ impl Client {
         status => "terminal.status", StatusParams, StatusResult;
         /// 增量读取 output（`terminal.read`）。
         read => "terminal.read", ReadParams, ReadResult;
+        /// 对保留的原始输出做尾部截取或倒搜（`terminal.output`）。
+        output => "terminal.output", OutputParams, OutputResult;
         /// 读取命令记录（`terminal.transcript`）。
         transcript => "terminal.transcript", TranscriptParams, TranscriptResult;
         /// 向终端写入（`terminal.send`）。
@@ -511,6 +513,7 @@ fn handle_text(inner: &Inner, text: &str) -> bool {
                 retryable: false,
                 terminal_id: None,
                 injection: None,
+                host_key: None,
             });
             inner.set_connection_error(error);
             return false;
@@ -651,6 +654,7 @@ fn protocol_error(code: ErrorCode, message: impl Into<String>) -> ClientError {
         retryable: false,
         terminal_id: None,
         injection: None,
+        host_key: None,
     })
 }
 

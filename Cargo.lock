@@ -2180,6 +2180,7 @@ dependencies = [
 name = "termx-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde_json",
  "termx-proc",
  "termx-protocol",
@@ -2284,6 +2285,7 @@ name = "termx-ssh"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "fs2",
  "russh",
  "serde_json",
  "sha2",

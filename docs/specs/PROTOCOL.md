@@ -75,14 +75,15 @@
 | `session_closed` | `{ root_session_id }` | `{ ok }` |
 | `session.list` | `{}` | `{ sessions: [{ root_session_id, live, last_seen_ms?, terminals }] }` |
 | `runtime.list` | `{}` | `{ runtimes: [{ id, name, version, platform, arch, available }] }`；只含当前平台兼容项，不含本机路径 |
-| `terminal.create` | `{ mode: "pty"\|"stdio", cmd?, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, accept_any_host_key? }, runtime_id?, allow_injection? }` | `{ terminal_id, cursor }` |
+| `terminal.create` | `{ mode: "pty"\|"stdio", cmd?, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, host_key_policy?, trusted_host_key? }, runtime_id?, allow_injection? }` | `{ terminal_id, cursor }` |
 | `terminal.claim` | `{ locator, force? }` | `{ owner, lease }` |
 | `terminal.release` | `{ locator }` | `{ ok }` |
 | `terminal.attach` | `{ locator, cursor? }` | `{ cursor, snapshot, reset? }` |
 | `terminal.detach` | `{ locator }` | `{ ok }` |
-| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, mode, runtime_id?, command, args, cwd?, pid?, idle_timeout?, last_activity?, created_at }]`；`limit` 取最近活动的前 N 条 |
-| `terminal.status` | `{ locator }` | `{ snapshot }` |
+| `terminal.list` | `{ states?, limit? }` | `[{ terminal_id, root_session_id, name, state, structured_events, mode, runtime_id?, command, args, cwd?, pid?, idle_timeout?, last_activity?, created_at }]`；`limit` 取最近活动的前 N 条 |
+| `terminal.status` | `{ locator }` | `{ snapshot }`；`snapshot.structured_events` 表示是否有带外 shell 事件能力 |
 | `terminal.read` | `{ locator, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
+| `terminal.output` | `{ locator, tail_lines? \| tail_chars? \| pattern?, nth?, only_matches? }` | `{ text }`；按命令输出文本做尾部截取或倒搜（结构化终端读 transcript，raw-only 先清洗），不返回行号 |
 | `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output, exit_code?, source?, best_effort?}], revision }` |
 | `terminal.send` | `{ locator, data(base64)?, text?, enter? }` | `{ ok }` |
 | `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
@@ -97,8 +98,8 @@
 - `pty` 必带 `cols/rows`（可默认）；`stdio` 忽略尺寸。
 - `runtime_id?`：从服务端 `<config_dir>/runtimes/index.json` 解析内置 runtime。此时 `cmd`/`args` 必须缺省或为空；服务端用 manifest 的 `bin`/`args` 覆盖，不解回退到请求里的自定义命令。未知 ID → `not_found`；平台不兼容、路径越界、文件缺失/不可执行 → `bad_request`。无 `runtime_id` 时保持旧 `cmd`/`args` 行为。P1 只读本地目录，不下载/不远程传输。
 - `ssh?`：存在时 `mode` 必须为 `pty`，由 SSH 后端建立远端会话；`cmd` 为空或 `"shell"` 时申请交互式 shell，否则把 `cmd + args` 按 POSIX 单引号规则拼成远端命令（helper 模式下直接作为 `spawn.cmd/args`，不经 shell 二次分词）。
-  - `auth`：`{ type:"password", password }` 或 `{ type:"key", path, passphrase? }`；`Debug` 输出遮蔽密码/口令，凭据不落日志。
-  - `accept_any_host_key` 缺省 `false`：要求 known_hosts 存在可信记录；缺失/不匹配以明确错误失败。仅测试或用户显式开启时置 `true`。
+  - `auth`：`{ type:"password", password }` 或 `{ type:"key", path, passphrase? }`；`path` 为空时由 service 在创建时依次探测本机 `~/.ssh/id_ed25519`、`~/.ssh/id_rsa`，显式路径优先，两者都不存在返回 `bad_request`。`Debug` 输出遮蔽密码/口令，凭据不落日志。
+  - `host_key_policy`：`ask`（缺省）/ `strict` / `accept_any`。`ask` 下未知主机返回 `host_key_unknown` 与指纹，客户端确认后以同一 host key 的 `trusted_host_key` 重试；`strict` 只接受 known_hosts 已存在的匹配项；`accept_any` 仅高级/测试，不写 known_hosts。密钥变化返回 `host_key_changed`，必须硬失败，不允许重试绕过。known_hosts 位于 service 配置目录。
   - helper 启用判定：`helper_path` 非空，或 `upload_helper=true`。路径只允许绝对路径或 `~/...`（`~` 为远端用户 home），拒绝空白/控制字符/`..`/相对路径。
     - `upload_helper` 缺省 `false`：`helper_path` 指向**远端已存在**的 helper；连接前只读预检目录/文件/可执行/`helper_sha256`，有效直接使用，缺失或不符合时回退 fallback，**不写任何文件**。
     - `upload_helper=true`：必须提供 `helper_local_path`；`helper_path` 可选，表示**持久安装目标**（缺省由服务端注入计划补齐）。写前先做同样的只读预检，已存在且摘要/可执行检查通过则直接复用，不触发授权。
@@ -148,6 +149,13 @@
   - `cursor` 早于缓冲下界（或所需输出已被背压淘汰）时返回 `reset` + 基线 `cursor`，客户端清空本地 output 视图后继续。
   - `max_bytes` 为本次累计 `data` **解码后**字节上限；`null`/缺省/`0` 取服务端默认。按 `seq` 升序累加，达到上限即在下一条前停止；**单条 output 解码后超过上限时仍返回该条并前进游标**，避免反复拿到空结果形成活锁。
   - `read` 是只读操作：不注册/修改订阅，也不推进任何消费状态，可重复调用。
+- `terminal.output`：对**命令输出文本**做尾部截取或倒搜，不返回行号；行指命令输出行，不是终端显示行。文本来源随终端能力切换：
+  - 结构化终端（`snapshot.structured_events=true`，带外 shell 事件）：只用 transcript 中按时间顺序拼接的清洗后命令输出（无 prompt/ANSI），命令块之间以换行分隔；没有 transcript 命令/输出时为空，**不退回 raw PTY**。
+  - raw-only 终端：拼接当前保留的 `output` 事件，剥离 ANSI/OSC 控制序列并处理 `\r` 重绘、CRLF 与退格；没有 shell 事件可用，**无法可靠剔除 prompt**（已知限制）。
+  - `tail_lines`：最后 N 行；历史不足时返回全部；末尾换行不额外算一行。
+  - `tail_chars`：最后最多 N 个 Unicode 字符；先拼接字节再按 UTF-8 解码，避免 chunk 边界切断多字节字符。
+  - `pattern` + `nth`：从末尾倒搜第 N 个字面量匹配（`nth=1` 为最后一个）；默认返回从该匹配到末尾，`only_matches=true` 只返回匹配所在行（不跨命令输出块）。无匹配返回空串。
+  - 三组条件互斥；历史被背压裁剪后只基于当前保留文本计算，旧位置不保证可用。
 - `attach` 不带 `cursor`：返回当前 `snapshot` + 当前基线 `cursor`（不补发历史 output，仅快照）。
 - `attach` 到终态终端：允许只读（返回 `snapshot` 与剩余 output）。
 - `subscribe` 的 `terminals` 与 `all` 同时给出时，结果按 `terminal_id` 去重；任一目标解析失败则整体失败，不注册任何订阅、不回放事件。
@@ -183,7 +191,7 @@
 - `capabilities` 的层级语义：
   - `hello.capabilities` 是**服务级**声明（当前 `helper:false`、`version` 为协议版本、`runtime_catalog:true`），只表示服务自身能力，不代表任何终端的 helper 状态；旧客户端缺省 `runtime_catalog:false`；
   - 终端级能力只通过 `attach`/`status` 的 `snapshot.capabilities` 或该终端的事件流暴露；客户端不得用 `hello.capabilities` 推断某个 SSH 终端是否启用 helper。
-  - 带外 shell 事件通道（本地 named pipe / 远端 helper）是 service 内部判定，不新增 `Capabilities` 字段；客户端仍只从 `terminal.transcript` 的 `source`/`exit_code` 观察结果。
+  - 带外 shell 事件通道（本地 named pipe / 远端 helper）是 service 内部判定，不新增 `Capabilities` 字段；该终端是否真正具备结构化事件由 `snapshot.structured_events` / `terminal.list[].structured_events` 暴露（旧服务端缺省 `false`）。Web 只在该字段为 `true` 时显示信息页，普通程序/shell 仅保留原始控制台。
 - `snapshot.foreground_pgrp` 以后端上报为准：helper 模式为会话根进程组（当前实现不随前台作业切换），fallback 无值（字段缺省）。
 - 所有事件共用每终端单调 `seq`；`output_dropped` 作为**新事件**分配自己的单调 `seq`（不复用被丢输出的 `seq`），使缺口可检测。
 - `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
@@ -257,6 +265,8 @@
 | `spawn_failed` | 进程创建失败 | false |
 | `pty_failed` | PTY/ConPTY 创建失败 | false |
 | `ssh_connect_failed` | SSH 连接失败 | true |
+| `host_key_unknown` | 未知主机密钥；`error.host_key` 带算法/指纹 | false（确认后重试） |
+| `host_key_changed` | 主机密钥与 known_hosts 不一致，疑似中间人 | false |
 | `helper_failed` | helper 握手/启动失败 | true |
 | `protocol_error` | 帧/状态机违例 | false |
 | `consent_required` | 远端注入需要用户授权；`error.injection` 描述将写入的文件 | false |

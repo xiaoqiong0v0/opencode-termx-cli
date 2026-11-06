@@ -91,18 +91,51 @@ pub struct ListArgs {
     pub limit: Option<u32>,
 }
 
-/// `read` 子命令参数。
+/// `read` 子命令参数：游标增量读取，或按尾部行/字符读取。
 #[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("read_target")
+        .required(true)
+        .multiple(false)
+        .args(["cursor", "tail_lines", "tail_chars"])
+))]
 pub struct ReadArgs {
     /// 终端定位参数。
     #[command(flatten)]
     pub locator: LocatorArgs,
-    /// 起始游标（必填）。
+    /// 起始游标；增量读取时必填。
     #[arg(long)]
-    pub cursor: u64,
-    /// 单次读取的解码后字节上限。
-    #[arg(long = "max-bytes")]
+    pub cursor: Option<u64>,
+    /// 只返回最后 N 行。
+    #[arg(long = "tail-lines", value_name = "N")]
+    pub tail_lines: Option<u32>,
+    /// 只返回最后最多 N 个 Unicode 字符（UTF-8 字符边界）。
+    #[arg(long = "tail-chars", value_name = "N")]
+    pub tail_chars: Option<u64>,
+    /// 单次读取的解码后字节上限（仅配合 `--cursor`）。
+    #[arg(
+        long = "max-bytes",
+        requires = "cursor",
+        conflicts_with_all = ["tail_lines", "tail_chars"]
+    )]
     pub max_bytes: Option<u64>,
+}
+
+/// `search` 子命令参数：从末尾倒搜命令输出文本。
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// 终端定位参数。
+    #[command(flatten)]
+    pub locator: LocatorArgs,
+    /// 要搜索的字面量。
+    #[arg(long, value_name = "PATTERN")]
+    pub pattern: String,
+    /// 从末尾数第 N 个匹配（1 起）。
+    #[arg(long, default_value_t = 1, value_parser = parse_positive_u32)]
+    pub nth: u32,
+    /// 只返回匹配所在行。
+    #[arg(long = "only-matches")]
+    pub only_matches: bool,
 }
 
 /// `send` 子命令参数：`--text` 与 `--data` 二选一。
@@ -222,8 +255,10 @@ pub enum Command {
     Status(LocatorArgs),
     /// 列出终端。
     List(ListArgs),
-    /// 增量读取 output。
+    /// 读取 output：按游标增量，或 `--tail-lines` / `--tail-chars`。
     Read(ReadArgs),
+    /// 从末尾倒搜命令输出文本。
+    Search(SearchArgs),
     /// 读取信息页命令记录（命令、起止时间、状态、清洗后输出）。
     Transcript(LocatorArgs),
     /// 向终端写入文本或字节。
@@ -323,6 +358,17 @@ fn parse_idle_action(input: &str) -> Result<IdleTimeoutAction, String> {
     }
 }
 
+/// 解析 `search --nth`：必须 >= 1。
+fn parse_positive_u32(input: &str) -> Result<u32, String> {
+    let value: u32 = input
+        .parse()
+        .map_err(|_| format!("nth 非法 {input:?}；必须是从 1 开始的整数"))?;
+    if value == 0 {
+        return Err("nth 必须从 1 开始".to_string());
+    }
+    Ok(value)
+}
+
 /// 解析 `prune --basis`。
 pub fn parse_prune_basis(input: &str) -> Result<PruneBasis, String> {
     match input {
@@ -394,5 +440,114 @@ mod tests {
             IdleTimeoutAction::Terminate
         );
         assert!(parse_idle_action("kill").is_err(), "未知动作应报错");
+    }
+
+    #[test]
+    fn read_accepts_tail_lines_or_chars_without_cursor() {
+        let cli =
+            Cli::try_parse_from(["termx-cli", "read", "--name", "build", "--tail-lines", "20"])
+                .expect("tail-lines 应可解析");
+        match cli.command {
+            Command::Read(args) => {
+                assert_eq!(args.tail_lines, Some(20));
+                assert_eq!(args.tail_chars, None);
+                assert_eq!(args.cursor, None);
+            }
+            other => panic!("期望 read，实际 {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "termx-cli",
+            "read",
+            "--name",
+            "build",
+            "--tail-chars",
+            "128",
+        ])
+        .expect("tail-chars 应可解析");
+        match cli.command {
+            Command::Read(args) => {
+                assert_eq!(args.tail_chars, Some(128));
+                assert_eq!(args.tail_lines, None);
+            }
+            other => panic!("期望 read，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_requires_one_range_mode_and_rejects_combinations() {
+        assert!(Cli::try_parse_from(["termx-cli", "read", "--name", "build"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "termx-cli",
+                "read",
+                "--name",
+                "build",
+                "--cursor",
+                "0",
+                "--tail-lines",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "termx-cli",
+                "read",
+                "--name",
+                "build",
+                "--tail-lines",
+                "1",
+                "--max-bytes",
+                "10",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn search_parses_nth_and_only_matches() {
+        let cli = Cli::try_parse_from([
+            "termx-cli",
+            "search",
+            "--name",
+            "build",
+            "--pattern",
+            "error",
+            "--nth",
+            "2",
+            "--only-matches",
+        ])
+        .expect("search 应可解析");
+        match cli.command {
+            Command::Search(args) => {
+                assert_eq!(args.pattern, "error");
+                assert_eq!(args.nth, 2);
+                assert!(args.only_matches);
+            }
+            other => panic!("期望 search，实际 {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "termx-cli",
+                "search",
+                "--name",
+                "build",
+                "--pattern",
+                "error",
+                "--nth",
+                "0",
+            ])
+            .is_err(),
+            "nth=0 应被拒绝"
+        );
+    }
+
+    #[test]
+    fn parse_positive_u32_rejects_zero_and_text() {
+        assert_eq!(parse_positive_u32("1").expect("1"), 1);
+        assert!(parse_positive_u32("0").is_err());
+        assert!(parse_positive_u32("x").is_err());
     }
 }

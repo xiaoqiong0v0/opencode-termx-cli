@@ -95,6 +95,9 @@ fn test_config() -> Option<SshConfig> {
         upload_helper: false,
         // 测试容器使用临时主机密钥，显式接受。
         accept_any_host_key: true,
+        host_key_policy: None,
+        trusted_host_key: None,
+        known_hosts_path: None,
         injection: InjectionPlan::default(),
     })
 }

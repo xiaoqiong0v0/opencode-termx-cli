@@ -235,6 +235,7 @@ impl TerminalEntry {
             cols: self.cols,
             rows: self.rows,
             cursor: self.seq,
+            structured_events: self.shell_events,
             capabilities: self.capabilities.clone(),
         }
     }

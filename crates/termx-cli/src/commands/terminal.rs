@@ -3,15 +3,15 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use termx_client::Client;
 use termx_protocol::{
-    AttachParams, ClaimParams, ClaimResult, DetachParams, ListParams, PruneParams, ReadParams,
-    ReleaseParams, ResizeParams, SendParams, SignalParams, SimpleResult, StatusParams,
-    TerminalLocator, TerminateParams, TranscriptParams,
+    AttachParams, ClaimParams, ClaimResult, DetachParams, ListParams, OutputParams, OutputResult,
+    PruneParams, ReadParams, ReleaseParams, ResizeParams, SendParams, SignalParams, SimpleResult,
+    StatusParams, TerminalLocator, TerminateParams, TranscriptParams,
 };
 
 use crate::{
     cli::{
         AttachArgs, Cli, DetachArgs, ListArgs, LocatorArgs, PruneArgs, ReadArgs, ResizeArgs,
-        SendArgs, SignalArgs, TerminateArgs, parse_prune_basis,
+        SearchArgs, SendArgs, SignalArgs, TerminateArgs, parse_prune_basis,
     },
     commands::{connect, locator},
     error::CliError,
@@ -51,14 +51,34 @@ pub async fn list(cli: &Cli, args: &ListArgs) -> Result<i32, CliError> {
     Ok(0)
 }
 
-/// `read`：按游标只读回放 output。
+/// `read`：按游标增量回放，或按尾部行/字符读取命令输出文本。
 pub async fn read(cli: &Cli, args: &ReadArgs) -> Result<i32, CliError> {
     let locator = locator(cli, args.locator.terminal_id.as_deref())?;
     let client = connect(cli).await?;
+
+    if args.tail_lines.is_some() || args.tail_chars.is_some() {
+        let result = client
+            .output(OutputParams {
+                locator,
+                tail_lines: args.tail_lines,
+                tail_chars: args.tail_chars,
+                pattern: None,
+                nth: None,
+                only_matches: false,
+            })
+            .await?;
+        print_output(&result, cli.json)?;
+        client.close().await;
+        return Ok(0);
+    }
+
+    let cursor = args
+        .cursor
+        .ok_or_else(|| CliError::Usage("read 需要 --cursor 或 --tail-lines/--tail-chars".into()))?;
     let result = client
         .read(ReadParams {
             locator,
-            cursor: args.cursor,
+            cursor,
             max_bytes: args.max_bytes,
         })
         .await?;
@@ -78,6 +98,34 @@ pub async fn read(cli: &Cli, args: &ReadArgs) -> Result<i32, CliError> {
     }
     client.close().await;
     Ok(0)
+}
+
+/// `search`：从末尾倒搜命令输出文本；`--nth 1` 为最后一个匹配。
+pub async fn search(cli: &Cli, args: &SearchArgs) -> Result<i32, CliError> {
+    let locator = locator(cli, args.locator.terminal_id.as_deref())?;
+    let client = connect(cli).await?;
+    let result = client
+        .output(OutputParams {
+            locator,
+            tail_lines: None,
+            tail_chars: None,
+            pattern: Some(args.pattern.clone()),
+            nth: Some(args.nth),
+            only_matches: args.only_matches,
+        })
+        .await?;
+    print_output(&result, cli.json)?;
+    client.close().await;
+    Ok(0)
+}
+
+/// 输出 `terminal.output` 文本：JSON 模式打印结构，否则原样写 stdout。
+fn print_output(result: &OutputResult, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(result)
+    } else {
+        write_stdout(result.text.as_bytes())
+    }
 }
 
 /// `transcript`：读取信息页命令记录（命令 + 起止时间 + 状态 + 清洗后输出）。

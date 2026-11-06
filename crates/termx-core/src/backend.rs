@@ -367,6 +367,37 @@ fn map_ssh_error(error: SshError) -> CoreError {
         SshError::InjectionFailed { path, message } => {
             CoreError::BadRequest(format!("远端 helper 注入失败（{path}）: {message}"))
         }
+        // 主机密钥确认/变化必须保留专用错误码，客户端才能提示或硬失败。
+        SshError::HostKeyUnknown {
+            host,
+            port,
+            algorithm,
+            fingerprint,
+        } => CoreError::HostKeyUnknown {
+            details: termx_protocol::SshHostKeyInfo {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+                recorded_fingerprint: None,
+            },
+        },
+        SshError::HostKeyChanged {
+            host,
+            port,
+            algorithm,
+            fingerprint,
+            recorded_fingerprint,
+        } => CoreError::HostKeyChanged {
+            details: termx_protocol::SshHostKeyInfo {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+                recorded_fingerprint: Some(recorded_fingerprint),
+            },
+        },
+        SshError::HostKeyRejected { message } => CoreError::HostKeyRejected { message },
         other => CoreError::BackendFailed(other.to_string()),
     }
 }
@@ -412,6 +443,37 @@ impl BackendFactory for SshFactory {
                 SshError::InjectionFailed { path, message } => {
                     CoreError::BadRequest(format!("远端 helper 注入失败（{path}）: {message}"))
                 }
+                // 首次信任/密钥变化保留专用错误码，避免被折叠成 spawn_failed。
+                SshError::HostKeyUnknown {
+                    host,
+                    port,
+                    algorithm,
+                    fingerprint,
+                } => CoreError::HostKeyUnknown {
+                    details: termx_protocol::SshHostKeyInfo {
+                        host,
+                        port,
+                        algorithm,
+                        fingerprint,
+                        recorded_fingerprint: None,
+                    },
+                },
+                SshError::HostKeyChanged {
+                    host,
+                    port,
+                    algorithm,
+                    fingerprint,
+                    recorded_fingerprint,
+                } => CoreError::HostKeyChanged {
+                    details: termx_protocol::SshHostKeyInfo {
+                        host,
+                        port,
+                        algorithm,
+                        fingerprint,
+                        recorded_fingerprint: Some(recorded_fingerprint),
+                    },
+                },
+                SshError::HostKeyRejected { message } => CoreError::HostKeyRejected { message },
                 other => CoreError::SpawnFailed {
                     message: other.to_string(),
                 },

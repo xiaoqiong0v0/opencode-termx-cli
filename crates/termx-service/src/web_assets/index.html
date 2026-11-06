@@ -119,6 +119,10 @@
               autocomplete="off"
               spellcheck="false"
             />
+            <p class="termx-dialog-hint">
+              自定义程序不接入 shell 事件：只显示原始控制台，不生成信息页/transcript；模型可用
+              read --tail-lines/--tail-chars/search 获取输出。普通 ssh 也在此以自定义程序运行（raw-only）。
+            </p>
           </div>
           <label class="termx-field" for="termx-create-cwd">工作目录（可选）</label>
           <input
@@ -160,8 +164,9 @@
             />
           </div>
           <div id="termx-create-key-group" class="termx-form-hidden">
-            <label class="termx-field" for="termx-create-key-path">私钥路径</label>
+            <label class="termx-field" for="termx-create-key-path">私钥路径（可留空）</label>
             <input id="termx-create-key-path" class="termx-input" type="text" autocomplete="off" spellcheck="false" />
+            <p class="termx-dialog-hint">留空自动尝试 ~/.ssh/id_ed25519 / ~/.ssh/id_rsa</p>
             <label class="termx-field" for="termx-create-key-passphrase">私钥口令（可选）</label>
             <input
               id="termx-create-key-passphrase"
@@ -170,15 +175,20 @@
               autocomplete="new-password"
             />
           </div>
-          <label class="termx-field" for="termx-create-ssh-runtime">运行环境</label>
-          <select id="termx-create-ssh-runtime" class="termx-select">
-            <option value="termx-pwsh">termx-pwsh（带外事件）</option>
-            <option value="">系统 shell</option>
-          </select>
-          <label class="termx-check">
-            <input id="termx-create-any-host-key" type="checkbox" />
-            接受任意主机密钥（accept-any-host-key）
-          </label>
+          <p class="termx-dialog-hint">SSH 固定使用 termx-pwsh（结构化事件）。</p>
+          <p class="termx-dialog-hint">
+            默认 Ask：首次连接会要求确认主机密钥指纹；已记录主机必须匹配，密钥变化会直接失败。
+          </p>
+          <details class="termx-advanced">
+            <summary>高级 / 不安全选项</summary>
+            <label class="termx-check">
+              <input id="termx-create-any-host-key" type="checkbox" />
+              接受任意主机密钥（accept-any-host-key）
+            </label>
+            <p class="termx-dialog-hint termx-danger-hint">
+              仅用于测试或已确认的受控环境：跳过 known_hosts 校验，且不会写入 known_hosts，存在中间人风险。
+            </p>
+          </details>
         </div>
 
         <div class="termx-form-grid">
@@ -218,6 +228,23 @@
           <button id="termx-consent-cancel" class="termx-button" type="button">取消</button>
           <button id="termx-consent-confirm" class="termx-button termx-primary" type="submit">
             允许并创建
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="termx-host-key-dialog" class="termx-dialog" aria-labelledby="termx-host-key-title">
+      <form id="termx-host-key-form" class="termx-dialog-form">
+        <h2 id="termx-host-key-title" class="termx-dialog-title">确认主机密钥</h2>
+        <p id="termx-host-key-host" class="termx-dialog-hint"></p>
+        <p class="termx-dialog-hint">
+          首次连接该主机。请与管理员核对下面的 SHA256 指纹；确认后会写入服务端 known_hosts。
+        </p>
+        <p id="termx-host-key-fingerprint" class="termx-host-key-fingerprint"></p>
+        <p id="termx-host-key-error" class="termx-dialog-error" role="alert" hidden></p>
+        <div class="termx-dialog-actions">
+          <button id="termx-host-key-cancel" class="termx-button" type="button">取消</button>
+          <button id="termx-host-key-confirm" class="termx-button termx-primary" type="submit">
+            信任并创建
           </button>
         </div>
       </form>

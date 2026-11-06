@@ -75,14 +75,17 @@
   var rebindBusy = false;
   // 新建请求在飞时禁用弹窗提交/取消。
   var createBusy = false;
-  // 用户是否手动改过「接受任意主机密钥」；否则按主机地址自动给默认值。
-  var anyHostKeyTouched = false;
+  // 未知主机密钥待确认：{ params, info, retried }；关闭新建弹窗即丢弃。
+  var pendingHostKey = null;
+  var hostKeyBusy = false;
   // 远端注入授权只保存在内存：{ params, injection, retried }；关闭新建弹窗即丢弃。
   var pendingConsent = null;
   // 授权重试在飞时禁用确认/取消，避免重复提交。
   var consentBusy = false;
-  // 当前视图：默认信息页；raw 保持现有 xterm。
-  var viewMode = "info";
+  // 当前视图：默认原始控制台；结构化终端选中后切到信息页。
+  var viewMode = "raw";
+  // 当前终端是否具备结构化 shell 事件能力；false 时信息页隐藏/禁用。
+  var structuredSupported = false;
   // 最近一次渲染的 transcript 修订号；null 表示尚未渲染。
   var transcriptRevision = null;
   var transcriptTimer = null;
@@ -122,7 +125,6 @@
     elements.createKeyGroup = document.getElementById("termx-create-key-group");
     elements.createKeyPath = document.getElementById("termx-create-key-path");
     elements.createKeyPassphrase = document.getElementById("termx-create-key-passphrase");
-    elements.createSshRuntime = document.getElementById("termx-create-ssh-runtime");
     elements.createAnyHostKey = document.getElementById("termx-create-any-host-key");
     elements.createCols = document.getElementById("termx-create-cols");
     elements.createRows = document.getElementById("termx-create-rows");
@@ -137,6 +139,13 @@
     elements.consentError = document.getElementById("termx-consent-error");
     elements.consentConfirm = document.getElementById("termx-consent-confirm");
     elements.consentCancel = document.getElementById("termx-consent-cancel");
+    elements.hostKeyDialog = document.getElementById("termx-host-key-dialog");
+    elements.hostKeyForm = document.getElementById("termx-host-key-form");
+    elements.hostKeyHost = document.getElementById("termx-host-key-host");
+    elements.hostKeyFingerprint = document.getElementById("termx-host-key-fingerprint");
+    elements.hostKeyError = document.getElementById("termx-host-key-error");
+    elements.hostKeyConfirm = document.getElementById("termx-host-key-confirm");
+    elements.hostKeyCancel = document.getElementById("termx-host-key-cancel");
     elements.infoMeta = document.getElementById("termx-info-meta");
     elements.terminate = document.getElementById("termx-terminate");
     elements.rebindOpen = document.getElementById("termx-rebind-open");
@@ -172,7 +181,8 @@
     createTerminal();
     bindControls();
     observeResize();
-    setView("info");
+    syncStructuredCapability(null);
+    setView("raw");
     updateControls();
     connect();
   }
@@ -229,15 +239,6 @@
     if (elements.createAuth) {
       elements.createAuth.addEventListener("change", updateCreateAuth);
     }
-    if (elements.createHost) {
-      elements.createHost.addEventListener("input", updateCreateHostKey);
-    }
-    if (elements.createAnyHostKey) {
-      // 一旦用户手动改过，就不再按主机地址覆盖。
-      elements.createAnyHostKey.addEventListener("change", function () {
-        anyHostKeyTouched = true;
-      });
-    }
     if (elements.createDialog) {
       // 原生 Esc 关闭不经过 cancel 按钮：清掉只在内存中的密码/口令与待确认授权。
       elements.createDialog.addEventListener("close", onCreateDialogClosed);
@@ -256,6 +257,20 @@
         }
       });
       elements.consentDialog.addEventListener("close", onConsentDialogClosed);
+    }
+    if (elements.hostKeyForm) {
+      elements.hostKeyForm.addEventListener("submit", confirmHostKey);
+    }
+    if (elements.hostKeyCancel) {
+      elements.hostKeyCancel.addEventListener("click", cancelHostKeyDialog);
+    }
+    if (elements.hostKeyDialog) {
+      elements.hostKeyDialog.addEventListener("cancel", function (event) {
+        if (hostKeyBusy) {
+          event.preventDefault();
+        }
+      });
+      elements.hostKeyDialog.addEventListener("close", onHostKeyDialogClosed);
     }
     if (elements.rebindOpen) {
       elements.rebindOpen.addEventListener("click", openRebindDialog);
@@ -435,6 +450,8 @@
     result.terminalId = error && error.terminal_id;
     // consent_required 会携带本次将写入的远端文件，供确认弹窗展示。
     result.injection = error && error.injection;
+    // host_key_unknown / host_key_changed 会携带主机密钥信息。
+    result.hostKey = error && error.host_key;
     return result;
   }
 
@@ -595,11 +612,14 @@
           stopTranscriptPolling();
           resetTranscriptView();
           closeRebindDialog();
+          syncStructuredCapability(null);
           renderInfoMeta(null);
           setInfoNotice("终端已不存在");
           setStatus("终端已不存在");
         } else {
-          renderInfoMeta(findTerminal(currentTerminalId));
+          var current = findTerminal(currentTerminalId);
+          syncStructuredCapability(current);
+          renderInfoMeta(current);
         }
         updateControls();
         return items;
@@ -876,7 +896,11 @@
       renderSessionList();
       renderTerminalList(lastTerminals);
     }
+    syncStructuredCapability(selectedItem);
     renderInfoMeta(selectedItem);
+    if (!reconnect) {
+      setView(supportsStructured(selectedItem) ? "info" : "raw");
+    }
     claimed = false;
     claimInFlight = null;
     lastSize = null;
@@ -1550,18 +1574,14 @@
     setInputValue(elements.createPassword, "");
     setInputValue(elements.createKeyPath, "");
     setInputValue(elements.createKeyPassphrase, "");
-    if (elements.createSshRuntime) {
-      elements.createSshRuntime.value = "termx-pwsh";
-    }
-    anyHostKeyTouched = false;
     if (elements.createAnyHostKey) {
+      // 默认 Ask；AcceptAny 只能由用户在“高级 / 不安全选项”里显式勾选。
       elements.createAnyHostKey.checked = false;
     }
     setInputValue(elements.createCols, String(DEFAULT_COLS));
     setInputValue(elements.createRows, String(DEFAULT_ROWS));
     updateCreateType();
     updateCreateAuth();
-    updateCreateHostKey();
     updateCreateSubmit();
   }
 
@@ -1682,6 +1702,8 @@
     clearCreateSecrets();
     clearConsentState();
     closeConsentDialog();
+    clearHostKeyState();
+    closeHostKeyDialog();
   }
 
   /** 关闭新建弹窗并清空密码/口令与待确认授权。 */
@@ -1690,6 +1712,8 @@
     clearCreateSecrets();
     clearConsentState();
     closeConsentDialog();
+    clearHostKeyState();
+    closeHostKeyDialog();
     if (!dialog) {
       return;
     }
@@ -1733,27 +1757,6 @@
     if (elements.createKeyGroup) {
       elements.createKeyGroup.classList.toggle("termx-form-hidden", !key);
     }
-  }
-
-  /** 本机回环主机：默认勾选「接受任意主机密钥」。 */
-  function isLoopbackHost(host) {
-    var value = String(host || "").trim().toLowerCase();
-    // IPv6 可能带方括号（[::1]）或端口；这里只做表单默认值判断。
-    if (value.charAt(0) === "[") {
-      var end = value.indexOf("]");
-      value = end > 0 ? value.slice(1, end) : value.slice(1);
-    }
-    return value === "127.0.0.1" || value === "localhost" || value === "::1";
-  }
-
-  /** 主机变化时更新「接受任意主机密钥」默认值；用户手动改过则不覆盖。 */
-  function updateCreateHostKey() {
-    if (!elements.createAnyHostKey || anyHostKeyTouched) {
-      return;
-    }
-    elements.createAnyHostKey.checked = isLoopbackHost(
-      elements.createHost ? elements.createHost.value : ""
-    );
   }
 
   /** 按连接状态启用/禁用新建提交。 */
@@ -1820,6 +1823,17 @@
           showInjectionConsent(params, error.injection);
           return;
         }
+        if (isHostKeyUnknown(error)) {
+          showHostKeyPrompt(params, error.hostKey);
+          return;
+        }
+        if (isHostKeyChanged(error)) {
+          showCreateError(
+            "创建失败：" + describeError(error) + "；主机密钥与已记录不一致，已拒绝连接。请先核对服务器，再清理服务端 known_hosts 中对应记录。"
+          );
+          setStatus("主机密钥变化，已拒绝连接");
+          return;
+        }
         var detail = describeError(error);
         showCreateError("创建失败：" + detail);
         setStatus("创建失败：" + detail);
@@ -1851,6 +1865,193 @@
   /** 是否为远端注入授权错误。 */
   function isConsentRequired(error) {
     return !!error && error.code === "consent_required";
+  }
+
+  /** 是否为未知主机密钥错误。 */
+  function isHostKeyUnknown(error) {
+    return !!error && error.code === "host_key_unknown";
+  }
+
+  /** 是否为主机密钥变化错误；该错误不允许一键信任。 */
+  function isHostKeyChanged(error) {
+    return !!error && error.code === "host_key_changed";
+  }
+
+  /** 保存本次创建参数并展开主机密钥确认弹窗；新建弹窗保持打开。 */
+  function showHostKeyPrompt(params, info) {
+    if (!isCreateDialogOpen()) {
+      return;
+    }
+    if (!info || !info.fingerprint) {
+      showCreateError("服务端报告未知主机密钥，但未返回指纹");
+      setStatus("主机密钥未知，但缺少指纹");
+      return;
+    }
+    pendingHostKey = { params: params, info: info, retried: false };
+    hostKeyBusy = false;
+    renderHostKey(info);
+    showHostKeyDialog();
+    setStatus("首次连接，请确认主机密钥指纹");
+  }
+
+  /** 渲染 target 与 SHA256 指纹。 */
+  function renderHostKey(info) {
+    var target = (info.host || "-") + ":" + (info.port || "");
+    if (elements.hostKeyHost) {
+      elements.hostKeyHost.textContent = "目标主机：" + target;
+    }
+    if (elements.hostKeyFingerprint) {
+      elements.hostKeyFingerprint.textContent =
+        (info.algorithm ? info.algorithm + " " : "") + info.fingerprint;
+    }
+    hideHostKeyError();
+    updateHostKeyButtons();
+  }
+
+  /** 展开/关闭主机密钥确认弹窗。 */
+  function showHostKeyDialog() {
+    var dialog = elements.hostKeyDialog;
+    if (!dialog) {
+      return;
+    }
+    if (typeof dialog.showModal === "function") {
+      if (!dialog.open) {
+        dialog.showModal();
+      }
+    } else {
+      dialog.setAttribute("open", "");
+    }
+  }
+
+  function closeHostKeyDialog() {
+    var dialog = elements.hostKeyDialog;
+    if (!dialog) {
+      return;
+    }
+    if (typeof dialog.close === "function") {
+      if (dialog.open) {
+        dialog.close();
+      }
+    } else {
+      dialog.removeAttribute("open");
+    }
+  }
+
+  function clearHostKeyState() {
+    pendingHostKey = null;
+    hostKeyBusy = false;
+    updateHostKeyButtons();
+  }
+
+  function showHostKeyError(message) {
+    if (!elements.hostKeyError) {
+      return;
+    }
+    elements.hostKeyError.textContent = message;
+    elements.hostKeyError.hidden = false;
+  }
+
+  function hideHostKeyError() {
+    if (!elements.hostKeyError) {
+      return;
+    }
+    elements.hostKeyError.textContent = "";
+    elements.hostKeyError.hidden = true;
+  }
+
+  function updateHostKeyButtons() {
+    if (elements.hostKeyConfirm) {
+      elements.hostKeyConfirm.disabled =
+        hostKeyBusy || !pendingHostKey || pendingHostKey.retried;
+    }
+    if (elements.hostKeyCancel) {
+      elements.hostKeyCancel.disabled = hostKeyBusy;
+    }
+  }
+
+  /** 取消首次信任：不写 known_hosts，也不继续创建。 */
+  function cancelHostKeyDialog() {
+    if (hostKeyBusy) {
+      return;
+    }
+    var hadPending = !!pendingHostKey;
+    clearHostKeyState();
+    closeHostKeyDialog();
+    if (hadPending) {
+      setStatus("已取消，未信任主机密钥");
+    }
+  }
+
+  function onHostKeyDialogClosed() {
+    if (!pendingHostKey) {
+      return;
+    }
+    clearHostKeyState();
+    setStatus("已取消，未信任主机密钥");
+  }
+
+  /** 浅复制创建参数，并复制 ssh 对象以便附加一次性信任指纹。 */
+  function copyParamsForHostKey(params) {
+    var copy = copyParams(params);
+    var ssh = params && params.ssh;
+    if (ssh) {
+      copy.ssh = {};
+      for (var key in ssh) {
+        if (Object.prototype.hasOwnProperty.call(ssh, key)) {
+          copy.ssh[key] = ssh[key];
+        }
+      }
+    }
+    return copy;
+  }
+
+  /** 确认指纹：仅对本次请求附加 `trusted_host_key`，最多重试一次。 */
+  function confirmHostKey(event) {
+    if (event) {
+      event.preventDefault();
+    }
+    var current = pendingHostKey;
+    if (!current || !connected) {
+      showHostKeyError("连接已断开，无法确认");
+      return;
+    }
+    if (current.retried) {
+      showHostKeyError("已重试过一次，请取消后重新创建");
+      return;
+    }
+    current.retried = true;
+    hostKeyBusy = true;
+    hideHostKeyError();
+    updateHostKeyButtons();
+    setStatus("已确认主机密钥，正在连接…");
+    var retryParams = copyParamsForHostKey(current.params);
+    retryParams.ssh.trusted_host_key = current.info.fingerprint;
+    retryParams.ssh.host_key_policy = "ask";
+    retryParams.ssh.accept_any_host_key = false;
+    rpc("terminal.create", retryParams, createRequestTimeout(retryParams)).then(
+      function (result) {
+        hostKeyBusy = false;
+        if (pendingHostKey !== current) {
+          return;
+        }
+        clearHostKeyState();
+        closeHostKeyDialog();
+        finishCreate(result);
+      },
+      function (error) {
+        hostKeyBusy = false;
+        if (pendingHostKey !== current) {
+          return;
+        }
+        var detail = describeError(error);
+        if (isHostKeyChanged(error)) {
+          showHostKeyError("主机密钥与记录不一致，已拒绝：" + detail);
+        } else {
+          showHostKeyError("创建失败：" + detail);
+        }
+        setStatus("创建失败：" + detail);
+      }
+    );
   }
 
   /** 保存本次创建参数并展开确认弹窗；新建弹窗保持打开。 */
@@ -2147,11 +2348,8 @@
         throw new Error("SSH 用户不能为空");
       }
       var port = parseInteger(elements.createPort, 1, 65535, "端口");
-      // 运行环境只有 termx-pwsh / 系统 shell；系统 shell 传空串。
-      params.cmd =
-        elements.createSshRuntime && elements.createSshRuntime.value === "termx-pwsh"
-          ? "termx-pwsh"
-          : "";
+      // SSH 表单固定使用 termx-pwsh（结构化事件）；普通 ssh 走本地自定义程序（raw-only）。
+      params.cmd = "termx-pwsh";
       params.args = [];
       params.ssh = buildSshConfig(host, port, user);
       return params;
@@ -2187,10 +2385,8 @@
     var authMode = elements.createAuth && elements.createAuth.value === "key" ? "key" : "password";
     var auth;
     if (authMode === "key") {
+      // 留空交给 service 依次探测 ~/.ssh/id_ed25519、~/.ssh/id_rsa。
       var path = (elements.createKeyPath && elements.createKeyPath.value || "").trim();
-      if (!path) {
-        throw new Error("私钥路径不能为空");
-      }
       auth = { type: "key", path: path };
       var passphrase = elements.createKeyPassphrase && elements.createKeyPassphrase.value;
       if (passphrase) {
@@ -2205,12 +2401,15 @@
     }
 
     // helper 路径/上传/摘要全部由 service 按注入配置自动处理，表单不再传递。
+    var acceptAny = !!(elements.createAnyHostKey && elements.createAnyHostKey.checked);
     return {
       host: host,
       port: port,
       user: user,
       auth: auth,
-      accept_any_host_key: !!(elements.createAnyHostKey && elements.createAnyHostKey.checked)
+      // 默认 Ask；勾选高级选项才使用 AcceptAny（不写 known_hosts）。
+      host_key_policy: acceptAny ? "accept_any" : "ask",
+      accept_any_host_key: acceptAny
     };
   }
 
@@ -2391,6 +2590,7 @@
           return;
         }
         if (result && result.snapshot) {
+          syncStructuredCapability(result.snapshot);
           renderInfoMeta(result.snapshot);
         }
       },
@@ -2479,8 +2679,33 @@
     return isFinite(parsed) ? parsed : 0;
   }
 
+  /** 终端是否具备结构化 shell 事件能力（缺省视为无）。 */
+  function supportsStructured(item) {
+    return !!(item && item.structured_events === true);
+  }
+
+  /**
+   * 按当前终端能力同步信息页入口。
+   *
+   * 无结构化事件能力时隐藏并禁用信息页；若当前停在信息页则立即退回 raw。
+   */
+  function syncStructuredCapability(item) {
+    structuredSupported = supportsStructured(item);
+    if (elements.tabInfo) {
+      elements.tabInfo.hidden = !structuredSupported;
+      elements.tabInfo.disabled = !structuredSupported;
+      elements.tabInfo.classList.toggle("termx-tab-disabled", !structuredSupported);
+    }
+    if (!structuredSupported && viewMode === "info") {
+      setView("raw");
+    }
+  }
+
   /** 切换信息页/原始控制台；只切可见性，不销毁 xterm。 */
   function setView(mode) {
+    if (mode === "info" && !structuredSupported) {
+      mode = "raw";
+    }
     viewMode = mode === "raw" ? "raw" : "info";
     var info = viewMode === "info";
     setTabState(elements.tabInfo, info);
@@ -2919,10 +3144,12 @@
       elements.rebindOpen.disabled = !connected || !currentTerminalId;
     }
     if (elements.infoInput) {
-      elements.infoInput.disabled = !connected || !currentTerminalId || terminalEnded;
+      elements.infoInput.disabled =
+        !connected || !currentTerminalId || terminalEnded || !structuredSupported;
     }
     if (elements.infoSend) {
-      elements.infoSend.disabled = !connected || !currentTerminalId || terminalEnded;
+      elements.infoSend.disabled =
+        !connected || !currentTerminalId || terminalEnded || !structuredSupported;
     }
     if (!connected) {
       closeCreateDialog();

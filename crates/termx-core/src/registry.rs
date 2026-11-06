@@ -16,12 +16,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use termx_protocol::{
     AttachResult, ClaimResult, Confidence, CreateParams, CreateResult, Event, EventKind,
     IdleTimeout, IdleTimeoutAction, IdleTimeoutUnit, InteractionState, LifecycleState, ListItem,
-    ListParams, Mode, ProcNode, PruneBasis, PruneParams, PruneResult, ReadChunk, ReadResult,
-    RebindResult, ResetReason, SubscriptionCursor, TerminalLocator, TerminalSnapshot, TimeSpan,
-    TranscriptResult, TranscriptSource, TranscriptStatus, WEB_ROOT_SESSION_ID,
+    ListParams, Mode, OutputParams, OutputResult, ProcNode, PruneBasis, PruneParams, PruneResult,
+    ReadChunk, ReadResult, RebindResult, ResetReason, SubscriptionCursor, TerminalLocator,
+    TerminalSnapshot, TimeSpan, TranscriptResult, TranscriptSource, TranscriptStatus,
+    WEB_ROOT_SESSION_ID,
 };
 use time::OffsetDateTime;
 use tokio::sync::{
@@ -563,6 +565,7 @@ impl Registry {
                 runtime_id: entry.runtime_id.clone(),
                 name: entry.name.clone(),
                 state: entry.state,
+                structured_events: entry.shell_events,
                 mode: entry.mode,
                 command: entry.command.clone(),
                 args: entry.args.clone(),
@@ -782,6 +785,57 @@ impl Registry {
         let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
         Ok(entry.transcript.read(limit))
     }
+
+    /// 对**命令输出文本**做尾部截取或倒搜。
+    ///
+    /// 文本来源随终端能力切换，但行/字符/倒搜语义一致（都基于清洗后的
+    /// 命令输出，不返回行号）：
+    /// - 结构化终端（带外 shell 事件）：只用 transcript 中按时间顺序拼接的
+    ///   命令输出，无 transcript 时为空；不退回 raw PTY，避免 prompt/控制串污染；
+    /// - raw-only 终端：拼接事件环里的 `output`，剥离 ANSI/OSC 并处理 CR 重绘
+    ///   与 CRLF；无 shell 事件可用，无法可靠剔除 prompt（已知限制）。
+    ///
+    /// 历史被背压裁剪后只返回当前仍保留的文本，不提供绝对行号。
+    pub fn output_text(
+        &self,
+        locator: &TerminalLocator,
+        params: &OutputParams,
+    ) -> Result<OutputResult, CoreError> {
+        let id = self.resolve(locator)?;
+        let entry = self.by_id.get(&id).ok_or(CoreError::NotFound)?;
+        let text = command_output_text(entry);
+        let result = match (&params.pattern, params.tail_lines, params.tail_chars) {
+            (Some(pattern), None, None) => {
+                if pattern.is_empty() {
+                    return Err(CoreError::BadRequest("搜索 pattern 不能为空".to_string()));
+                }
+                let nth = usize::try_from(params.nth.unwrap_or(1))
+                    .map_err(|_| CoreError::BadRequest("nth 超出范围".to_string()))?;
+                if nth == 0 {
+                    return Err(CoreError::BadRequest("nth 必须从 1 开始".to_string()));
+                }
+                crate::search(&text, pattern, nth, params.only_matches)
+            }
+            (None, Some(lines), None) => crate::tail_lines(&text, lines as usize),
+            (None, None, Some(chars)) => {
+                let chars = usize::try_from(chars)
+                    .map_err(|_| CoreError::BadRequest("tail-chars 超出范围".to_string()))?;
+                crate::tail_chars(&text, chars)
+            }
+            (None, None, None) => {
+                return Err(CoreError::BadRequest(
+                    "需要 tail_lines、tail_chars 或 pattern 之一".to_string(),
+                ));
+            }
+            _ => {
+                return Err(CoreError::BadRequest(
+                    "tail_lines/tail_chars/pattern 不能同时使用".to_string(),
+                ));
+            }
+        };
+        Ok(OutputResult { text: result })
+    }
+
     /// 终止终端：落 `interrupted` 终态并调用后端；已终态时幂等返回 `Ok`。
     ///
     /// 同步便捷入口。service 应先调用 [`Registry::prepare_terminate`] 取后端
@@ -2284,6 +2338,37 @@ fn replay_after(
         .map(|record| event_from_record(&entry.id, record))
         .collect();
     (None, events)
+}
+
+/// 拼接事件环中仍保留的全部 `output` 字节，再按 UTF-8 宽松解码。
+///
+/// 先拼字节再解码，避免单个 chunk 恰好切断多字节字符时产生乱码。
+fn retained_output(entry: &TerminalEntry) -> String {
+    let mut bytes = Vec::new();
+    for record in entry.events.records() {
+        if let EventKind::Output { data, .. } = &record.kind {
+            match BASE64_STANDARD.decode(data) {
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(error) => {
+                    tracing::warn!(terminal_id = %entry.id, %error, "输出 chunk 不是合法 base64，已跳过");
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// 取出 `read`/`search` 使用的命令输出文本。
+///
+/// 结构化终端（`shell_events=true`，即 `termx-pwsh`/远端事件通道）只读
+/// transcript 的清洗后命令输出；没有命令或没有输出时为空，绝不回退到
+/// raw PTY。raw-only 终端没有 shell 事件，只能清洗保留的原始输出，prompt
+/// 无法可靠剔除。
+fn command_output_text(entry: &TerminalEntry) -> String {
+    if entry.shell_events {
+        return entry.transcript.output_text();
+    }
+    crate::clean_raw_output(&retained_output(entry))
 }
 
 /// `terminal.read` 的只读扫描实现。
