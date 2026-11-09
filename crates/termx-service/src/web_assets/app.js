@@ -32,6 +32,11 @@
   // 新建终端表单的默认尺寸与服务端默认值一致。
   var DEFAULT_COLS = 120;
   var DEFAULT_ROWS = 30;
+  // 密码/口令“眼睛”按钮的文案（初始值与 index.html 保持一致）。
+  var SECRET_LABELS = {
+    password: { show: "显示密码", hide: "隐藏密码" },
+    keyPassphrase: { show: "显示私钥口令", hide: "隐藏私钥口令" }
+  };
   // 历史必须用 read 分段拉取；subscribe 只回放 read 末尾到订阅时刻之间的小段事件。
   var READ_MAX_BYTES = 64 * 1024;
   var READ_MAX_ROUNDS = 50;
@@ -42,14 +47,13 @@
   var TRANSCRIPT_UI_MAX_CHARS = 200000;
 
   var elements = {};
-  var term = null;
+  // 每终端独立的 xterm 实例/DOM 容器与输入、历史、尺寸状态，禁止跨终端复用。
+  var views = new Map();
   var socket = null;
   var connected = false;
   var pending = Object.create(null);
   var nextRequestId = 1;
   var currentTerminalId = null;
-  // 每终端已渲染/已消费的最后事件 seq；重连复用它避免从 0 重放。
-  var cursors = Object.create(null);
   // 订阅窗口内先缓存事件，等 subscribe 响应确认后再按 seq 顺序渲染。
   var liveBuffer = null;
   var liveBufferToken = 0;
@@ -57,9 +61,6 @@
   var historyNotice = null;
   // 每次选中递增，用于丢弃前一次异步读取的迟到回调。
   var selectToken = 0;
-  var claimed = false;
-  var claimInFlight = null;
-  var lastSize = null;
   var resizeTimer = null;
   var reconnectTimer = null;
   var reconnectDelay = RECONNECT_MIN_MS;
@@ -93,10 +94,9 @@
   // 底部状态栏：同一消息被点击关闭后，重复上报不再自动弹回。
   var statusBarKey = "";
   var statusBarDismissed = false;
-  // 终端进入终态后信息页输入禁用并显示提示。
-  var terminalEnded = false;
 
-  /** 初始化页面：创建终端、绑定控件、连接代理。 */
+
+  /** 初始化页面：绑定控件、连接代理；xterm 按选中终端懒创建。 */
   function init() {
     elements.term = document.getElementById("termx-term");
     elements.sessionSelect = document.getElementById("termx-session");
@@ -122,9 +122,13 @@
     elements.createAuth = document.getElementById("termx-create-auth");
     elements.createPasswordGroup = document.getElementById("termx-create-password-group");
     elements.createPassword = document.getElementById("termx-create-password");
+    elements.createPasswordToggle = document.getElementById("termx-create-password-toggle");
     elements.createKeyGroup = document.getElementById("termx-create-key-group");
     elements.createKeyPath = document.getElementById("termx-create-key-path");
     elements.createKeyPassphrase = document.getElementById("termx-create-key-passphrase");
+    elements.createKeyPassphraseToggle = document.getElementById(
+      "termx-create-key-passphrase-toggle"
+    );
     elements.createAnyHostKey = document.getElementById("termx-create-any-host-key");
     elements.createCols = document.getElementById("termx-create-cols");
     elements.createRows = document.getElementById("termx-create-rows");
@@ -178,7 +182,6 @@
       return;
     }
 
-    createTerminal();
     bindControls();
     observeResize();
     syncStructuredCapability(null);
@@ -187,9 +190,33 @@
     connect();
   }
 
-  /** 创建 xterm 实例并挂载到容器。 */
-  function createTerminal() {
-    term = new window.Terminal({
+  /** 取指定终端的独立视图；未创建时返回 null。 */
+  function getView(terminalId) {
+    if (!terminalId) {
+      return null;
+    }
+    return views.get(terminalId) || null;
+  }
+
+  /** 当前选中终端的视图。 */
+  function currentView() {
+    return getView(currentTerminalId);
+  }
+
+  /**
+   * 为 terminal_id 创建独立 xterm 实例与 DOM 容器。
+   *
+   * onData / 鼠标聚焦都绑定创建时的 terminal_id，避免随后切换终端后串到
+   * 新的 currentTerminalId。
+   */
+  function createTerminalView(terminalId) {
+    var container = document.createElement("div");
+    container.className = "termx-term-view termx-term-view-hidden";
+    container.setAttribute("data-terminal-id", terminalId);
+    container.setAttribute("aria-label", "终端输出 " + terminalId);
+    elements.term.appendChild(container);
+
+    var terminal = new window.Terminal({
       cursorBlink: true,
       fontFamily: '"Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace',
       fontSize: FALLBACK_FONT_SIZE,
@@ -201,13 +228,82 @@
         selectionBackground: "#2b4a6f"
       }
     });
-    term.open(elements.term);
-    term.onData(handleInput);
-    elements.term.addEventListener("mousedown", function () {
-      if (currentTerminalId) {
-        term.focus();
+    terminal.open(container);
+
+    var view = {
+      terminalId: terminalId,
+      term: terminal,
+      container: container,
+      // 该实例已消费的最后事件 seq；切换回来时只补缺失历史。
+      cursor: 0,
+      lastSize: null,
+      claimed: false,
+      claimInFlight: null,
+      ended: false
+    };
+    terminal.onData(function (data) {
+      handleInput(terminalId, data);
+    });
+    container.addEventListener("mousedown", function () {
+      if (currentTerminalId === terminalId) {
+        terminal.focus();
       }
     });
+    views.set(terminalId, view);
+    return view;
+  }
+
+  /** 取已有视图，不存在则创建；同一 terminal_id 永远对应一个实例。 */
+  function ensureTerminalView(terminalId) {
+    return getView(terminalId) || createTerminalView(terminalId);
+  }
+
+  /** 只显隐终端视图，不销毁也不共用 buffer。 */
+  function activateTerminalView(terminalId) {
+    views.forEach(function (view, id) {
+      view.container.classList.toggle("termx-term-view-hidden", id !== terminalId);
+    });
+  }
+
+  /** 释放单个终端的 xterm 实例、事件与 DOM，避免切换/删除后泄漏。 */
+  function disposeTerminalView(terminalId) {
+    var view = getView(terminalId);
+    if (!view) {
+      return;
+    }
+    views.delete(terminalId);
+    try {
+      view.term.dispose();
+    } catch (error) {
+      // 已销毁或浏览器回收时忽略。
+    }
+    if (view.container && view.container.parentNode) {
+      view.container.parentNode.removeChild(view.container);
+    }
+  }
+
+  /** 清理已不在 terminal.list 中的视图（删除/prune/force 替换）。 */
+  function pruneTerminalViews(items) {
+    var stale = [];
+    views.forEach(function (view, terminalId) {
+      if (!hasTerminal(items, terminalId)) {
+        stale.push(terminalId);
+      }
+    });
+    for (var i = 0; i < stale.length; i += 1) {
+      disposeTerminalView(stale[i]);
+    }
+  }
+
+  /** 断线/服务重启时释放全部视图；重连后按新终端状态重建。 */
+  function disposeAllTerminalViews() {
+    var ids = [];
+    views.forEach(function (_view, terminalId) {
+      ids.push(terminalId);
+    });
+    for (var i = 0; i < ids.length; i += 1) {
+      disposeTerminalView(ids[i]);
+    }
   }
 
   /** 绑定 header 控件。 */
@@ -239,6 +335,16 @@
     if (elements.createAuth) {
       elements.createAuth.addEventListener("change", updateCreateAuth);
     }
+    bindSecretToggle(
+      elements.createPasswordToggle,
+      elements.createPassword,
+      SECRET_LABELS.password
+    );
+    bindSecretToggle(
+      elements.createKeyPassphraseToggle,
+      elements.createKeyPassphrase,
+      SECRET_LABELS.keyPassphrase
+    );
     if (elements.createDialog) {
       // 原生 Esc 关闭不经过 cancel 按钮：清掉只在内存中的密码/口令与待确认授权。
       elements.createDialog.addEventListener("close", onCreateDialogClosed);
@@ -349,8 +455,7 @@
       setConnected(false);
       stopTranscriptPolling();
       rejectPending("连接已断开");
-      claimed = false;
-      claimInFlight = null;
+      disposeAllTerminalViews();
       setStatus("连接已断开，正在重连…");
       scheduleReconnect();
     });
@@ -475,81 +580,102 @@
     pending = Object.create(null);
   }
 
-  /** 处理当前终端的事件；订阅窗口内先入缓冲，避免与历史回放乱序。 */
+  /** 按 terminal_id 找到对应视图；订阅窗口内先入缓冲，避免与历史回放乱序。 */
   function handleEvent(event) {
-    if (!event.terminal_id || event.terminal_id !== currentTerminalId) {
+    if (!event.terminal_id) {
       return;
     }
-    if (liveBuffer) {
+    var view = getView(event.terminal_id);
+    if (!view) {
+      return;
+    }
+    if (liveBuffer && event.terminal_id === currentTerminalId) {
       liveBuffer.push(event);
       return;
     }
-    applyEvent(event);
+    applyEvent(view, event);
   }
 
-  /** 按类型渲染一条事件并推进该终端的游标。 */
-  function applyEvent(event) {
+  /** 按类型渲染一条事件到指定视图，并只推进该终端的游标。 */
+  function applyEvent(view, event) {
+    var active = view.terminalId === currentTerminalId;
     if (typeof event.seq === "number") {
-      advanceCursor(event.terminal_id, event.seq);
+      advanceCursor(view, event.seq);
     }
     switch (event.type) {
       case "started":
-        setStatus("终端运行中（pid " + event.pid + "）");
+        if (active) {
+          setStatus("终端运行中（pid " + event.pid + "）");
+        }
         break;
       case "output":
         if (event.data) {
-          term.write(base64ToBytes(event.data));
+          view.term.write(base64ToBytes(event.data));
         }
         break;
       case "output_dropped":
-        setStatus(
-          "输出因背压被丢弃（seq " + event.from_seq + "–" + event.to_seq + "）"
-        );
+        if (active) {
+          setStatus(
+            "输出因背压被丢弃（seq " + event.from_seq + "–" + event.to_seq + "）"
+          );
+        }
         break;
       case "waiting_input":
-        setStatus("等待输入（" + event.confidence + " / " + event.reason + "）");
+        if (active) {
+          setStatus("等待输入（" + event.confidence + " / " + event.reason + "）");
+        }
         break;
       case "interactive_changed":
-        if (event.active) {
+        if (active && event.active) {
           setStatus("交互中：" + (event.command || "pid " + event.pid));
         }
         break;
       case "lease_revoked":
-        claimed = false;
-        setStatus("输入控制已被释放或抢占");
+        view.claimed = false;
+        if (active) {
+          setStatus("输入控制已被释放或抢占");
+        }
         break;
       case "exited":
-        claimed = false;
-        terminalEnded = true;
-        setInfoNotice("终端已退出（退出码 " + event.exit_code + "）");
-        setStatus(
-          "终端已退出（退出码 " + event.exit_code + "）",
-          event.exit_code === 0 ? "success" : "error"
-        );
-        updateControls();
+        view.claimed = false;
+        view.ended = true;
+        if (active) {
+          setInfoNotice("终端已退出（退出码 " + event.exit_code + "）");
+          setStatus(
+            "终端已退出（退出码 " + event.exit_code + "）",
+            event.exit_code === 0 ? "success" : "error"
+          );
+          updateControls();
+        }
         refreshTerminals();
         break;
       case "interrupted":
-        claimed = false;
-        terminalEnded = true;
-        setInfoNotice("终端已中断（" + event.signal + "）");
-        setStatus("终端已中断（" + event.signal + "）", "warning");
-        updateControls();
+        view.claimed = false;
+        view.ended = true;
+        if (active) {
+          setInfoNotice("终端已中断（" + event.signal + "）");
+          setStatus("终端已中断（" + event.signal + "）", "warning");
+          updateControls();
+        }
         refreshTerminals();
         break;
       case "rebound":
-        setStatus(
-          "终端已迁移到 " + event.new_root_session_id + "/" + event.new_name
-        );
-        closeRebindDialog();
+        if (active) {
+          setStatus(
+            "终端已迁移到 " + event.new_root_session_id + "/" + event.new_name
+          );
+          closeRebindDialog();
+        }
         refreshTerminals();
         break;
       case "error":
-        claimed = false;
-        terminalEnded = true;
-        setInfoNotice("终端错误：" + event.message);
-        setStatus("终端错误：" + event.message);
-        updateControls();
+        view.claimed = false;
+        view.ended = true;
+        if (active) {
+          setInfoNotice("终端错误：" + event.message);
+          setStatus("终端错误：" + event.message);
+          updateControls();
+        }
         refreshTerminals();
         break;
       default:
@@ -557,13 +683,13 @@
     }
   }
 
-  /** 只前进不回退地记录某终端的最后事件 seq。 */
-  function advanceCursor(terminalId, seq) {
-    if (!terminalId || typeof seq !== "number") {
+  /** 只前进不回退地记录某视图的最后事件 seq。 */
+  function advanceCursor(view, seq) {
+    if (!view || typeof seq !== "number") {
       return;
     }
-    if (seq > (cursors[terminalId] || 0)) {
-      cursors[terminalId] = seq;
+    if (seq > view.cursor) {
+      view.cursor = seq;
     }
   }
 
@@ -578,7 +704,10 @@
       return (left.seq || 0) - (right.seq || 0);
     });
     for (var i = 0; i < buffered.length; i += 1) {
-      applyEvent(buffered[i]);
+      var view = getView(buffered[i].terminal_id);
+      if (view) {
+        applyEvent(view, buffered[i]);
+      }
     }
   }
 
@@ -600,15 +729,17 @@
         var items = normalizeList(results[0]);
         lastTerminals = items;
         lastSessions = mergeSessions(results[1], items);
+        pruneTerminalViews(items);
         syncSelectedSession(items, focusTerminalId);
         renderSessionList();
         renderTerminalList(items);
         var exists = currentTerminalId && hasTerminal(items, currentTerminalId);
         if (currentTerminalId && !exists) {
-          delete cursors[currentTerminalId];
           currentTerminalId = null;
-          claimed = false;
-          term.clear();
+          selectToken += 1;
+          liveBuffer = null;
+          liveBufferToken = 0;
+          activateTerminalView(null);
           stopTranscriptPolling();
           resetTranscriptView();
           closeRebindDialog();
@@ -880,7 +1011,7 @@
     }
   }
 
-  /** 切换/重连终端：先 read 历史，再从游标订阅实时事件，最后 claim 并聚焦。 */
+  /** 切换/重连终端：只显隐独立视图，先 read 历史再订阅，最后 claim 并聚焦。 */
   function selectTerminal(terminalId, force) {
     terminalId = terminalId || null;
     if (!force && terminalId === currentTerminalId) {
@@ -889,7 +1020,13 @@
     var previous = currentTerminalId;
     // 重连同名终端时保留 xterm 内容与游标，只补齐断线期间的历史。
     var reconnect = !!(force && terminalId && terminalId === previous);
+    // 服务重连/显式重连代表旧 xterm 状态不可信：释放旧实例，重建干净视图。
+    if (reconnect) {
+      disposeTerminalView(terminalId);
+    }
+    var view = terminalId ? ensureTerminalView(terminalId) : null;
     currentTerminalId = terminalId;
+    activateTerminalView(terminalId);
     var selectedItem = findTerminal(terminalId);
     if (selectedItem && selectedItem.root_session_id !== selectedSession) {
       selectedSession = selectedItem.root_session_id;
@@ -901,9 +1038,6 @@
     if (!reconnect) {
       setView(supportsStructured(selectedItem) ? "info" : "raw");
     }
-    claimed = false;
-    claimInFlight = null;
-    lastSize = null;
     selectToken += 1;
     var token = selectToken;
     liveBuffer = null;
@@ -911,12 +1045,8 @@
     historyNotice = null;
 
     if (!reconnect) {
-      term.clear();
+      // 只重置信息页；xterm buffer 由各 terminal_id 自己的视图保留。
       resetTranscriptView();
-      terminalEnded = false;
-      if (terminalId) {
-        cursors[terminalId] = 0;
-      }
     }
     if (previous && connected && previous !== terminalId) {
       rpc("unsubscribe", { terminals: [{ terminal_id: previous }] }).catch(function () {
@@ -938,7 +1068,7 @@
     if (viewMode === "info") {
       startTranscriptPolling();
     }
-    var startCursor = cursors[terminalId] || 0;
+    var startCursor = view ? view.cursor : 0;
     setStatus(reconnect ? "正在补齐断线期间的历史…" : "正在读取终端历史…");
     readHistory(terminalId, startCursor, token)
       .then(function (cursor) {
@@ -954,7 +1084,10 @@
         refreshStatusMeta(terminalId, token);
         if (viewMode === "raw") {
           applyResize();
-          term.focus();
+          var current = currentView();
+          if (current) {
+            current.term.focus();
+          }
         } else {
           startTranscriptPolling();
         }
@@ -973,6 +1106,10 @@
       if (token !== selectToken || currentTerminalId !== terminalId || !connected) {
         return Promise.resolve(cursor);
       }
+      var view = getView(terminalId);
+      if (!view) {
+        return Promise.resolve(cursor);
+      }
       var before = cursor;
       return rpc("terminal.read", {
         terminal_id: terminalId,
@@ -984,12 +1121,12 @@
             return cursor;
           }
           if (result && result.reset) {
-            // 该游标之后的历史已不可用：清屏，从服务端基线继续实时流。
-            term.clear();
+            // 该视图自己的历史已不可用：只重置该实例，不影响其他终端。
+            view.term.reset();
             if (typeof result.cursor === "number") {
               cursor = result.cursor;
             }
-            advanceCursor(terminalId, cursor);
+            advanceCursor(view, cursor);
             historyNotice = "历史已不可回放（" + result.reset + "），从最新位置继续";
             setStatus(historyNotice);
             return cursor;
@@ -997,16 +1134,16 @@
           var chunks = (result && result.chunks) || [];
           for (var i = 0; i < chunks.length; i += 1) {
             if (chunks[i] && chunks[i].data) {
-              term.write(base64ToBytes(chunks[i].data));
+              view.term.write(base64ToBytes(chunks[i].data));
             }
             if (chunks[i] && typeof chunks[i].seq === "number") {
-              advanceCursor(terminalId, chunks[i].seq);
+              advanceCursor(view, chunks[i].seq);
               cursor = Math.max(cursor, chunks[i].seq);
             }
           }
           if (result && typeof result.cursor === "number") {
             cursor = Math.max(cursor, result.cursor);
-            advanceCursor(terminalId, cursor);
+            advanceCursor(view, cursor);
           }
           round += 1;
           if (round >= READ_MAX_ROUNDS) {
@@ -1035,6 +1172,10 @@
    * 事件。回放过大时服务端返回 reset，此时丢弃缓冲、退订并重新 read 后再订阅。
    */
   function subscribeTerminal(terminalId, cursor, token, allowResetRetry) {
+    var view = getView(terminalId);
+    if (!view) {
+      return Promise.resolve(false);
+    }
     liveBuffer = [];
     liveBufferToken = token;
     return rpc("subscribe", {
@@ -1060,10 +1201,10 @@
           }
           if (!allowResetRetry) {
             liveBuffer = null;
-            advanceCursor(terminalId, baseline);
+            advanceCursor(view, baseline);
             historyNotice = "历史回放过大（" + reset + "），已从最新位置继续";
             setStatus(historyNotice);
-            return claimTerminal();
+            return claimTerminal(terminalId);
           }
           historyNotice = "历史回放过大（" + reset + "），已改用分段读取";
           setStatus(historyNotice);
@@ -1085,10 +1226,10 @@
         }
 
         flushLiveBuffer(token);
-        advanceCursor(terminalId, baseline);
+        advanceCursor(view, baseline);
         setStatus(historyNotice || "已订阅终端");
         historyNotice = null;
-        return claimTerminal();
+        return claimTerminal(terminalId);
       },
       function (error) {
         if (liveBufferToken === token) {
@@ -1111,46 +1252,46 @@
     return items[0];
   }
 
-  /** 取得当前终端的输入 lease；失败时显示状态并允许下次重试。 */
-  function claimTerminal() {
-    if (!currentTerminalId || !connected) {
+  /** 取得指定终端的输入 lease；lease 状态同样按 terminal_id 独立保存。 */
+  function claimTerminal(terminalId) {
+    var view = getView(terminalId);
+    if (!view || !connected) {
       return Promise.resolve(false);
     }
-    if (claimed) {
+    if (view.claimed) {
       return Promise.resolve(true);
     }
-    if (claimInFlight) {
-      return claimInFlight;
+    if (view.claimInFlight) {
+      return view.claimInFlight;
     }
-    var terminalId = currentTerminalId;
-    claimInFlight = rpc("terminal.claim", { terminal_id: terminalId }).then(
+    view.claimInFlight = rpc("terminal.claim", { terminal_id: terminalId }).then(
       function () {
-        claimInFlight = null;
-        if (currentTerminalId === terminalId) {
-          claimed = true;
+        view.claimInFlight = null;
+        if (getView(terminalId) === view) {
+          view.claimed = true;
           return true;
         }
         return false;
       },
       function (error) {
-        claimInFlight = null;
+        view.claimInFlight = null;
         if (connected && currentTerminalId === terminalId) {
           setStatus("输入控制获取失败：" + error.message);
         }
         return false;
       }
     );
-    return claimInFlight;
+    return view.claimInFlight;
   }
 
-  /** xterm 输入 → terminal.send（base64 UTF-8，不追加换行）。 */
-  function handleInput(data) {
-    if (!currentTerminalId || !connected) {
+  /** xterm 输入 → 所属 terminal_id 的 send（base64 UTF-8，不追加换行）。 */
+  function handleInput(terminalId, data) {
+    var view = getView(terminalId);
+    if (!view || !connected || view.ended) {
       return;
     }
-    var terminalId = currentTerminalId;
-    claimTerminal().then(function (ok) {
-      if (!ok || currentTerminalId !== terminalId || !connected) {
+    claimTerminal(terminalId).then(function (ok) {
+      if (!ok || !connected || getView(terminalId) !== view) {
         return;
       }
       rpc("terminal.send", {
@@ -1574,6 +1715,7 @@
     setInputValue(elements.createPassword, "");
     setInputValue(elements.createKeyPath, "");
     setInputValue(elements.createKeyPassphrase, "");
+    resetCreateSecretVisibility();
     if (elements.createAnyHostKey) {
       // 默认 Ask；AcceptAny 只能由用户在“高级 / 不安全选项”里显式勾选。
       elements.createAnyHostKey.checked = false;
@@ -1695,6 +1837,46 @@
   function clearCreateSecrets() {
     setInputValue(elements.createPassword, "");
     setInputValue(elements.createKeyPassphrase, "");
+    resetCreateSecretVisibility();
+  }
+
+  /** 密码类输入框的“眼睛”切换：点击在明文/隐藏之间切换，值本身不落到任何存储。 */
+  function bindSecretToggle(button, input, labels) {
+    if (!button || !input || !labels) {
+      return;
+    }
+    button.addEventListener("click", function () {
+      setSecretVisible(input, button, labels, input.type === "password");
+    });
+  }
+
+  /** 设置密码框明文/隐藏状态，并同步按钮 aria-pressed 与可读文案。 */
+  function setSecretVisible(input, button, labels, visible) {
+    if (input) {
+      input.type = visible ? "text" : "password";
+    }
+    if (button && labels) {
+      var label = visible ? labels.hide : labels.show;
+      button.setAttribute("aria-pressed", visible ? "true" : "false");
+      button.setAttribute("aria-label", label);
+      button.title = label;
+    }
+  }
+
+  /** 关闭/重置新建弹窗时把密码框与对应按钮恢复为隐藏态。 */
+  function resetCreateSecretVisibility() {
+    setSecretVisible(
+      elements.createPassword,
+      elements.createPasswordToggle,
+      SECRET_LABELS.password,
+      false
+    );
+    setSecretVisible(
+      elements.createKeyPassphrase,
+      elements.createKeyPassphraseToggle,
+      SECRET_LABELS.keyPassphrase,
+      false
+    );
   }
 
   /** 新建弹窗关闭（按钮或 Esc）：清掉密码/口令与待确认的注入授权。 */
@@ -2504,6 +2686,23 @@
     rpc("terminal.terminate", { terminal_id: terminalId, force: true }).then(
       function () {
         setStatus("已请求终止终端");
+        // 终止后立即释放该实例与 DOM；列表里若仍有终态条目，重选时再新建视图。
+        disposeTerminalView(terminalId);
+        if (currentTerminalId === terminalId) {
+          currentTerminalId = null;
+          selectToken += 1;
+          liveBuffer = null;
+          liveBufferToken = 0;
+          activateTerminalView(null);
+          resetTranscriptView();
+          syncStructuredCapability(null);
+          renderInfoMeta(null);
+          setView("raw");
+          if (elements.select) {
+            elements.select.value = "";
+          }
+        }
+        updateControls();
         refreshTerminals();
       },
       function (error) {
@@ -2620,18 +2819,19 @@
     resizeTimer = window.setTimeout(applyResize, RESIZE_DEBOUNCE_MS);
   }
 
-  /** 计算并提交终端尺寸。 */
+  /** 计算并提交当前选中视图的终端尺寸；其他视图保持自己的尺寸状态。 */
   function applyResize() {
     resizeTimer = null;
-    if (!term || !currentTerminalId) {
+    var view = currentView();
+    if (!view) {
       return;
     }
-    var rect = elements.term.getBoundingClientRect();
+    var rect = view.container.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return;
     }
-    var cell = cellSize();
-    var style = window.getComputedStyle(elements.term);
+    var cell = cellSize(view.term);
+    var style = window.getComputedStyle(view.container);
     var padX = pixelValue(style.paddingLeft) + pixelValue(style.paddingRight);
     var padY = pixelValue(style.paddingTop) + pixelValue(style.paddingBottom);
     var cols = Math.max(2, Math.floor((rect.width - padX) / cell.width));
@@ -2639,15 +2839,15 @@
     if (!isFinite(cols) || !isFinite(rows)) {
       return;
     }
-    if (lastSize && lastSize.cols === cols && lastSize.rows === rows) {
+    if (view.lastSize && view.lastSize.cols === cols && view.lastSize.rows === rows) {
       return;
     }
-    if (term.cols !== cols || term.rows !== rows) {
-      term.resize(cols, rows);
+    if (view.term.cols !== cols || view.term.rows !== rows) {
+      view.term.resize(cols, rows);
     }
-    lastSize = { cols: cols, rows: rows };
+    view.lastSize = { cols: cols, rows: rows };
     rpc("terminal.resize", {
-      terminal_id: currentTerminalId,
+      terminal_id: view.terminalId,
       cols: cols,
       rows: rows
     }).catch(function () {
@@ -2655,10 +2855,11 @@
     });
   }
 
-  /** 读取 xterm 字符尺寸；内部字段不可用时按字号估算。 */
-  function cellSize() {
+  /** 读取指定 xterm 的字符尺寸；内部字段不可用时按字号估算。 */
+  function cellSize(terminal) {
     try {
-      var dimensions = term._core && term._core._renderService && term._core._renderService.dimensions;
+      var dimensions =
+        terminal._core && terminal._core._renderService && terminal._core._renderService.dimensions;
       var cell = dimensions && dimensions.css && dimensions.css.cell;
       if (cell && cell.width > 0 && cell.height > 0) {
         return cell;
@@ -2666,7 +2867,7 @@
     } catch (error) {
       // 回退到字号估算。
     }
-    var fontSize = (term.options && term.options.fontSize) || FALLBACK_FONT_SIZE;
+    var fontSize = (terminal.options && terminal.options.fontSize) || FALLBACK_FONT_SIZE;
     return {
       width: Math.max(1, fontSize * 0.62),
       height: Math.max(1, Math.ceil(fontSize * 1.2))
@@ -2721,8 +2922,9 @@
     } else {
       stopTranscriptPolling();
       applyResize();
-      if (term) {
-        term.focus();
+      var view = currentView();
+      if (view) {
+        view.term.focus();
       }
     }
   }
@@ -2985,7 +3187,8 @@
       setStatus("未连接或未选择终端");
       return;
     }
-    if (terminalEnded) {
+    var view = currentView();
+    if (view && view.ended) {
       setInfoNotice("终端已结束，不能再发送命令");
       return;
     }
@@ -2995,7 +3198,7 @@
       return;
     }
     var terminalId = currentTerminalId;
-    claimTerminal()
+    claimTerminal(terminalId)
       .then(function (ok) {
         if (!ok || currentTerminalId !== terminalId || !connected) {
           return false;
@@ -3123,6 +3326,12 @@
     updateControls();
   }
 
+  /** 当前选中终端是否已进入终态。 */
+  function currentTerminalEnded() {
+    var view = currentView();
+    return !!(view && view.ended);
+  }
+
   /** 按连接与选中状态启用/禁用控件。 */
   function updateControls() {
     if (elements.refresh) {
@@ -3145,11 +3354,11 @@
     }
     if (elements.infoInput) {
       elements.infoInput.disabled =
-        !connected || !currentTerminalId || terminalEnded || !structuredSupported;
+        !connected || !currentTerminalId || currentTerminalEnded() || !structuredSupported;
     }
     if (elements.infoSend) {
       elements.infoSend.disabled =
-        !connected || !currentTerminalId || terminalEnded || !structuredSupported;
+        !connected || !currentTerminalId || currentTerminalEnded() || !structuredSupported;
     }
     if (!connected) {
       closeCreateDialog();

@@ -91,6 +91,60 @@ body.termx-body {
   font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
 }
 
+/* 密码/口令的“眼睛”切换：与输入框同高对齐、可聚焦，配色沿用表单控件。 */
+.termx-secret-field {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.termx-secret-field .termx-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.termx-secret-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  padding: 0;
+  color: var(--termx-muted);
+  cursor: pointer;
+  background: #1b2230;
+  border: 1px solid var(--termx-border);
+  border-radius: 6px;
+}
+
+.termx-secret-toggle:hover {
+  color: var(--termx-fg);
+  border-color: var(--termx-accent);
+}
+
+.termx-secret-toggle:focus-visible {
+  outline: 2px solid var(--termx-accent);
+  outline-offset: 1px;
+}
+
+.termx-secret-toggle svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.termx-secret-toggle .termx-secret-icon-hide {
+  display: none;
+}
+
+.termx-secret-toggle[aria-pressed="true"] .termx-secret-icon-show {
+  display: none;
+}
+
+.termx-secret-toggle[aria-pressed="true"] .termx-secret-icon-hide {
+  display: block;
+}
+
 .termx-check {
   display: inline-flex;
   gap: 4px;
@@ -326,9 +380,17 @@ body.termx-body {
   font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
 }
 
-.termx-term {
+.termx-term-host {
+  position: relative;
   width: 100%;
   height: 100%;
+  overflow: hidden;
+}
+
+/* 每个 terminal_id 一个绝对定位容器；切换时只切 visibility，不共用 buffer。 */
+.termx-term-view {
+  position: absolute;
+  inset: 0;
   padding: 8px;
   overflow: hidden;
   background: #05070a;
@@ -336,11 +398,16 @@ body.termx-body {
   border-radius: 8px;
 }
 
-.termx-term .xterm {
+.termx-term-view-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.termx-term-view .xterm {
   height: 100%;
 }
 
-.termx-term .xterm-viewport {
+.termx-term-view .xterm-viewport {
   background-color: transparent !important;
 }
 

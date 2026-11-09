@@ -58,6 +58,7 @@ idle_timeout > 0：按配置仅 detach 或 terminate
 ## 4. 客户端
 - `opencode adapter`：薄层，把模型工具调用映射为 service RPC；不解析终端渲染状态。
 - `Web`：订阅同一 service 事件；raw/transcript/命令输入都走 service，不直连本地 PTY。
+- **Web 每终端独立 xterm，禁止共用实例**：浏览器按 `terminal_id` 维护 `Map<terminal_id, TerminalView>`，每个视图拥有独立 xterm 实例、DOM 容器、游标/history、resize/focus 与输入 lease；切换终端只显隐对应视图，禁止用一个全局 xterm 跨终端复用，也不得用 `term.clear()` 充当隔离。输出事件按 `terminal_id` 写入对应实例；终止/删除/force 替换时 dispose 实例与 DOM。
 - `CLI`：调试/运维客户端，和 Web 使用同一协议。
 - `termx-client`：CLI 与 opencode adapter 共用的客户端库，负责服务发现、`hello`、按 `id` 配对请求与 `broadcast` 事件；不解析终端渲染状态。
 - 多客户端：同一 terminal 可多 attach；输入冲突需定义 owner/lease，至少保证输出广播顺序。

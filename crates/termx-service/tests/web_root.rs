@@ -121,6 +121,60 @@ fn web_hides_info_view_for_non_structured_terminals() {
     );
 }
 
+/// 每个 terminal_id 必须有独立 xterm 实例与 DOM 容器，禁止单一全局 term 共用。
+#[test]
+fn web_keeps_per_terminal_xterm_views() {
+    let app = include_str!("../src/web_assets/app.js");
+    let index = include_str!("../src/web_assets/index.html");
+    let css = include_str!("../src/web_assets/app.css");
+
+    assert!(
+        app.contains("var views = new Map()"),
+        "app.js 应使用 Map<terminal_id, TerminalView>"
+    );
+    assert!(
+        !app.contains("var term = null;"),
+        "app.js 不应保留单一全局 xterm 实例"
+    );
+    assert!(
+        app.contains("function createTerminalView(terminalId)")
+            && app.contains("views.set(terminalId, view)"),
+        "每个 terminal_id 应创建并登记独立视图"
+    );
+    assert!(
+        app.contains("terminal.onData(function (data)")
+            && app.contains("handleInput(terminalId, data)"),
+        "onData 必须绑定创建时的 terminal_id，而不是切换后的 currentTerminalId"
+    );
+    assert!(
+        app.contains("view.term.write(base64ToBytes(event.data))"),
+        "输出事件应按 terminal_id 写入对应实例"
+    );
+    assert!(
+        app.contains("terminal_id: view.terminalId"),
+        "resize 应使用视图自己的 terminal_id"
+    );
+    assert!(
+        app.contains("function disposeTerminalView(terminalId)")
+            && app.contains("view.term.dispose()"),
+        "终止/删除/force 替换时应释放实例"
+    );
+    assert!(
+        app.contains("function pruneTerminalViews(items)") && app.contains("view.cursor"),
+        "清理缺失视图并使用每终端独立游标"
+    );
+    assert!(
+        !app.contains("term.clear()"),
+        "不应再用全局 term.clear() 做终端隔离"
+    );
+    assert!(
+        index.contains("termx-term-host")
+            && css.contains(".termx-term-view")
+            && css.contains(".termx-term-view-hidden"),
+        "终端容器应支持每个 terminal_id 独立显隐"
+    );
+}
+
 /// SSH 创建表单：固定 termx-pwsh、默认私钥提示、helper 字段移除、回环主机默认信任。
 #[test]
 fn web_ssh_form_converges_runtime_and_helper_fields() {

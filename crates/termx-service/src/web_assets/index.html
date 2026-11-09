@@ -156,24 +156,128 @@
           </select>
           <div id="termx-create-password-group">
             <label class="termx-field" for="termx-create-password">密码</label>
-            <input
-              id="termx-create-password"
-              class="termx-input"
-              type="password"
-              autocomplete="new-password"
-            />
+            <div class="termx-secret-field">
+              <input
+                id="termx-create-password"
+                class="termx-input"
+                type="password"
+                autocomplete="new-password"
+              />
+              <button
+                id="termx-create-password-toggle"
+                class="termx-secret-toggle"
+                type="button"
+                aria-label="显示密码"
+                aria-pressed="false"
+                title="显示密码"
+              >
+                <svg
+                  class="termx-secret-icon-show"
+                  viewBox="0 0 16 16"
+                  width="16"
+                  height="16"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <path
+                    d="M1 8s2.6-4.5 7-4.5S15 8 15 8s-2.6 4.5-7 4.5S1 8 1 8Z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                  <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                </svg>
+                <svg
+                  class="termx-secret-icon-hide"
+                  viewBox="0 0 16 16"
+                  width="16"
+                  height="16"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <path
+                    d="M1 8s2.6-4.5 7-4.5S15 8 15 8s-2.6 4.5-7 4.5S1 8 1 8Z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                  <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  <path
+                    d="M3 3l10 10"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                  />
+                </svg>
+              </button>
+            </div>
           </div>
           <div id="termx-create-key-group" class="termx-form-hidden">
             <label class="termx-field" for="termx-create-key-path">私钥路径（可留空）</label>
             <input id="termx-create-key-path" class="termx-input" type="text" autocomplete="off" spellcheck="false" />
             <p class="termx-dialog-hint">留空自动尝试 ~/.ssh/id_ed25519 / ~/.ssh/id_rsa</p>
             <label class="termx-field" for="termx-create-key-passphrase">私钥口令（可选）</label>
-            <input
-              id="termx-create-key-passphrase"
-              class="termx-input"
-              type="password"
-              autocomplete="new-password"
-            />
+            <div class="termx-secret-field">
+              <input
+                id="termx-create-key-passphrase"
+                class="termx-input"
+                type="password"
+                autocomplete="new-password"
+              />
+              <button
+                id="termx-create-key-passphrase-toggle"
+                class="termx-secret-toggle"
+                type="button"
+                aria-label="显示私钥口令"
+                aria-pressed="false"
+                title="显示私钥口令"
+              >
+                <svg
+                  class="termx-secret-icon-show"
+                  viewBox="0 0 16 16"
+                  width="16"
+                  height="16"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <path
+                    d="M1 8s2.6-4.5 7-4.5S15 8 15 8s-2.6 4.5-7 4.5S1 8 1 8Z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                  <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                </svg>
+                <svg
+                  class="termx-secret-icon-hide"
+                  viewBox="0 0 16 16"
+                  width="16"
+                  height="16"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <path
+                    d="M1 8s2.6-4.5 7-4.5S15 8 15 8s-2.6 4.5-7 4.5S1 8 1 8Z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                  <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  <path
+                    d="M3 3l10 10"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                  />
+                </svg>
+              </button>
+            </div>
           </div>
           <p class="termx-dialog-hint">SSH 固定使用 termx-pwsh（结构化事件）。</p>
           <p class="termx-dialog-hint">
@@ -259,7 +363,7 @@
         </form>
       </section>
       <section id="termx-view-raw" class="termx-view termx-raw-view termx-view-hidden" role="tabpanel" aria-labelledby="termx-tab-raw">
-        <div id="termx-term" class="termx-term" aria-label="终端输出"></div>
+        <div id="termx-term" class="termx-term-host" aria-label="终端输出"></div>
       </section>
     </main>
     <div id="termx-statusbar" class="termx-statusbar" role="status" aria-live="polite" hidden></div>
