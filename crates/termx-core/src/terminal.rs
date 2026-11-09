@@ -75,8 +75,9 @@ pub struct TerminalEntry {
     pub ssh: bool,
     /// 是否使用带外 shell 事件通道（本地通道或远端 helper 通道）。
     ///
-    /// 为 `true` 时 transcript 的 `C`/`D` 只由宿主事件建立，`terminal.send`
-    /// 不再预记录命令，避免同一命令出现 send 与宿主两条来源。
+    /// 为 `true` 时 transcript 的 `C`/`D` 由宿主事件建立；`terminal.send`
+    /// 是否预记录命令由 [`crate::Registry::records_transcript_on_send`] 决定
+    /// （`termx-bash` 需要预记录，避免首段输出先于 `C` 被丢弃）。
     pub shell_events: bool,
     /// 创建时指定的 runtime ID；旧 cmd/args 终端为 `None`。
     pub runtime_id: Option<String>,

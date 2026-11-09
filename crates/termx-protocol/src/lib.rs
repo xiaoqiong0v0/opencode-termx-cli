@@ -562,8 +562,8 @@ pub struct TerminalSnapshot {
     pub cursor: u64,
     /// 是否具备结构化 shell 事件（prompt/命令生命周期）能力。
     ///
-    /// 仅当终端真正建立了带外 shell 事件通道（本地 `termx-pwsh` 或远端
-    /// helper）时为 `true`；普通程序、普通 shell 与降级终端均为 `false`。
+    /// 仅当终端真正建立了带外 shell 事件通道（本地 `termx-pwsh`/`termx-bash`
+    /// 或远端 helper）时为 `true`；普通程序、普通 shell 与降级终端均为 `false`。
     /// 旧服务端缺省为 `false`，客户端应隐藏信息页。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub structured_events: bool,

@@ -85,8 +85,8 @@ pub struct TranscriptBuffer {
     scanner: OscScanner,
     /// 是否解析 stdout 上的 in-band OSC 133/633。
     ///
-    /// 使用带外事件通道的运行时（如 `termx-pwsh`）必须关闭该开关，
-    /// 否则子程序仍可通过 stdout 伪造命令结束。
+    /// 使用带外事件通道的运行时（如 `termx-pwsh`/`termx-bash`）必须关闭该
+    /// 开关，否则子程序仍可通过 stdout 伪造命令结束。
     in_band_osc: bool,
 }
 
@@ -579,13 +579,16 @@ pub fn clean_output(command: &str, raw: &str) -> String {
         .collect();
 
     let command = command.trim();
+    // 多行命令在 PTY 回显里可能被折叠成一行；去掉空白后再比对，避免
+    // 预记录造成的命令回显被当成输出（例如 `for ...; do ...; done`）。
+    let compact_command = compact_for_echo(command);
     // 终端回显可能带提示符/启动横幅（ConPTY 常见），在前几行里找到命令并删到它为止。
     if !command.is_empty() {
-        if let Some(index) = lines
-            .iter()
-            .take(10)
-            .position(|line| line.contains(command))
-        {
+        if let Some(index) = lines.iter().take(10).position(|line| {
+            line.contains(command)
+                || (!compact_command.is_empty()
+                    && compact_for_echo(line).contains(&compact_command))
+        }) {
             lines.drain(0..=index);
         } else {
             while lines
@@ -629,6 +632,11 @@ pub fn clean_output(command: &str, raw: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// 去掉全部空白，用于比对多行命令与折叠成单行的 PTY 回显。
+fn compact_for_echo(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 /// 判断 shell 启动横幅/版权行（这些不是命令输出）。
@@ -1224,6 +1232,13 @@ mod tests {
 
         let raw = "echo hi; __termx_ec=$?; printf '\\033]133;D;%s\\007' \"$__termx_ec\"\r\nhi\r\n";
         assert_eq!(clean_output("echo hi", raw), "hi");
+
+        // 多行命令回显被折叠成一行时也必须识别为回显，不能混进输出。
+        let raw = "for i in 1 2 3; do echo line$i; done\r\nline1\r\nline2\r\nline3\r\n";
+        assert_eq!(
+            clean_output("for i in 1 2 3;\ndo\n  echo line$i;\ndone", raw),
+            "line1\nline2\nline3"
+        );
     }
 
     #[test]

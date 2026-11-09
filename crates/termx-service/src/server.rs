@@ -29,7 +29,7 @@ use termx_protocol::{
     SubscriptionCursor, TerminalLocator, TerminalSnapshot, TerminateParams, TranscriptParams,
     UnsubscribeParams, WEB_ROOT_SESSION_ID, from_json, to_json,
 };
-use termx_runtime::{RuntimeCatalog, RuntimeError};
+use termx_runtime::{RuntimeCatalog, RuntimeError, is_structured_runtime};
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -56,6 +56,7 @@ use crate::config::{
 };
 use crate::lock::{LockError, ServiceLock};
 use crate::marker;
+use crate::ordering::{self, OutputGate};
 use crate::shell_events::{
     EVENT_ENDPOINT_ENV, EVENT_TOKEN_ENV, ShellEventCancel, ShellEventChannel, ShellEventTracker,
 };
@@ -71,13 +72,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// P1 的 in-band marker 会被 shell 回显并写入历史，污染 raw/历史记录；
 /// 等 hook-based shell integration 接上后再启用精确退出码。
 const TRANSCRIPT_MARKER_ENABLED: bool = false;
-/// 使用带外 shell 事件通道的本地 runtime ID。
-const SHELL_EVENT_RUNTIME_ID: &str = "termx-pwsh";
 /// 单终端交互采样（`foreground_pgrp` + `tree`）的超时上限。
 ///
 /// 每个终端独立任务并带超时：任一后端的 `tree()` 卡住只影响自身，不会拖住
 /// 其它终端的采集，也不会阻塞 ticker 响应停止信号。
 const INTERACTION_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// D 事件应用前的输出屏障上限；超时即退化为静默判定。
+const OUTPUT_BARRIER_TIMEOUT: Duration = termx_proc::DEFAULT_BARRIER_TIMEOUT;
 /// 鉴权头名。
 const AUTHORIZATION_HEADER: &str = "authorization";
 /// Bearer 鉴权方案前缀。
@@ -1969,16 +1970,16 @@ async fn dispatch_request(
     }
 }
 
-/// SSH 远端程序是否需要 helper（按 basename 匹配 `termx-pwsh`）。
+/// SSH 远端程序是否需要 helper（按 basename 匹配结构化 runtime）。
 ///
 /// Web 的 SSH 表单固定发送 `termx-pwsh`；普通 ssh 由本地自定义程序承载。
 /// 旧客户端仍可直接发 `cmd`，因此按 basename 判断，兼容
-/// `/usr/local/bin/termx-pwsh` 与 Windows 风格分隔符。
+/// `/usr/local/bin/termx-bash` 与 Windows 风格分隔符。
 fn ssh_needs_helper(cmd: &str) -> bool {
     cmd.trim()
         .rsplit(['/', '\\'])
         .next()
-        .is_some_and(|name| name == SHELL_EVENT_RUNTIME_ID)
+        .is_some_and(is_structured_runtime)
 }
 
 /// SSH 历史记录键：host、port、user、auth_type。
@@ -2088,9 +2089,9 @@ async fn handle_create(
             Err(error) => return Ok(runtime_error_response(id, &error)),
         }
     }
-    // 远端注入计划：SSH + termx-pwsh（或旧请求显式要求）视为需要 helper，
-    // 由 service 从生效的 remote injection 自动填充 helper 字段；只读预检固定
-    // deny。授权只来自本次请求，不写入 registry 或任何状态。
+    // 远端注入计划：SSH + termx-pwsh/termx-bash（或旧请求显式要求）视为需要
+    // helper，由 service 从生效的 remote injection 自动填充 helper 字段；只读
+    // 预检固定 deny。授权只来自本次请求，不写入 registry 或任何状态。
     if params.ssh.is_some() {
         let allow_injection = params.allow_injection;
         let needs_helper = ssh_needs_helper(&params.cmd);
@@ -2114,10 +2115,14 @@ async fn handle_create(
             }
         }
     }
-    // 只有本地 PTY 的 termx-pwsh 使用带外通道；SSH/其他 runtime 保持现状。
+    // 只有本地 PTY 的结构化 runtime（termx-pwsh / termx-bash）使用带外通道；
+    // SSH/其他 runtime 保持现状，普通 bash 等仍是 raw-only。
     let event_channel_eligible = params.mode == Mode::Pty
         && params.ssh.is_none()
-        && params.runtime_id.as_deref() == Some(SHELL_EVENT_RUNTIME_ID);
+        && params
+            .runtime_id
+            .as_deref()
+            .is_some_and(is_structured_runtime);
     let event_channel = if event_channel_eligible {
         match ShellEventChannel::open() {
             Ok(channel) => {
@@ -2156,9 +2161,10 @@ async fn handle_create(
         Ok(spawned) => spawned,
         Err(error) => return Ok(response_from_core_error(id, error)),
     };
-    // 远端事件是否生效由后端快照决定：只有 ssh + pty + termx-pwsh + helper
-    // `shell_events` 能力 + `started.events=true` 才会为 true。普通 SSH 保持
-    // in-band OSC；本地通道逻辑不变。
+    // 远端事件是否生效由后端快照决定：只有 ssh + pty + 结构化 runtime
+    // （termx-pwsh/termx-bash）+ helper `shell_events` 能力 +
+    // `started.events=true` 才会为 true。普通 SSH 保持 in-band OSC；本地通道
+    // 逻辑不变。
     let remote_events = backend.shell_events();
     // 只有本地通道真正建立或远端 helper 通道生效时才关闭 in-band fallback；
     // 本地通道创建失败时仍保留 send/in-band 记录，避免 transcript 丢失。
@@ -2188,10 +2194,14 @@ async fn handle_create(
     // 注册成功才记录历史；失败/取消路径在上面提前返回，不会落盘。
     record_ssh_history(Arc::clone(ssh_history), history_record).await;
 
+    // 本地 PTY 输出与带外 shell 事件是两条独立任务：用共享进度门保证
+    // D 只在它之前的 Output 都被 ingest_proc_events 处理后才应用。
+    let output_gate = Arc::new(OutputGate::new());
     tokio::spawn(ingest_proc_events(
         Arc::clone(registry),
         TerminalId::new(result.terminal_id.clone()),
         events,
+        Arc::clone(&output_gate),
     ));
     if let Some(channel) = event_channel {
         let (receiver, cancel) = channel.split();
@@ -2200,6 +2210,8 @@ async fn handle_create(
             TerminalId::new(result.terminal_id.clone()),
             receiver,
             cancel,
+            Arc::clone(&backend),
+            output_gate,
         ));
     }
     Ok(ok_response(id, serde_json::to_value(result)?))
@@ -2238,8 +2250,9 @@ async fn handle_send(
             Err(error) => return Ok(response_from_core_error(id, error)),
         };
         // 与 prepare_send 同锁记录，保证新命令排在本次写入产生的输出之前；
-        // 鉴权/lease 已通过，因此不会记录被拒绝的输入。事件通道终端改由宿主
-        // `C` 建记录，这里跳过，避免 send 与宿主产生两条来源。
+        // 鉴权/lease 已通过，因此不会记录被拒绝的输入。termx-bash 的 `C`
+        // 与 PTY 输出可能逆序，必须保留 send-time pending，由 `C` 按代次认领；
+        // termx-pwsh 等仍由宿主 `C` 建记录，避免 send 与宿主两条来源。
         if let (Some(text), Some(raw_id)) = (&command_text, &locator.terminal_id) {
             match registry.records_transcript_on_send(&locator) {
                 Ok(true) => {
@@ -2537,10 +2550,12 @@ async fn ingest_proc_events(
     registry: Arc<Mutex<Registry>>,
     terminal_id: TerminalId,
     mut events: Receiver<ProcEvent>,
+    output_gate: Arc<OutputGate>,
 ) {
     // 远端 helper 与本地通道共用同一套 command-id + 代次判定；跟踪器跨事件保留。
     let mut tracker = ShellEventTracker::new();
     while let Some(event) = events.recv().await {
+        let is_output = matches!(event, ProcEvent::Output { .. });
         let (result, terminal) = {
             let mut registry = registry
                 .lock()
@@ -2560,10 +2575,15 @@ async fn ingest_proc_events(
             Err(error) => tracing::debug!(%error, terminal_id = %terminal_id, "事件写入失败"),
         }
 
+        if is_output {
+            output_gate.record_processed();
+        }
         if terminal {
             break;
         }
     }
+    // 让仍在等待 D 屏障的任务立即收敛，而不是等到超时。
+    output_gate.close();
 }
 
 /// 在已持有的 registry 锁内处理一条进程事件。
@@ -2634,9 +2654,33 @@ async fn ingest_shell_events(
     terminal_id: TerminalId,
     mut events: Receiver<crate::shell_events::ShellEvent>,
     _cancel: ShellEventCancel,
+    backend: Arc<dyn TerminalBackend>,
+    output_gate: Arc<OutputGate>,
 ) {
     let mut tracker = ShellEventTracker::new();
     while let Some(event) = events.recv().await {
+        // 只有匹配当前 C 的 D 需要顺序屏障；A/B/C/X 立即应用。
+        let command_end = event.kind == crate::shell_events::ShellEventKind::CommandEnd
+            && event.id.is_some()
+            && tracker.active_command_id() == event.id.as_deref();
+        if command_end
+            && !ordering::barrier_before_command_end(
+                Arc::clone(&backend),
+                &output_gate,
+                OUTPUT_BARRIER_TIMEOUT,
+            )
+            .await
+        {
+            // 屏障失败/超时：丢弃该 D，让静默判定收尾；迟到的输出仍可被
+            // best-effort 记录复活，避免挂到已真实结束的命令上。
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                "输出屏障未完成，丢弃命令结束事件并退化为静默判定"
+            );
+            let _ = tracker.observe(&event, 0);
+            continue;
+        }
+
         let applied = {
             let mut registry = lock_registry(&registry);
             crate::shell_events::apply_event(
@@ -3204,10 +3248,12 @@ mod tests {
         events: Vec<ProcEvent>,
     ) {
         let (tx, rx) = channel(8);
+        let gate = Arc::new(OutputGate::new());
         let handle = tokio::spawn(ingest_proc_events(
             Arc::clone(registry),
             TerminalId::new(terminal_id.to_string()),
             rx,
+            gate,
         ));
         for event in events {
             tx.send(event).await.expect("摄取任务应仍在运行");

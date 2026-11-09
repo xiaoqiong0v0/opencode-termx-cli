@@ -24,6 +24,10 @@ pub fn run() {
         let _ = std::fs::write(record, endpoint.as_bytes());
     }
 
+    // 先向 PTY 写一段稳定标记，供父测试验证 Output 先于 D 转发。
+    println!("TERMX_BARRIER_OUTPUT");
+    let _ = std::io::stdout().flush();
+
     let path = endpoint.strip_prefix("unix:").unwrap_or(&endpoint);
     let Ok(mut stream) = UnixStream::connect(path) else {
         return;

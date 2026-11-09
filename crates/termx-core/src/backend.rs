@@ -14,8 +14,11 @@ use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
-use termx_proc::{ProcError, ProcEvent, PtyConfig, PtySession, StdioSession};
+use termx_proc::{
+    BarrierHandle, BarrierReport, ProcError, ProcEvent, PtyConfig, PtySession, StdioSession,
+};
 use termx_protocol::{Capabilities, CreateParams, Mode, ProcNode};
 use termx_ssh::{SshConnectRequest, SshError, SshSession, helper_enabled};
 use tokio::sync::mpsc::{Receiver, channel};
@@ -78,6 +81,15 @@ pub trait TerminalBackend: Send + Sync {
     fn shell_events(&self) -> bool {
         false
     }
+
+    /// 请求输出屏障：读侧排空当前可读输出并返回累计序号。
+    ///
+    /// 本地 Unix PTY 返回 [`BarrierReport::Drained`]；stdio/SSH/Windows 等
+    /// 没有本地读侧控制通道的后端返回 [`BarrierReport::Unsupported`]。
+    /// 调用方必须在 registry 锁之外、通过 `spawn_blocking` 调用（可能阻塞）。
+    fn barrier(&self, _timeout: Duration) -> Result<BarrierReport, CoreError> {
+        Ok(BarrierReport::Unsupported)
+    }
 }
 
 /// 后端工厂：把 `terminal.create` 参数变成真实进程或 mock 进程。
@@ -100,6 +112,8 @@ pub trait BackendFactory: Send + Sync {
 pub struct PtyBackend {
     /// 底层 PTY 会话；所有访问都在锁内完成。
     session: Mutex<PtySession>,
+    /// 输出屏障句柄；与读线程共享控制通道，不依赖会话锁。
+    barrier: BarrierHandle,
     /// 创建后不变的根进程 ID。
     pid: u32,
     /// 创建后不变的进程组 ID。
@@ -111,8 +125,10 @@ impl PtyBackend {
     pub fn new(session: PtySession) -> Self {
         let pid = session.pid();
         let pgid = session.pgid();
+        let barrier = session.barrier_handle();
         Self {
             session: Mutex::new(session),
+            barrier,
             pid,
             pgid,
         }
@@ -160,6 +176,11 @@ impl TerminalBackend for PtyBackend {
         if let Err(error) = self.lock_session().terminate() {
             tracing::warn!(%error, "终止 PTY 会话失败");
         }
+    }
+
+    fn barrier(&self, timeout: Duration) -> Result<BarrierReport, CoreError> {
+        // 屏障不借用会话锁：句柄只共享控制管道，避免等待期间阻塞 write/terminate。
+        self.barrier.barrier(timeout).map_err(map_proc_error)
     }
 }
 

@@ -91,7 +91,7 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
 - **信息页顶部**：显示当前终端的 `state`、`pid`、`mode`、启动命令（`command` + `args`）与 `cwd`（来自 `terminal.list` / `terminal.status` 快照）。
 - **新建终端**：header「新建终端」打开表单，绑定会话（含「其他/未绑定」`@web`）、名称（默认 `default`）、类型 `local`/`ssh`。
   - `local`：程序、参数（空格分隔，支持单/双引号）、cwd、环境变量（每行 `KEY=VALUE`）、cols/rows。
-  - `ssh`：host/port/user、密码或私钥路径/口令（私钥路径可留空：service 依次探测本机 `~/.ssh/id_ed25519`、`~/.ssh/id_rsa`，显式路径优先）、固定 `termx-pwsh`（结构化事件；普通 ssh 请用 `local` 自定义程序，raw-only）、cols/rows；helper 路径/上传/摘要由 service 按注入配置自动处理。主机密钥默认 `ask`：未知主机弹出指纹确认，匹配 known_hosts 直接连接，指纹变化硬失败；`accept_any` 仅在高级/不安全选项中显式开启，且不写 known_hosts。回环地址不再默认静默接受。
+  - `ssh`：host/port/user、密码或私钥路径/口令（私钥路径可留空：service 依次探测本机 `~/.ssh/id_ed25519`、`~/.ssh/id_rsa`，显式路径优先）、固定结构化程序 `termx-pwsh` 或 `termx-bash`（普通 ssh 请用 `local` 自定义程序，raw-only）、cols/rows；helper 路径/上传/摘要由 service 按注入配置自动处理。主机密钥默认 `ask`：未知主机弹出指纹确认，匹配 known_hosts 直接连接，指纹变化硬失败；`accept_any` 仅在高级/不安全选项中显式开启，且不写 known_hosts。回环地址不再默认静默接受。
   - **最近连接**：SSH 区块顶部提供下拉（`ssh.history.list`），选择后只填充 host/port/user/auth_type，**不填充**密码、私钥口令或私钥路径，并清空表单里已有的秘密输入；空历史或读取失败时隐藏下拉，不阻塞创建。
   - `local` 自定义 cmd/args 不接入 shell 事件：只显示原始控制台，不生成信息页/transcript；模型用 `read --tail-lines`/`--tail-chars`/`search` 获取输出。
   - 提交 `terminal.create`（`mode:"pty"`）；绑定「其他/未绑定」时 `root_session_id` 使用保留值 `@web`。成功后刷新两级选择并选中新终端，失败在弹窗内显示错误。
@@ -121,11 +121,21 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
       "arch": "x86_64",
       "bin": "bin/termx-pwsh.exe",
       "args": []
+    },
+    {
+      "id": "termx-bash",
+      "name": "termx-bash",
+      "version": "0.1.0",
+      "platform": "linux",
+      "arch": "x86_64",
+      "bin": "bin/termx-bash",
+      "args": ["--noprofile"]
     }
   ]
 }
 ```
 
+- 结构化事件 runtime：`termx-pwsh`、`termx-bash`。只有这两个 ID 的本地 PTY 会创建带外事件通道；直接启动的 `bash`/`sh`/`pwsh` 仍是 raw-only。
 - `bin` 必须是 `runtimes/` 下的相对路径；拒绝绝对路径、`..`、盘符前缀与 symlink 越界。
 - 启动前检查文件存在且可执行；Windows 按 `.exe/.cmd/.bat/.com`，Unix 检查执行位。
 - `platform` / `arch` 与 `std::env::consts` 对齐：`windows|linux|macos`、`x86_64|aarch64`。

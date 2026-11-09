@@ -6,27 +6,45 @@
 //! 保证工作区可跨平台编译。
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use thiserror::Error;
 
 #[cfg(not(any(windows, unix)))]
 mod unsupported;
 #[cfg(not(any(windows, unix)))]
-pub use unsupported::{PtySession, StdioSession};
+pub use unsupported::{BarrierHandle, PtySession, StdioSession};
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::PtySession;
+pub use unix::{BarrierHandle, PtySession};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::PtySession;
+pub use windows::{BarrierHandle, PtySession};
 
 /// 跨平台管道 stdio 后端；非 Windows/Unix 平台由 `unsupported` 提供同名占位。
 #[cfg(any(windows, unix))]
 mod stdio;
 #[cfg(any(windows, unix))]
 pub use stdio::StdioSession;
+
+/// 输出屏障默认等待上限。
+///
+/// 屏障本身不靠时间排序，只用该上限收敛异常路径（读线程卡死、后端无响应）。
+pub const DEFAULT_BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 输出屏障完成报告。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierReport {
+    /// 已排空当前可读输出；`output_seq` 为累计入队的 `Output` 事件序号。
+    Drained {
+        /// 已入队的 `Output` 事件累计数（从 1 起，0 表示尚无输出）。
+        output_seq: u64,
+    },
+    /// 当前平台或后端不提供输出屏障（Windows/stdio/unsupported）。
+    Unsupported,
+}
 
 /// `termx-proc` 的统一错误类型。
 #[derive(Debug, Error)]
@@ -64,6 +82,9 @@ pub enum ProcError {
     /// stdio 写入队列已满；调用方应映射为 `limit_exceeded`。
     #[error("stdio 写入队列已满")]
     WriteQueueFull,
+    /// 等待输出屏障确认超时；调用方应退化为静默判定。
+    #[error("等待输出屏障超时")]
+    BarrierTimeout,
 }
 
 /// stdio stdin 有界写队列的默认容量（条）。

@@ -413,9 +413,9 @@ impl Registry {
 
     /// 注册一个已启动的后端，并指定是否解析 stdout 上的 in-band OSC。
     ///
-    /// `in_band_osc=false` 用于自带带外事件通道的运行时（本地 `termx-pwsh`
-    /// 或远端 helper 通道）：子程序输出的 `133/633` 不再结束命令，退出码只来自
-    /// 事件通道；同时 `terminal.send` 不再预记录 transcript 命令。
+    /// `in_band_osc=false` 用于自带带外事件通道的运行时（本地 `termx-pwsh`/
+    /// `termx-bash` 或远端 helper 通道）：子程序输出的 `133/633` 不再结束命令，
+    /// 退出码只来自事件通道；同时 `terminal.send` 不再预记录 transcript 命令。
     /// 其他语义与 [`Registry::register_create`] 完全一致。
     pub fn register_create_with(
         &mut self,
@@ -1073,14 +1073,18 @@ impl Registry {
 
     /// 该终端是否应在 `terminal.send` 时预记录 transcript 命令。
     ///
-    /// 返回 `true` 表示依赖 in-band OSC 或静默判定，需要 send-time fallback；
-    /// 返回 `false` 表示使用带外事件通道，命令记录只由宿主 `C` 事件创建，
-    /// 避免同一命令出现两条来源。终端不存在时返回 [`CoreError::NotFound`]。
+    /// 返回 `true` 表示命令在写后端前先落一条 pending 记录；宿主 `C` 到达后
+    /// 通过 [`Registry::take_pending_transcript_generation`] 原地认领，避免
+    /// 首段输出先于 `C` 处理时被上一命令的终态丢弃。
+    ///
+    /// `termx-bash` 的 `C` 与 PTY 输出同样来自两条链路，因此即使启用带外
+    /// 事件也必须 send-time 预记录；`termx-pwsh` 保持原行为。raw-only 终端
+    /// 继续依赖 in-band OSC/静默判定。终端不存在时返回 [`CoreError::NotFound`]。
     pub fn records_transcript_on_send(&self, locator: &TerminalLocator) -> Result<bool, CoreError> {
         let id = self.resolve(locator)?;
         self.by_id
             .get(&id)
-            .map(|entry| !entry.shell_events)
+            .map(|entry| !entry.shell_events || is_termx_bash(entry))
             .ok_or(CoreError::NotFound)
     }
 
@@ -2282,6 +2286,20 @@ fn signal_name(signal: i32) -> String {
     name.to_string()
 }
 
+/// 是否为 termx-bash 终端（本地 runtime_id 或远端 cmd basename）。
+///
+/// `termx-bash` 的 `C` 事件与 PTY 输出可能逆序到达；`terminal.send` 必须
+/// 先落 pending 命令记录，等 `C` 到达后由代次认领，不能只靠 `C` 新建。
+fn is_termx_bash(entry: &TerminalEntry) -> bool {
+    entry.runtime_id.as_deref() == Some("termx-bash")
+        || entry
+            .command
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name == "termx-bash")
+}
+
 /// 终态生命周期状态对应的命令记录状态；非终态返回 `None`。
 fn transcript_status_for(state: LifecycleState) -> Option<TranscriptStatus> {
     match state {
@@ -2360,10 +2378,10 @@ fn retained_output(entry: &TerminalEntry) -> String {
 
 /// 取出 `read`/`search` 使用的命令输出文本。
 ///
-/// 结构化终端（`shell_events=true`，即 `termx-pwsh`/远端事件通道）只读
-/// transcript 的清洗后命令输出；没有命令或没有输出时为空，绝不回退到
-/// raw PTY。raw-only 终端没有 shell 事件，只能清洗保留的原始输出，prompt
-/// 无法可靠剔除。
+/// 结构化终端（`shell_events=true`，即 `termx-pwsh`/`termx-bash` 或远端
+/// 事件通道）只读 transcript 的清洗后命令输出；没有命令或没有输出时为空，
+/// 绝不回退到 raw PTY。raw-only 终端没有 shell 事件，只能清洗保留的原始
+/// 输出，prompt 无法可靠剔除。
 fn command_output_text(entry: &TerminalEntry) -> String {
     if entry.shell_events {
         return entry.transcript.output_text();

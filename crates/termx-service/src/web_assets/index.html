@@ -285,7 +285,11 @@
               </button>
             </div>
           </div>
-          <p class="termx-dialog-hint">SSH 固定使用 termx-pwsh（结构化事件）。</p>
+          <label class="termx-field" for="termx-create-ssh-runtime">运行环境</label>
+          <select id="termx-create-ssh-runtime" class="termx-select">
+            <option value="termx-pwsh">termx-pwsh（结构化事件）</option>
+            <option value="termx-bash">termx-bash（结构化事件）</option>
+          </select>
           <p class="termx-dialog-hint">
             默认 Ask：首次连接会要求确认主机密钥指纹；已记录主机必须匹配，密钥变化会直接失败。
           </p>

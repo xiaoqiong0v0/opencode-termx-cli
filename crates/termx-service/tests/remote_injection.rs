@@ -238,6 +238,38 @@ async fn invalid_injection_path_returns_bad_request_without_spawning() {
     );
 }
 
+#[tokio::test]
+async fn termx_bash_ssh_requests_helper_like_termx_pwsh() {
+    let dir = tempdir().expect("创建临时目录失败");
+    let config = ServiceConfig::new(dir.path().to_path_buf())
+        .with_remote_injection(RemoteInjectionConfig::new().with_helper_local("./termx-helper"));
+    let probe = Arc::new(ProbeFactory::default());
+    let service =
+        TestService::start_with_config_and_factory(config, Some(Arc::clone(&probe) as Arc<_>))
+            .await;
+    let mut client = connect(&service).await;
+    handshake_root(&mut client, &service.token, "ses-inject").await;
+
+    let created = call(
+        &mut client,
+        "inject-bash",
+        "terminal.create",
+        remote_params("remote-bash", "termx-bash", true),
+    )
+    .await;
+    assert!(created.ok, "termx-bash SSH 创建应成功: {created:?}");
+
+    let seen = probe.seen.lock().expect("probe 锁中毒");
+    let ssh = seen[0].ssh.as_ref().expect("ssh");
+    assert!(ssh.upload_helper, "termx-bash 应自动开启 helper 上传");
+    assert_eq!(ssh.helper_local_path.as_deref(), Some("./termx-helper"));
+    assert_eq!(
+        ssh.injection.bash.as_deref(),
+        Some("~/.termx/runtimes/bash"),
+        "计划应保留 bash runtime 路径"
+    );
+}
+
 #[test]
 fn probe_plan_default_matches_protocol_default() {
     // 防止协议默认值变化后测试悄悄失去意义。

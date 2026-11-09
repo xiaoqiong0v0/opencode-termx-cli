@@ -15,6 +15,7 @@ mod config;
 mod lock;
 pub mod logging;
 mod marker;
+mod ordering;
 mod server;
 pub mod shell_events;
 mod ssh_history;

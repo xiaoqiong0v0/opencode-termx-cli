@@ -311,6 +311,10 @@ fn hello_ok_advertises_capabilities() {
             assert_eq!(proto, HELPER_PROTOCOL_VERSION);
             assert!(capabilities.iter().any(|cap| cap == "pty"));
             assert!(capabilities.iter().any(|cap| cap == "exit_status"));
+            assert!(
+                capabilities.iter().any(|cap| cap == "shell_events"),
+                "helper 应声明 shell_events 能力"
+            );
         }
         other => panic!("期望 hello_ok，实际 {other:?}"),
     }

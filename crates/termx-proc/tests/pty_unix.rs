@@ -221,3 +221,55 @@ async fn signaled() {
     assert_eq!(terminal, Terminal::Signaled(15), "应报告 SIGTERM 终止");
     assert!(session.pid() > 0, "pid 应为正数");
 }
+
+#[tokio::test]
+async fn output_barrier_drains_readable_output() {
+    use termx_proc::{BarrierReport, DEFAULT_BARRIER_TIMEOUT};
+
+    let (mut session, mut rx) = PtySession::spawn(sh_config("printf 'BARRIER_MARK\\n'; sleep 30"))
+        .expect("启动 /bin/sh 失败");
+    let barrier = session.barrier_handle();
+
+    // 屏障会排空投递时刻已可读的输出；只重试到 shell 真正写出标记为止。
+    let target = timeout(Duration::from_secs(5), async {
+        loop {
+            match barrier
+                .barrier(DEFAULT_BARRIER_TIMEOUT)
+                .expect("屏障不应超时")
+            {
+                BarrierReport::Drained { output_seq } if output_seq > 0 => return output_seq,
+                BarrierReport::Drained { .. } => sleep(Duration::from_millis(20)).await,
+                BarrierReport::Unsupported => panic!("Unix PTY 应支持输出屏障"),
+            }
+        }
+    })
+    .await
+    .expect("屏障应在超时内看到输出");
+
+    // 屏障确认的输出必须已经在事件通道中，且顺序不变。
+    let mut seen = 0u64;
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(2), async {
+        while seen < target {
+            match rx.recv().await {
+                Some(ProcEvent::Output { data, .. }) => {
+                    seen += 1;
+                    bytes.extend_from_slice(&data);
+                }
+                Some(_) => break,
+                None => break,
+            }
+        }
+    })
+    .await
+    .expect("屏障确认后应能读到对应输出");
+
+    assert!(
+        seen >= target,
+        "屏障确认的输出应在通道中: seen={seen}, target={target}"
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("BARRIER_MARK"), "输出缺少标记: {text:?}");
+
+    session.terminate().expect("terminate 失败");
+}

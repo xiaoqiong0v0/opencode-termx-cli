@@ -34,6 +34,15 @@ use serde::{Deserialize, Serialize};
 pub const INDEX_FILE_NAME: &str = "index.json";
 /// `runtimes` 子目录名。
 pub const RUNTIMES_DIR_NAME: &str = "runtimes";
+/// 使用带外结构化 shell 事件通道的本地 runtime ID。
+///
+/// 普通程序（含直接启动的 `bash`/`sh`）不在列表内，保持 raw-only。
+pub const STRUCTURED_RUNTIME_IDS: &[&str] = &["termx-pwsh", "termx-bash"];
+
+/// 判断 runtime ID 是否使用结构化 shell 事件通道。
+pub fn is_structured_runtime(id: &str) -> bool {
+    STRUCTURED_RUNTIME_IDS.contains(&id)
+}
 
 /// manifest 根结构。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +471,15 @@ mod tests {
         let resolved = catalog.resolve("termx-pwsh").expect("解析应成功");
         assert_eq!(resolved.bin_path, dir.join("bin/fake-runtime.exe"));
         assert_eq!(resolved.args, vec!["--no-profile".to_string()]);
+    }
+
+    #[test]
+    fn structured_runtime_ids_cover_both_managed_shells() {
+        assert!(is_structured_runtime("termx-pwsh"));
+        assert!(is_structured_runtime("termx-bash"));
+        for plain in ["bash", "sh", "pwsh", "termx-bash-old", ""] {
+            assert!(!is_structured_runtime(plain), "{plain:?} 不应结构化");
+        }
     }
 
     #[test]

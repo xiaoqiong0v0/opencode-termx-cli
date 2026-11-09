@@ -43,7 +43,12 @@ use tokio::{
 pub const DEFAULT_TERM: &str = "xterm-256color";
 
 /// 需要带外 shell 事件通道的远端程序名（按 basename 匹配）。
-pub const SHELL_EVENT_PROGRAM: &str = "termx-pwsh";
+///
+/// `termx-pwsh` 为首个受管 shell；`termx-bash` 使用同一协议，因此远端 helper
+/// 只需按程序名下发 `events=true` 并注入 `TERMX_EVENT_ENDPOINT/TOKEN`。
+pub const SHELL_EVENT_PROGRAMS: &[&str] = &["termx-pwsh", "termx-bash"];
+/// 兼容旧调用方：首个结构化程序名。
+pub const SHELL_EVENT_PROGRAM: &str = SHELL_EVENT_PROGRAMS[0];
 
 /// TCP 建连 + 认证的总超时。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -199,7 +204,7 @@ pub struct SshConnectRequest {
     /// helper 模式直接启动的程序；`None` 时按 `mode` 推导。
     pub program: Option<HelperProgram>,
     /// 是否请求 helper 带外 shell 事件通道；仅 `from_create` 在 pty + 远端
-    /// `termx-pwsh` 时置 `true`。
+    /// 结构化程序（`termx-pwsh`/`termx-bash`）时置 `true`。
     pub events: bool,
 }
 
@@ -254,8 +259,9 @@ impl SshConnectRequest {
     /// `cmd` 为空或等于 `shell` 时申请交互式 shell；否则把 `cmd + args`
     /// 按 POSIX 单引号规则拼成远端命令，并保留原始程序/参数供 helper 使用。
     ///
-    /// 只有 pty + `basename(cmd) == "termx-pwsh"` 才请求带外 shell 事件通道；
-    /// 其他 SSH 命令保持原有 in-band 行为，避免误关闭普通远端会话的 OSC 判定。
+    /// 只有 pty + basename 属于结构化程序（`termx-pwsh`/`termx-bash`）才请求
+    /// 带外 shell 事件通道；其他 SSH 命令保持原有 in-band 行为，避免误关闭
+    /// 普通远端会话的 OSC 判定。
     pub fn from_create(cmd: &str, args: &[String], cols: u16, rows: u16) -> Self {
         let trimmed = cmd.trim();
         if trimmed.is_empty() || trimmed == "shell" {
@@ -285,13 +291,14 @@ impl SshConnectRequest {
 
 /// 判断 `cmd` 的 basename 是否需要带外 shell 事件通道。
 ///
-/// 同时接受 `/usr/local/bin/termx-pwsh` 与 Windows 风格分隔符；只比较文件名，
-/// 不依赖远端路径存在。命令来自协议字符串，不按本机路径语义解析。
+/// 同时接受 `/usr/local/bin/termx-pwsh`、`/usr/local/bin/termx-bash` 与
+/// Windows 风格分隔符；只比较文件名，不依赖远端路径存在。命令来自协议字符串，
+/// 不按本机路径语义解析。
 fn is_shell_event_program(cmd: &str) -> bool {
     cmd.trim()
         .rsplit(['/', '\\'])
         .next()
-        .is_some_and(|name| name == SHELL_EVENT_PROGRAM)
+        .is_some_and(|name| SHELL_EVENT_PROGRAMS.contains(&name))
 }
 
 /// 把程序与参数拼成 POSIX shell 命令行。
@@ -1269,18 +1276,28 @@ mod tests {
             SshChannelMode::Exec("' uptime '".to_string())
         );
 
-        // 只有 pty + basename(cmd)==termx-pwsh 才请求带外事件。
+        // 只有 pty + basename 属于结构化程序才请求带外事件。
         for cmd in [
             SHELL_EVENT_PROGRAM,
             "/usr/local/bin/termx-pwsh",
             "C:\\termx\\termx-pwsh",
+            "termx-bash",
+            "/usr/local/bin/termx-bash",
+            "C:\\termx\\termx-bash",
         ] {
             assert!(
                 SshConnectRequest::from_create(cmd, &[], 80, 24).events,
                 "{cmd:?} 应请求 shell 事件"
             );
         }
-        for cmd in ["pwsh", "termx-pwsh-old", "shell", ""] {
+        for cmd in [
+            "pwsh",
+            "bash",
+            "termx-pwsh-old",
+            "termx-bash-old",
+            "shell",
+            "",
+        ] {
             assert!(
                 !SshConnectRequest::from_create(cmd, &[], 80, 24).events,
                 "{cmd:?} 不应请求 shell 事件"

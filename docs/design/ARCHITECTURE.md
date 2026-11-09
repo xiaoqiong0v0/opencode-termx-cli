@@ -26,6 +26,9 @@
                  └──────────────────┘
 ```
 
+- `termx-helper` 保持一份 core + platform：`core` 只负责协议、握手、事件转发与生命周期；`unix` 负责 PTY/UDS/termios 适配，`windows` 负责 ConPTY/named pipe 适配。平台差异只用 `cfg` 选择模块，不在 core 内按平台分叉。
+- 受管 shell：`termx-pwsh` 与 `termx-bash` 使用同一带外事件协议（A/B/C/D/X）。本地由 runtime catalog 提供；远端由 helper 在 `spawn.events=true` 时注入 `TERMX_EVENT_ENDPOINT/TOKEN`。普通 bash/sh 仍是 raw-only。`termx-bash` 的带外事件与 PTY 输出是两条链路：`terminal.send` 先落 pending 命令记录，`D` 前通过 PTY 输出屏障保证先于它的 Output 已排队/转发；不靠 sleep 或修改 stdout/OSC。
+
 ## 2. 核心原则
 1. **服务拥有终端**：会话、PTY、进程树、buffer、事件全部在 `termx-service`；opencode/Web/CLI 只是客户端。
 2. **opencode 只与服务交互**：模型通过 opencode 工具 adapter 发 RPC；不直接持有终端对象，不依赖插件进程生命周期。

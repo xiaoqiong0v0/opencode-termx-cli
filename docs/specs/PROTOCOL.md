@@ -195,7 +195,7 @@
 - `capabilities` 的层级语义：
   - `hello.capabilities` 是**服务级**声明（当前 `helper:false`、`version` 为协议版本、`runtime_catalog:true`），只表示服务自身能力，不代表任何终端的 helper 状态；旧客户端缺省 `runtime_catalog:false`；
   - 终端级能力只通过 `attach`/`status` 的 `snapshot.capabilities` 或该终端的事件流暴露；客户端不得用 `hello.capabilities` 推断某个 SSH 终端是否启用 helper。
-  - 带外 shell 事件通道（本地 named pipe / 远端 helper）是 service 内部判定，不新增 `Capabilities` 字段；该终端是否真正具备结构化事件由 `snapshot.structured_events` / `terminal.list[].structured_events` 暴露（旧服务端缺省 `false`）。Web 只在该字段为 `true` 时显示信息页，普通程序/shell 仅保留原始控制台。
+  - 带外 shell 事件通道（本地 runtime 的 Unix UDS / Windows named pipe、远端 helper）是 service 内部判定，不新增 `Capabilities` 字段；该终端是否真正具备结构化事件由 `snapshot.structured_events` / `terminal.list[].structured_events` 暴露（旧服务端缺省 `false`）。Web 只在该字段为 `true` 时显示信息页；普通程序/shell（包括直接启动的 `bash`/`sh`）仅保留原始控制台。
 - `snapshot.foreground_pgrp` 以后端上报为准：helper 模式为会话根进程组（当前实现不随前台作业切换），fallback 无值（字段缺省）。
 - 所有事件共用每终端单调 `seq`；`output_dropped` 作为**新事件**分配自己的单调 `seq`（不复用被丢输出的 `seq`），使缺口可检测。
 - `output_dropped.from_seq`/`to_seq` 为**闭区间**（两端都包含），即被丢弃的是 `from_seq..=to_seq`。
@@ -326,10 +326,11 @@
   - `hello_ok.capabilities` 含 `shell_events` 表示 helper 支持事件通道；旧 helper 无该能力时客户端不下发事件请求，行为与之前一致。
   - `spawn.events`（缺省 `false`）仅在客户端需要且 helper 声明能力时置 `true`；`started.events`（缺省 `false`）回报本次是否实际建立通道，创建失败只降级、不阻断 spawn。
   - Unix 远端：helper 为每个会话创建私有临时目录（`0700`）与 Unix domain socket（`0600`），生成随机 token，并通过 `TERMX_EVENT_ENDPOINT=unix:<path>` / `TERMX_EVENT_TOKEN` 注入子进程环境；只 accept 一次、首行校验 token、单帧上限，会话结束后清理 socket。不在 stdout 输出事件，也不新增 TCP 端口。
-  - 子进程按 JSON Lines 发送 `A/B/C/D`；helper 转成 `shell_event{event, code?, id?}` 协议帧。Windows 远端 named pipe 暂不启用（仅保留编译分支）。
+  - 子进程按 JSON Lines 发送 `A/B/C/D`；helper 转成 `shell_event{event, code?, id?}` 协议帧。Unix 使用 UDS；Windows 使用命名管道（`pipe:<name>`），同一 token/帧格式与降级语义。
   - `termx-ssh` 把 `shell_event` 映射为 `ProcEvent::ShellEvent`；service 复用本地通道的 command-id + transcript 代次判定，`D` 命中时以 `source: "shell_integration"` 写入真实 `exit_code`，不匹配/迟到 `D` 被忽略。
-  - 关闭 in-band OSC 的判定是严格三级门槛：`ssh + pty + basename(cmd) == "termx-pwsh"`（后端快照 `shell_events()`）、helper 声明 `shell_events`、`started.events=true`；任一不满足（含旧 helper、普通 SSH、fallback）都保持 in-band 解析，不伪造退出码。
+  - 关闭 in-band OSC 的判定是严格三级门槛：`ssh + pty + basename(cmd)` 属于结构化程序（`termx-pwsh`/`termx-bash`，后端快照 `shell_events()`）、helper 声明 `shell_events`、`started.events=true`；任一不满足（含旧 helper、普通 SSH、fallback）都保持 in-band 解析，不伪造退出码。
   - 公开 WebSocket `Capabilities` 不新增字段；事件通道状态只影响 service 内部 transcript 判定。
+- 本地结构化 runtime：`termx-pwsh`、`termx-bash`（见 CONFIG §3.2）。只有这些 runtime ID 的本地 PTY 会创建带外事件通道；直接启动的普通 shell 保持 raw-only，`structured_events=false`。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全

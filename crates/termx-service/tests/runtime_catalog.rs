@@ -26,11 +26,15 @@ fn install_runtime(config_dir: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(&bin_dir).expect("创建 runtime bin 目录失败");
     let bin_path = bin_dir.join("termx-pwsh-fake.exe");
     std::fs::write(&bin_path, b"fake runtime").expect("写假 runtime 失败");
+    let bash_bin = bin_dir.join("termx-bash-fake.exe");
+    std::fs::write(&bash_bin, b"fake bash runtime").expect("写假 bash runtime 失败");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
-            .expect("设置执行权限失败");
+        for path in [&bin_path, &bash_bin] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("设置执行权限失败");
+        }
     }
 
     let other_platform = if current_platform() == "windows" {
@@ -47,6 +51,15 @@ fn install_runtime(config_dir: &Path) -> std::path::PathBuf {
                 platform: current_platform(),
                 arch: current_arch(),
                 bin: "bin/termx-pwsh-fake.exe".to_string(),
+                args: vec!["--no-profile".to_string()],
+            },
+            RuntimeEntry {
+                id: "termx-bash".to_string(),
+                name: "termx-bash".to_string(),
+                version: "0.1.0".to_string(),
+                platform: current_platform(),
+                arch: current_arch(),
+                bin: "bin/termx-bash-fake.exe".to_string(),
                 args: vec!["--no-profile".to_string()],
             },
             RuntimeEntry {
@@ -194,6 +207,159 @@ async fn create_with_runtime_id_uses_manifest_bin_and_args() {
         item.structured_events,
         "本地 termx-pwsh 建立事件通道后应声明结构化能力"
     );
+}
+
+/// termx-bash 本地 runtime 应声明结构化事件；直接启动 bash 保持 raw-only。
+#[tokio::test]
+async fn termx_bash_is_structured_while_plain_bash_is_raw_only() {
+    let dir = tempdir().expect("创建临时目录失败");
+    install_runtime(dir.path());
+    let mut service = TestService::start_with_config_and_factory(
+        ServiceConfig::new(dir.path().to_path_buf()),
+        Some(Arc::new(MockFactory)),
+    )
+    .await;
+    let mut admin = connect(&service).await;
+    handshake(&mut admin, &service.token).await;
+
+    let created: CreateResult = {
+        let response = call(
+            &mut admin,
+            "c-bash-create",
+            "terminal.create",
+            serde_json::json!({
+                "mode": "pty",
+                "runtime_id": "termx-bash",
+                "root_session_id": "ses-bash",
+                "name": "bash",
+                "cols": 120,
+                "rows": 30
+            }),
+        )
+        .await;
+        assert!(response.ok, "termx-bash 创建应成功: {response:?}");
+        from_json(&to_json(&response.result.expect("缺少 create result")).expect("序列化"))
+            .expect("CreateResult 解析失败")
+    };
+
+    let list = parse_list(
+        call(
+            &mut admin,
+            "c-bash-list",
+            "terminal.list",
+            serde_json::json!({}),
+        )
+        .await,
+    );
+    let item = list
+        .iter()
+        .find(|item| item.terminal_id == created.terminal_id)
+        .expect("termx-bash 终端应出现在列表");
+    assert_eq!(item.runtime_id.as_deref(), Some("termx-bash"));
+    assert!(item.structured_events, "termx-bash 应声明结构化事件");
+
+    let terminal_id = TerminalId::new(created.terminal_id.clone());
+    {
+        let registry = service.registry.lock().expect("registry 锁");
+        assert!(
+            registry
+                .records_transcript_on_send(&by_id(&created.terminal_id))
+                .expect("查询 termx-bash"),
+            "termx-bash 应保留 send-time 记录，避免首段输出先于 C 被丢弃"
+        );
+    }
+
+    let started = OffsetDateTime::now_utc();
+    let ended = started + time::Duration::milliseconds(100);
+    let mut tracker = ShellEventTracker::new();
+    {
+        let mut registry = service.registry.lock().expect("registry 锁");
+        let start = ShellEvent {
+            kind: ShellEventKind::CommandStart,
+            code: None,
+            id: Some("bash-1".to_string()),
+            command: Some("echo hi".to_string()),
+            started_at_ms: Some(millis(started)),
+            ended_at_ms: None,
+        };
+        apply_event(&mut registry, &terminal_id, &mut tracker, &start, started).expect("C 事件");
+    }
+    {
+        let mut registry = service.registry.lock().expect("registry 锁");
+        let end = ShellEvent {
+            kind: ShellEventKind::CommandEnd,
+            code: Some(7),
+            id: Some("bash-1".to_string()),
+            command: None,
+            started_at_ms: None,
+            ended_at_ms: Some(millis(ended)),
+        };
+        assert!(
+            apply_event(&mut registry, &terminal_id, &mut tracker, &end, ended).expect("D 事件")
+        );
+    }
+    {
+        let registry = service.registry.lock().expect("registry 锁");
+        let commands = registry
+            .transcript(&by_id(&created.terminal_id), None)
+            .expect("读取 termx-bash transcript")
+            .commands;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "echo hi");
+        assert_eq!(commands[0].status, TranscriptStatus::Done);
+        assert_eq!(commands[0].exit_code, Some(7));
+        assert_eq!(commands[0].source, Some(TranscriptSource::ShellIntegration));
+    }
+
+    // 普通 bash（无 runtime_id）没有带外事件，必须保持 raw-only。
+    let plain: CreateResult = {
+        let response = call(
+            &mut admin,
+            "c-plain-bash",
+            "terminal.create",
+            serde_json::json!({
+                "mode": "pty",
+                "cmd": "bash",
+                "args": [],
+                "root_session_id": "ses-plain-bash",
+                "name": "plain-bash",
+                "cols": 120,
+                "rows": 30
+            }),
+        )
+        .await;
+        assert!(response.ok, "普通 bash 创建应成功: {response:?}");
+        from_json(&to_json(&response.result.expect("缺少 create result")).expect("序列化"))
+            .expect("CreateResult 解析失败")
+    };
+    let list = parse_list(
+        call(
+            &mut admin,
+            "c-plain-bash-list",
+            "terminal.list",
+            serde_json::json!({}),
+        )
+        .await,
+    );
+    let plain_item = list
+        .iter()
+        .find(|item| item.terminal_id == plain.terminal_id)
+        .expect("普通 bash 终端应出现在列表");
+    assert!(
+        !plain_item.structured_events,
+        "普通 bash 不应声明结构化事件，保持 raw-only"
+    );
+    {
+        let registry = service.registry.lock().expect("registry 锁");
+        assert!(
+            registry
+                .records_transcript_on_send(&by_id(&plain.terminal_id))
+                .expect("查询普通 bash"),
+            "普通 bash 仍应保留 send-time 记录"
+        );
+    }
+
+    service.shutdown().await;
 }
 
 /// 以 terminal_id 定位。

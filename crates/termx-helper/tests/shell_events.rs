@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 #[path = "support/helper_client.rs"]
 mod helper_client;
 #[path = "support/shell_event_probe.rs"]
@@ -153,6 +155,51 @@ fn events_are_forwarded_in_order_and_socket_is_cleaned() {
         "terminate 后 socket 应被清理: {}",
         socket.display()
     );
+}
+
+#[test]
+fn output_is_forwarded_before_command_end() {
+    let dir = tempfile::tempdir().expect("创建临时目录");
+    let record = dir.path().join("endpoint.txt");
+
+    let mut helper = Helper::start();
+    helper.handshake();
+    helper.send(&spawn_probe(
+        &record,
+        &[("TERMX_EVENT_PROBE_HOLD_MS", PROBE_HOLD_MS)],
+    ));
+
+    // 探针在发送 C/D 前先向 PTY 写入 `TERMX_BARRIER_OUTPUT`；屏障必须让该
+    // Output 先于 D 出现在 helper 协议流中。
+    let events = helper.collect_until(|event| match event {
+        HelperEvent::ShellEvent { event, .. } => event == "D",
+        HelperEvent::Exited { .. } | HelperEvent::Signaled { .. } | HelperEvent::Error { .. } => {
+            true
+        }
+        _ => false,
+    });
+
+    let mut text = String::new();
+    let mut saw_marker = false;
+    for event in &events {
+        match event {
+            HelperEvent::Output { data, .. } => {
+                let bytes = STANDARD.decode(data).expect("output.data 非 base64");
+                text.push_str(&String::from_utf8_lossy(&bytes));
+                if text.contains("TERMX_BARRIER_OUTPUT") {
+                    saw_marker = true;
+                }
+            }
+            HelperEvent::ShellEvent { event, .. } if event == "D" => {
+                assert!(saw_marker, "D 转发前必须已转发先于它的 Output: {events:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_marker, "应收到探针输出标记: {events:?}");
+
+    helper.send(&HelperRequest::Terminate);
 }
 
 #[test]

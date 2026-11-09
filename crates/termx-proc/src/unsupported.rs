@@ -3,10 +3,12 @@
 //! Unix/Linux 已由 `unix.rs` 提供真实 PTY 后端；本模块所有操作都返回
 //! [`ProcError::Unsupported`]，保证工作区在其它目标上仍可编译。
 
+use std::time::Duration;
+
 use termx_protocol::ProcNode;
 use tokio::sync::mpsc::Receiver;
 
-use crate::{ProcError, ProcEvent, PtyConfig};
+use crate::{BarrierReport, ProcError, ProcEvent, PtyConfig};
 
 /// 非 Windows 平台上的空 PTY 会话。
 #[derive(Debug)]
@@ -74,6 +76,24 @@ impl StdioSession {
     /// 未启动时没有进程树。
     pub fn tree(&self) -> Result<Vec<ProcNode>, ProcError> {
         Err(ProcError::Unsupported)
+    }
+}
+
+/// 非 Windows/Unix 平台没有 PTY，也没有输出屏障。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BarrierHandle;
+
+impl BarrierHandle {
+    /// 当前平台不支持输出屏障。
+    pub fn barrier(&self, _timeout: Duration) -> Result<BarrierReport, ProcError> {
+        Ok(BarrierReport::Unsupported)
+    }
+}
+
+impl PtySession {
+    /// 未启动时没有输出屏障。
+    pub fn barrier_handle(&self) -> BarrierHandle {
+        BarrierHandle
     }
 }
 

@@ -22,6 +22,7 @@ use std::ffi::{CString, c_char, c_int};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -35,7 +36,7 @@ use termx_protocol::ProcNode;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, warn};
 
-use crate::{OutputStream, ProcError, ProcEvent, PtyConfig, normalize_signal};
+use crate::{BarrierReport, OutputStream, ProcError, ProcEvent, PtyConfig, normalize_signal};
 
 /// 事件通道容量；读线程满时通过 `blocking_send` 施加背压。
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -74,6 +75,8 @@ pub struct PtySession {
     session: u32,
     /// PTY 主端；`terminate` / `Drop` 时关闭。
     master: Option<OwnedFd>,
+    /// 输出屏障控制端；与读线程共享，`Drop` 时关闭写端。
+    barrier: Arc<BarrierControl>,
     /// wait 线程完成 `waitpid` 后置位，用于 `terminate` 等待回收。
     exit_gate: Arc<Gate>,
     /// `terminate` 是否已执行（幂等标记）。
@@ -115,6 +118,17 @@ impl PtySession {
             })?;
         set_cloexec(status_read.as_raw_fd())?;
         set_cloexec(status_write.as_raw_fd())?;
+
+        // 输出屏障控制管道：读线程 poll 它来响应“排空当前可读输出”的请求。
+        // 读端设为非阻塞，读线程一次可消费多个请求令牌；写端由 `BarrierControl` 持有。
+        let (control_read, control_write) =
+            nix::unistd::pipe().map_err(|err| ProcError::PtyFailed {
+                message: format!("创建输出屏障控制管道失败: {err}"),
+            })?;
+        set_cloexec(control_read.as_raw_fd())?;
+        set_cloexec(control_write.as_raw_fd())?;
+        set_nonblocking(control_read.as_raw_fd())?;
+        let barrier = Arc::new(BarrierControl::new(control_write));
 
         let handles = ChildFds {
             master: pty.master.as_raw_fd(),
@@ -179,7 +193,8 @@ impl PtySession {
             .spawn({
                 let tx = tx.clone();
                 let gate = Arc::clone(&reader_gate);
-                move || read_loop(reader_master, tx, gate)
+                let barrier = Arc::clone(&barrier);
+                move || read_loop(reader_master, control_read, tx, gate, barrier)
             });
         if let Err(err) = reader {
             let _ = killpg(child, Signal::SIGKILL);
@@ -206,6 +221,7 @@ impl PtySession {
             // 子进程 `setsid()` 后会话 ID 等于自身 PID。
             session: pgid,
             master: Some(pty.master),
+            barrier,
             exit_gate,
             terminated: false,
         };
@@ -215,6 +231,15 @@ impl PtySession {
     /// 根进程 ID。
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// 输出屏障句柄：与读线程共享同一控制通道。
+    ///
+    /// 句柄是 `Arc` 克隆，可在不持有会话可变借用的线程里发起屏障请求。
+    pub fn barrier_handle(&self) -> BarrierHandle {
+        BarrierHandle {
+            inner: Arc::clone(&self.barrier),
+        }
     }
 
     /// 进程组 ID；子进程调用 `setsid` 后即为根进程 PID。
@@ -811,32 +836,358 @@ fn read_exec_status(fd: RawFd) -> io::Result<Option<i32>> {
     Ok(Some(i32::from_ne_bytes(buffer)))
 }
 
-/// 后台读线程：阻塞读取输出直到 EOF（`EIO`/0），然后标记读线程完成。
-fn read_loop(master: OwnedFd, tx: Sender<ProcEvent>, gate: Arc<Gate>) {
+/// 输出屏障句柄：请求读线程先排空当前可读的 PTY 输出。
+///
+/// 句柄只共享控制管道与计数，不借用 `PtySession`，因此可以在 helper 的
+/// shell 事件转发任务或 service 的阻塞线程池中安全使用。
+#[derive(Clone)]
+pub struct BarrierHandle {
+    /// 控制管道写端、请求/确认计数与输出序号。
+    inner: Arc<BarrierControl>,
+}
+
+impl BarrierHandle {
+    /// 请求读线程排空当前可读输出并等待确认。
+    ///
+    /// 等待有 [`crate::DEFAULT_BARRIER_TIMEOUT`] 之类的上限由调用方传入；
+    /// 超时返回 [`ProcError::BarrierTimeout`]，调用方应退化为静默判定。
+    pub fn barrier(&self, timeout: Duration) -> Result<BarrierReport, ProcError> {
+        self.inner.barrier(timeout)
+    }
+}
+
+/// 屏障内部状态：请求数、确认数、确认时的输出序号与关闭标志。
+#[derive(Debug, Default)]
+struct BarrierState {
+    /// 已投递的屏障请求数。
+    requested: u64,
+    /// 读线程已处理的请求数。
+    acked: u64,
+    /// 最近一次确认时的输出事件序号。
+    acked_seq: u64,
+    /// 读线程是否已结束（终端退出或输出通道关闭）。
+    closed: bool,
+}
+
+/// 与读线程共享的屏障控制块。
+struct BarrierControl {
+    /// 控制管道写端；同时用于串行化请求，保证令牌与请求 id 一一对应。
+    control: Mutex<OwnedFd>,
+    /// 请求/确认状态。
+    state: Mutex<BarrierState>,
+    /// 状态变化通知。
+    cv: Condvar,
+    /// 读线程累计入队的 `Output` 事件数。
+    output_seq: AtomicU64,
+}
+
+impl BarrierControl {
+    /// 用控制管道写端创建控制块。
+    fn new(control: OwnedFd) -> Self {
+        Self {
+            control: Mutex::new(control),
+            state: Mutex::new(BarrierState::default()),
+            cv: Condvar::new(),
+            output_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// 当前已入队的输出事件数。
+    fn output_seq(&self) -> u64 {
+        self.output_seq.load(Ordering::SeqCst)
+    }
+
+    /// 读线程即将入队一条输出前递增序号。
+    fn note_output(&self) {
+        self.output_seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 投递一次屏障请求并等待读线程确认。
+    ///
+    /// 读线程已结束时直接返回当前输出序号（此时不会再有新输出，顺序已确定）；
+    /// 只有等待超时才返回 [`ProcError::BarrierTimeout`]。
+    fn barrier(&self, timeout: Duration) -> Result<BarrierReport, ProcError> {
+        let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.closed {
+                return Ok(BarrierReport::Drained {
+                    output_seq: self.output_seq(),
+                });
+            }
+        }
+
+        let request = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.requested = state.requested.saturating_add(1);
+            state.requested
+        };
+        if write_barrier_token(&mut control).is_err() {
+            drop(control);
+            self.mark_closed();
+            return Ok(BarrierReport::Drained {
+                output_seq: self.output_seq(),
+            });
+        }
+        drop(control);
+
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if state.acked >= request {
+                return Ok(BarrierReport::Drained {
+                    output_seq: state.acked_seq,
+                });
+            }
+            if state.closed {
+                return Ok(BarrierReport::Drained {
+                    output_seq: self.output_seq(),
+                });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ProcError::BarrierTimeout);
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = guard;
+        }
+    }
+
+    /// 读线程处理一个请求令牌：排空当前可读输出并确认。
+    ///
+    /// 返回 `false` 表示读线程应停止（输出通道关闭或读取失败）。
+    fn handle_request(&self, master: &OwnedFd, tx: &Sender<ProcEvent>) -> bool {
+        let drained = drain_readable(master, tx, self);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.acked = state.acked.saturating_add(1);
+        state.acked_seq = self.output_seq();
+        if !drained {
+            state.closed = true;
+        }
+        self.cv.notify_all();
+        drained
+    }
+
+    /// 标记读线程结束并唤醒所有等待者（幂等）。
+    fn mark_closed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// 后台读线程：poll PTY 主端与屏障控制管道，直到 EOF（`EIO`/0）。
+///
+/// 控制管道可读时优先处理屏障请求：把“当前已可读”的输出全部入队后再确认，
+/// 从而保证屏障返回时这些 `Output` 已排在后续事件之前。
+fn read_loop(
+    master: OwnedFd,
+    control: OwnedFd,
+    tx: Sender<ProcEvent>,
+    gate: Arc<Gate>,
+    barrier: Arc<BarrierControl>,
+) {
     let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+    let mut control_open = true;
     loop {
-        match nix::unistd::read(&master, &mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                let chunk = buffer[..read].to_vec();
-                let event = ProcEvent::Output {
-                    data: chunk,
-                    stream: OutputStream::Pty,
-                };
-                if tx.blocking_send(event).is_err() {
-                    // 接收端已丢弃：停止读取并让 fd 随作用域关闭。
+        let mut fds = [
+            libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if control_open {
+                    control.as_raw_fd()
+                } else {
+                    -1
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` 是长度为 2 的有效数组，poll 只读写该数组。
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            debug!(error = %error, "poll PTY 失败");
+            break;
+        }
+
+        // 先处理屏障请求：drain 会消费此刻所有可读输出。
+        if control_open && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let mut tokens = [0u8; 64];
+            loop {
+                match nix::unistd::read(&control, &mut tokens) {
+                    Ok(0) => {
+                        // 所有写端已关闭：不再轮询控制管道，避免 POLLHUP 忙等。
+                        control_open = false;
+                        break;
+                    }
+                    Ok(count) => {
+                        for _ in 0..count {
+                            if !barrier.handle_request(&master, &tx) {
+                                barrier.mark_closed();
+                                gate.mark_done();
+                                return;
+                            }
+                        }
+                    }
+                    Err(Errno::EINTR) => continue,
+                    Err(Errno::EAGAIN) => break,
+                    Err(err) => {
+                        debug!(error = %err, "读取屏障控制管道失败");
+                        control_open = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 屏障 drain 可能已经把 fds[0] 的 POLLIN 数据读空；不能仅凭
+        // drain 前的 revents 再做阻塞 read，否则读线程会卡住、后续屏障
+        // 请求只能等下一次输出或进程退出。HUP/ERR 仍需 read 取 EOF。
+        let revents = fds[0].revents;
+        let terminal = revents & (libc::POLLHUP | libc::POLLERR) != 0;
+        if terminal || fd_readable(master.as_raw_fd()) {
+            match nix::unistd::read(&master, &mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    barrier.note_output();
+                    let event = ProcEvent::Output {
+                        data: buffer[..read].to_vec(),
+                        stream: OutputStream::Pty,
+                    };
+                    if tx.blocking_send(event).is_err() {
+                        // 接收端已丢弃：停止读取并让 fd 随作用域关闭。
+                        break;
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EIO) => break,
+                Err(err) => {
+                    debug!(error = %err, "PTY 输出读取结束");
                     break;
                 }
             }
+        }
+    }
+    barrier.mark_closed();
+    gate.mark_done();
+}
+
+/// 排空“投递时刻已可读”的 PTY 输出并全部入队。
+///
+/// 优先用 `FIONREAD` 取快照，避免读到屏障之后才产生的输出；`FIONREAD`
+/// 不可用时退回 `poll(0)` 可见即读。返回 `false` 表示读线程应停止。
+fn drain_readable(master: &OwnedFd, tx: &Sender<ProcEvent>, barrier: &BarrierControl) -> bool {
+    let fd = master.as_raw_fd();
+    let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+    if let Some(mut remaining) = readable_bytes(fd) {
+        while remaining > 0 {
+            let want = remaining.min(buffer.len());
+            match nix::unistd::read(master, &mut buffer[..want]) {
+                Ok(0) => return false,
+                Ok(read) => {
+                    remaining = remaining.saturating_sub(read);
+                    if !send_output(tx, &buffer[..read], barrier) {
+                        return false;
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(err) => {
+                    debug!(error = %err, "排空 PTY 输出失败");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    loop {
+        if !fd_readable(fd) {
+            break;
+        }
+        match nix::unistd::read(master, &mut buffer) {
+            Ok(0) => return false,
+            Ok(read) => {
+                if !send_output(tx, &buffer[..read], barrier) {
+                    return false;
+                }
+            }
             Err(Errno::EINTR) => continue,
-            Err(Errno::EIO) => break,
+            Err(Errno::EAGAIN) => break,
             Err(err) => {
-                debug!(error = %err, "PTY 输出读取结束");
-                break;
+                debug!(error = %err, "排空 PTY 输出失败");
+                return false;
             }
         }
     }
-    gate.mark_done();
+    true
+}
+
+/// 入队一段输出并递增屏障序号；空数据不产生事件。
+fn send_output(tx: &Sender<ProcEvent>, data: &[u8], barrier: &BarrierControl) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    barrier.note_output();
+    tx.blocking_send(ProcEvent::Output {
+        data: data.to_vec(),
+        stream: OutputStream::Pty,
+    })
+    .is_ok()
+}
+
+/// `FIONREAD`：返回投递时刻可从 PTY 主端读取的字节数。
+fn readable_bytes(fd: RawFd) -> Option<usize> {
+    let mut available: libc::c_int = 0;
+    // SAFETY: `fd` 有效；FIONREAD 只写入一个 `c_int`。
+    let result = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut available) };
+    if result == 0 && available >= 0 {
+        Some(available as usize)
+    } else {
+        None
+    }
+}
+
+/// `poll(0)`：当前 fd 是否可读。
+fn fd_readable(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` 是有效的单个 pollfd，超时为 0 不阻塞。
+    let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+    ready > 0 && (pfd.revents & libc::POLLIN) != 0
+}
+
+/// 向控制管道写一个屏障令牌；管道写端关闭时返回错误。
+fn write_barrier_token(control: &mut OwnedFd) -> io::Result<()> {
+    let token = [1u8];
+    let mut offset = 0;
+    while offset < token.len() {
+        match nix::unistd::write(&*control, &token[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "屏障控制管道写入 0 字节",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(io::Error::from(err)),
+        }
+    }
+    Ok(())
 }
 
 /// 后台 wait 线程：回收子进程，等读线程排空后发送唯一的终态事件。
@@ -876,6 +1227,24 @@ fn set_cloexec(fd: RawFd) -> Result<(), ProcError> {
     if ret < 0 {
         return Err(ProcError::PtyFailed {
             message: format!("设置 FD_CLOEXEC 失败: {}", io::Error::last_os_error()),
+        });
+    }
+    Ok(())
+}
+
+/// 对已打开的 fd 设置 `O_NONBLOCK`，供读线程非阻塞消费控制令牌。
+fn set_nonblocking(fd: RawFd) -> Result<(), ProcError> {
+    // SAFETY: `fd` 有效；F_GETFL/F_SETFL 只读写描述符状态标志。
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(ProcError::PtyFailed {
+            message: format!("读取 fd 状态标志失败: {}", io::Error::last_os_error()),
+        });
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(ProcError::PtyFailed {
+            message: format!("设置 O_NONBLOCK 失败: {}", io::Error::last_os_error()),
         });
     }
     Ok(())

@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use termx_protocol::ProcNode;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -44,7 +45,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
 
-use crate::{OutputStream, ProcError, ProcEvent, PtyConfig, normalize_signal};
+use crate::{BarrierReport, OutputStream, ProcError, ProcEvent, PtyConfig, normalize_signal};
 
 /// 事件通道容量；读线程满时通过 `blocking_send` 施加背压。
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -79,6 +80,27 @@ pub struct PtySession {
     hpc: SharedConsole,
     /// `terminate` 是否已执行（幂等标记）。
     terminated: bool,
+}
+
+/// Windows ConPTY 不提供输出屏障的控制通道。
+///
+/// 调用 `barrier` 明确返回 [`BarrierReport::Unsupported`]；service/helper 的
+/// D 事件排序逻辑据此跳过等待，保持既有行为。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BarrierHandle;
+
+impl BarrierHandle {
+    /// 明确不支持输出屏障。
+    pub fn barrier(&self, _timeout: Duration) -> Result<BarrierReport, ProcError> {
+        Ok(BarrierReport::Unsupported)
+    }
+}
+
+impl PtySession {
+    /// Windows 无内部屏障控制通道：返回 no-op 句柄。
+    pub fn barrier_handle(&self) -> BarrierHandle {
+        BarrierHandle
+    }
 }
 
 impl PtySession {

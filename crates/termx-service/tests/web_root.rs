@@ -182,8 +182,12 @@ fn web_ssh_form_converges_runtime_and_helper_fields() {
     let index = include_str!("../src/web_assets/index.html");
 
     assert!(
-        !index.contains("termx-create-ssh-runtime") && !index.contains("系统 shell"),
-        "SSH 表单不应再提供系统 shell 运行环境"
+        !index.contains("系统 shell") && index.contains("termx-create-ssh-runtime"),
+        "SSH 表单应提供 termx-pwsh/termx-bash，且不再提供系统 shell"
+    );
+    assert!(
+        index.contains("termx-bash"),
+        "SSH 表单应提供 termx-bash 运行环境"
     );
     assert!(
         index.contains("留空自动尝试 ~/.ssh/id_ed25519 / ~/.ssh/id_rsa"),
@@ -205,8 +209,8 @@ fn web_ssh_form_converges_runtime_and_helper_fields() {
     }
 
     assert!(
-        app.contains("params.cmd = \"termx-pwsh\""),
-        "app.js 应固定把 termx-pwsh 映射为 cmd"
+        app.contains("termx-bash") && app.contains("termx-pwsh"),
+        "app.js 应支持 termx-pwsh/termx-bash 的 SSH 运行环境映射"
     );
     assert!(
         !app.contains("私钥路径不能为空") && app.contains("{ type: \"key\", path: path }"),

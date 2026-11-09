@@ -128,6 +128,7 @@
     elements.createKeyGroup = document.getElementById("termx-create-key-group");
     elements.createKeyPath = document.getElementById("termx-create-key-path");
     elements.createKeyPassphrase = document.getElementById("termx-create-key-passphrase");
+    elements.createSshRuntime = document.getElementById("termx-create-ssh-runtime");
     elements.createKeyPassphraseToggle = document.getElementById(
       "termx-create-key-passphrase-toggle"
     );
@@ -1718,6 +1719,9 @@
     setInputValue(elements.createHost, "");
     setInputValue(elements.createPort, "22");
     setInputValue(elements.createUser, "");
+    if (elements.createSshRuntime) {
+      elements.createSshRuntime.value = "termx-pwsh";
+    }
     if (elements.createAuth) {
       elements.createAuth.value = "password";
     }
@@ -2640,8 +2644,11 @@
         throw new Error("SSH 用户不能为空");
       }
       var port = parseInteger(elements.createPort, 1, 65535, "端口");
-      // SSH 表单固定使用 termx-pwsh（结构化事件）；普通 ssh 走本地自定义程序（raw-only）。
-      params.cmd = "termx-pwsh";
+      // SSH 表单可选 termx-pwsh / termx-bash；普通 ssh 走本地自定义程序（raw-only）。
+      params.cmd =
+        elements.createSshRuntime && elements.createSshRuntime.value === "termx-bash"
+          ? "termx-bash"
+          : "termx-pwsh";
       params.args = [];
       params.ssh = buildSshConfig(host, port, user);
       return params;
