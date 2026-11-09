@@ -702,6 +702,56 @@ pub struct RuntimeListResult {
     pub runtimes: Vec<RuntimeInfo>,
 }
 
+/// `ssh.history.list` 参数；当前不需要任何字段。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHistoryListParams {}
+
+/// SSH 连接历史条目；不包含密码、私钥口令或私钥路径。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHistoryEntry {
+    /// 主机名或 IP。
+    pub host: String,
+    /// 端口。
+    pub port: u16,
+    /// 登录用户。
+    pub user: String,
+    /// 认证方式：`password` / `key`。
+    pub auth_type: String,
+    /// 成功连接次数。
+    pub use_count: u64,
+    /// 最近一次成功连接时间（RFC3339 UTC）。
+    pub last_used: String,
+}
+
+/// `ssh.history.list` 结果；按 `last_used` 降序。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHistoryListResult {
+    /// 历史条目。
+    pub entries: Vec<SshHistoryEntry>,
+}
+
+/// `ssh.history.remove` 参数：按 host + port + user 定位单条记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHistoryRemoveParams {
+    /// 主机名或 IP。
+    pub host: String,
+    /// 端口。
+    pub port: u16,
+    /// 登录用户。
+    pub user: String,
+}
+
+/// `ssh.history.clear` 参数；当前不需要任何字段。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHistoryClearParams {}
+
+/// SSH 历史变更结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHistoryMutationResult {
+    /// 被删除的记录数。
+    pub removed: usize,
+}
+
 /// `terminal.create` 结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateResult {

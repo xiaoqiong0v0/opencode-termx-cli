@@ -35,6 +35,8 @@ const TERMX_MAX_TERMINALS_ENV: &str = "TERMX_MAX_TERMINALS";
 const TERMX_STDIO_WRITE_QUEUE_ENV: &str = "TERMX_STDIO_WRITE_QUEUE";
 /// 覆盖每终端命令记录容量的环境变量。
 const TERMX_TRANSCRIPT_CAPACITY_ENV: &str = "TERMX_TRANSCRIPT_CAPACITY";
+/// 覆盖 SSH 连接历史条数上限的环境变量；`0` 表示禁用历史。
+const TERMX_SSH_HISTORY_LIMIT_ENV: &str = "TERMX_SSH_HISTORY_LIMIT";
 /// Web 登录密码；只从环境变量读取，不进入命令行与日志输出。
 const TERMX_WEB_PASSWORD_ENV: &str = "TERMX_WEB_PASSWORD";
 /// 覆盖「无存活会话」超时的环境变量，单位为毫秒；`0` 表示关闭。
@@ -97,6 +99,8 @@ pub const DEFAULT_STDIO_WRITE_QUEUE_CAPACITY: usize =
     termx_proc::DEFAULT_STDIO_WRITE_QUEUE_CAPACITY;
 /// 文件日志默认保留天数（含当天）。
 pub const DEFAULT_LOG_MAX_DAYS: u32 = 7;
+/// SSH 连接历史默认条数上限；`0` 表示禁用历史。
+pub const DEFAULT_SSH_HISTORY_LIMIT: usize = crate::ssh_history::DEFAULT_SSH_HISTORY_LIMIT;
 
 /// 无存活会话超过超时后的处理策略。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -431,6 +435,8 @@ pub struct ServiceConfig {
     pub event_buffer_capacity: usize,
     /// 每个终端的命令记录容量（条）；缺省 200。
     pub transcript_capacity: usize,
+    /// SSH 连接历史条数上限；`0` 表示禁用历史。
+    pub ssh_history_limit: usize,
     /// 每个订阅者的有界事件队列容量；缺省 1024。
     pub subscriber_queue_capacity: usize,
     /// 自定义 token 文件路径；`Some` 时优先于 `TERMX_TOKEN` 与默认文件。
@@ -486,6 +492,7 @@ impl fmt::Debug for ServiceConfig {
             .field("bind_addr", &self.bind_addr)
             .field("event_buffer_capacity", &self.event_buffer_capacity)
             .field("transcript_capacity", &self.transcript_capacity)
+            .field("ssh_history_limit", &self.ssh_history_limit)
             .field("subscriber_queue_capacity", &self.subscriber_queue_capacity)
             .field("token_file", &self.token_file)
             .field("max_frame_bytes", &self.max_frame_bytes)
@@ -531,6 +538,7 @@ impl ServiceConfig {
             bind_addr: DEFAULT_BIND_ADDR,
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
+            ssh_history_limit: DEFAULT_SSH_HISTORY_LIMIT,
             subscriber_queue_capacity: DEFAULT_SUBSCRIBER_QUEUE_CAPACITY,
             token_file: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
@@ -591,6 +599,13 @@ impl ServiceConfig {
     #[must_use]
     pub fn with_transcript_capacity(mut self, transcript_capacity: usize) -> Self {
         self.transcript_capacity = transcript_capacity.max(1);
+        self
+    }
+
+    /// 覆盖 SSH 连接历史条数上限；`0` 表示禁用历史。
+    #[must_use]
+    pub fn with_ssh_history_limit(mut self, ssh_history_limit: usize) -> Self {
+        self.ssh_history_limit = ssh_history_limit;
         self
     }
 
@@ -767,6 +782,8 @@ impl ServiceConfig {
         config.max_terminals = positive_usize_from_env(TERMX_MAX_TERMINALS_ENV, &env);
         config.transcript_capacity = positive_usize_from_env(TERMX_TRANSCRIPT_CAPACITY_ENV, &env)
             .unwrap_or(DEFAULT_TRANSCRIPT_CAPACITY);
+        config.ssh_history_limit =
+            usize_from_env(TERMX_SSH_HISTORY_LIMIT_ENV, &env).unwrap_or(DEFAULT_SSH_HISTORY_LIMIT);
         config.stdio_write_queue_capacity =
             positive_usize_from_env(TERMX_STDIO_WRITE_QUEUE_ENV, &env)
                 .unwrap_or(DEFAULT_STDIO_WRITE_QUEUE_CAPACITY);
@@ -849,6 +866,16 @@ fn clamp_non_zero(interval: Duration) -> Duration {
     } else {
         interval
     }
+}
+
+/// 读取非负整数的环境变量；缺失或非法返回 `None`（`0` 有效）。
+fn usize_from_env<F>(name: &str, env: F) -> Option<usize>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env(name)
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
 /// 读取正整数值的环境变量；缺失、非法或 0 返回 `None`。
@@ -1125,6 +1152,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_history_limit_reads_env_and_allows_zero() {
+        let default = ServiceConfig::new(PathBuf::from("/tmp/termx"));
+        assert_eq!(default.ssh_history_limit, 64);
+
+        let custom = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_SSH_HISTORY_LIMIT_ENV).then(|| OsString::from("4"))
+        });
+        assert_eq!(custom.ssh_history_limit, 4);
+
+        let disabled = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+            (key == TERMX_SSH_HISTORY_LIMIT_ENV).then(|| OsString::from("0"))
+        });
+        assert_eq!(disabled.ssh_history_limit, 0, "0 表示禁用历史");
+
+        for invalid in ["abc", "-1", "  "] {
+            let fallback = ServiceConfig::from_env_with(PathBuf::from("/tmp/termx"), |key| {
+                (key == TERMX_SSH_HISTORY_LIMIT_ENV).then(|| OsString::from(invalid))
+            });
+            assert_eq!(fallback.ssh_history_limit, 64, "非法值 {invalid:?}");
+        }
+    }
+
+    #[test]
     fn interaction_settings_read_env_with_defaults() {
         let defaults = ServiceConfig::new(PathBuf::from("/tmp/termx"));
         assert_eq!(
@@ -1234,6 +1284,12 @@ mod tests {
             PathBuf::from("/tmp/termx").join(PORT_FILE_NAME)
         );
         assert_eq!(config.event_buffer_capacity, DEFAULT_EVENT_BUFFER_CAPACITY);
+        assert_eq!(config.ssh_history_limit, DEFAULT_SSH_HISTORY_LIMIT);
+        assert_eq!(config.ssh_history_limit, 64);
+        assert_eq!(
+            config.clone().with_ssh_history_limit(4).ssh_history_limit,
+            4
+        );
         assert_eq!(
             config
                 .clone()

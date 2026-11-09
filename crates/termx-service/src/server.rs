@@ -24,9 +24,10 @@ use termx_protocol::{
     OutputParams, PROTOCOL_VERSION, ProtocolError, PruneParams, ReadParams, RebindParams,
     ReleaseParams, Request, ResizeParams, Response, RuntimeInfo, RuntimeListResult, SendParams,
     SessionInfo, SessionListParams, SessionListResult, SignalParams, SimpleResult, SshAuth,
-    StatusParams, StatusResult, Stream, SubscribeParams, SubscribeResult, SubscriptionCursor,
-    TerminalLocator, TerminalSnapshot, TerminateParams, TranscriptParams, UnsubscribeParams,
-    WEB_ROOT_SESSION_ID, from_json, to_json,
+    SshHistoryClearParams, SshHistoryListParams, SshHistoryListResult, SshHistoryMutationResult,
+    SshHistoryRemoveParams, StatusParams, StatusResult, Stream, SubscribeParams, SubscribeResult,
+    SubscriptionCursor, TerminalLocator, TerminalSnapshot, TerminateParams, TranscriptParams,
+    UnsubscribeParams, WEB_ROOT_SESSION_ID, from_json, to_json,
 };
 use termx_runtime::{RuntimeCatalog, RuntimeError};
 use time::OffsetDateTime;
@@ -58,6 +59,7 @@ use crate::marker;
 use crate::shell_events::{
     EVENT_ENDPOINT_ENV, EVENT_TOKEN_ENV, ShellEventCancel, ShellEventChannel, ShellEventTracker,
 };
+use crate::ssh_history::SshHistory;
 use crate::web::WebServer;
 
 /// 服务端标识，随包版本变化。
@@ -349,6 +351,8 @@ pub struct Service {
     registry: Arc<Mutex<Registry>>,
     /// 启动时读取的本地 runtime catalog；加载失败时为空。
     runtimes: Arc<RuntimeCatalog>,
+    /// SSH 连接历史（只保存非敏感字段）。
+    ssh_history: Arc<SshHistory>,
     /// `web_port > 0` 时预先绑定的 Web 监听器。
     web: Option<WebServer>,
 }
@@ -430,6 +434,11 @@ impl Service {
             );
         }
         let runtimes = Arc::new(runtimes);
+        // 历史文件按需读取/写入；启动时不因缺失或损坏失败。
+        let ssh_history = Arc::new(SshHistory::new(
+            &config.config_dir,
+            config.ssh_history_limit,
+        ));
 
         tracing::info!(
             addr = %local_addr,
@@ -445,6 +454,7 @@ impl Service {
             token,
             registry,
             runtimes,
+            ssh_history,
             web,
         })
     }
@@ -541,6 +551,7 @@ impl Service {
                         subscriber_queue_capacity: self.config.subscriber_queue_capacity,
                         remote_injection: Arc::new(self.config.remote_injection.clone()),
                         known_hosts_path: Arc::new(self.config.known_hosts_path()),
+                        ssh_history: Arc::clone(&self.ssh_history),
                     };
                     tokio::spawn(async move {
                         if let Err(error) = handle_connection(stream, token, resources).await {
@@ -830,6 +841,8 @@ struct ConnectionResources {
     remote_injection: Arc<RemoteInjectionConfig>,
     /// SSH known_hosts 路径；服务端配置目录下，不来自客户端。
     known_hosts_path: Arc<PathBuf>,
+    /// SSH 连接历史；成功创建 SSH 终端后记录。
+    ssh_history: Arc<SshHistory>,
 }
 
 /// 处理单个客户端连接：完成 `hello` 鉴权，成功则保持连接。
@@ -1040,6 +1053,7 @@ where
         subscriber_queue_capacity,
         remote_injection,
         known_hosts_path,
+        ssh_history,
     } = resources;
     let (sink, mut stream) = ws.split();
     let (out_tx, out_rx) = unbounded_channel::<Message>();
@@ -1071,6 +1085,7 @@ where
         sessions: &sessions,
         remote_injection: &remote_injection,
         known_hosts_path: known_hosts_path.as_path(),
+        ssh_history: &ssh_history,
         out_tx: &out_tx,
         event_tx: &event_tx,
         shutdown: &mut shutdown_rx,
@@ -1197,6 +1212,8 @@ struct ReadContext<'a> {
     remote_injection: &'a RemoteInjectionConfig,
     /// 服务端 known_hosts 路径。
     known_hosts_path: &'a Path,
+    /// SSH 连接历史；`terminal.create` 成功后记录。
+    ssh_history: &'a Arc<SshHistory>,
     /// 连接出站队列。
     out_tx: &'a UnboundedSender<Message>,
     /// 订阅事件发送端。
@@ -1256,6 +1273,7 @@ where
                     context.sessions,
                     context.remote_injection,
                     context.known_hosts_path,
+                    context.ssh_history,
                     context.out_tx,
                     context.event_tx,
                 )
@@ -1282,6 +1300,7 @@ async fn handle_rpc_text(
     sessions: &SessionBook,
     remote_injection: &RemoteInjectionConfig,
     known_hosts_path: &Path,
+    ssh_history: &Arc<SshHistory>,
     out_tx: &UnboundedSender<Message>,
     event_tx: &Sender<Event>,
 ) -> Result<(), ServiceError> {
@@ -1296,6 +1315,7 @@ async fn handle_rpc_text(
                 sessions,
                 remote_injection,
                 known_hosts_path,
+                ssh_history,
                 event_tx,
             )
             .await?
@@ -1325,6 +1345,7 @@ async fn dispatch_request(
     sessions: &SessionBook,
     remote_injection: &RemoteInjectionConfig,
     known_hosts_path: &Path,
+    ssh_history: &Arc<SshHistory>,
     event_tx: &Sender<Event>,
 ) -> Result<Response, ServiceError> {
     let Request { id, method, params } = request;
@@ -1380,6 +1401,120 @@ async fn dispatch_request(
             };
             Ok(ok_response(id, serde_json::to_value(result)?))
         }
+        "ssh.history.list" => {
+            if !caller.admin {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::PermissionDenied,
+                    "ssh.history.list 仅管理员可用",
+                ));
+            }
+            let _params: SshHistoryListParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("ssh.history.list 参数非法: {error}"),
+                    ));
+                }
+            };
+            let history = Arc::clone(ssh_history);
+            match tokio::task::spawn_blocking(move || history.list()).await {
+                Ok(Ok(entries)) => Ok(ok_response(
+                    id,
+                    serde_json::to_value(SshHistoryListResult { entries })?,
+                )),
+                Ok(Err(error)) => Ok(error_response(
+                    id,
+                    ErrorCode::Internal,
+                    format!("读取 SSH 历史失败: {error}"),
+                )),
+                Err(error) => Ok(error_response(
+                    id,
+                    ErrorCode::Internal,
+                    format!("读取 SSH 历史任务失败: {error}"),
+                )),
+            }
+        }
+        "ssh.history.remove" => {
+            if !caller.admin {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::PermissionDenied,
+                    "ssh.history.remove 仅管理员可用",
+                ));
+            }
+            let params: SshHistoryRemoveParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("ssh.history.remove 参数非法: {error}"),
+                    ));
+                }
+            };
+            let history = Arc::clone(ssh_history);
+            match tokio::task::spawn_blocking(move || {
+                history.remove(&params.host, params.port, &params.user)
+            })
+            .await
+            {
+                Ok(Ok(removed)) => Ok(ok_response(
+                    id,
+                    serde_json::to_value(SshHistoryMutationResult {
+                        removed: usize::from(removed),
+                    })?,
+                )),
+                Ok(Err(error)) => Ok(error_response(
+                    id,
+                    ErrorCode::Internal,
+                    format!("删除 SSH 历史失败: {error}"),
+                )),
+                Err(error) => Ok(error_response(
+                    id,
+                    ErrorCode::Internal,
+                    format!("删除 SSH 历史任务失败: {error}"),
+                )),
+            }
+        }
+        "ssh.history.clear" => {
+            if !caller.admin {
+                return Ok(error_response(
+                    id,
+                    ErrorCode::PermissionDenied,
+                    "ssh.history.clear 仅管理员可用",
+                ));
+            }
+            let _params: SshHistoryClearParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(error_response(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("ssh.history.clear 参数非法: {error}"),
+                    ));
+                }
+            };
+            let history = Arc::clone(ssh_history);
+            match tokio::task::spawn_blocking(move || history.clear()).await {
+                Ok(Ok(removed)) => Ok(ok_response(
+                    id,
+                    serde_json::to_value(SshHistoryMutationResult { removed })?,
+                )),
+                Ok(Err(error)) => Ok(error_response(
+                    id,
+                    ErrorCode::Internal,
+                    format!("清空 SSH 历史失败: {error}"),
+                )),
+                Err(error) => Ok(error_response(
+                    id,
+                    ErrorCode::Internal,
+                    format!("清空 SSH 历史任务失败: {error}"),
+                )),
+            }
+        }
         "terminal.create" => {
             let params: CreateParams = match serde_json::from_value(params) {
                 Ok(params) => params,
@@ -1399,6 +1534,7 @@ async fn dispatch_request(
                 runtimes,
                 remote_injection,
                 known_hosts_path,
+                ssh_history,
             )
             .await
         }
@@ -1845,6 +1981,36 @@ fn ssh_needs_helper(cmd: &str) -> bool {
         .is_some_and(|name| name == SHELL_EVENT_RUNTIME_ID)
 }
 
+/// SSH 历史记录键：host、port、user、auth_type。
+type SshHistoryRecord = (String, u16, String, &'static str);
+
+/// 从创建参数提取历史键；只取非敏感字段，host/user 为空时忽略。
+fn ssh_history_record(params: &CreateParams) -> Option<SshHistoryRecord> {
+    let ssh = params.ssh.as_ref()?;
+    let host = ssh.host.trim();
+    let user = ssh.user.trim();
+    if host.is_empty() || user.is_empty() {
+        return None;
+    }
+    let auth_type = match &ssh.auth {
+        SshAuth::Password { .. } => "password",
+        SshAuth::Key { .. } => "key",
+    };
+    Some((host.to_string(), ssh.port, user.to_string(), auth_type))
+}
+
+/// 记录一次成功的 SSH 连接；任何失败只记日志，不影响创建响应。
+async fn record_ssh_history(history: Arc<SshHistory>, record: Option<SshHistoryRecord>) {
+    let Some((host, port, user, auth_type)) = record else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || history.record(&host, port, &user, auth_type)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "记录 SSH 连接历史失败"),
+        Err(error) => tracing::warn!(%error, "SSH 连接历史任务失败"),
+    }
+}
+
 /// 默认私钥候选（相对用户 home，按探测顺序）。
 const DEFAULT_SSH_KEY_CANDIDATES: [&str; 2] = [".ssh/id_ed25519", ".ssh/id_rsa"];
 
@@ -1892,7 +2058,10 @@ async fn handle_create(
     runtimes: &RuntimeCatalog,
     remote_injection: &RemoteInjectionConfig,
     known_hosts_path: &Path,
+    ssh_history: &Arc<SshHistory>,
 ) -> Result<Response, ServiceError> {
+    // 只在创建成功后落历史；先捕获非敏感字段，避免 params 被移动后丢失。
+    let history_record = ssh_history_record(&params);
     // runtime_id 指向本机 runtime，ssh 指向远端主机，两者语义冲突，先拒绝再解析。
     if params.runtime_id.is_some() && params.ssh.is_some() {
         return Ok(error_response(
@@ -2016,6 +2185,8 @@ async fn handle_create(
     if let Some(displaced) = displaced {
         terminate_backend(displaced).await;
     }
+    // 注册成功才记录历史；失败/取消路径在上面提前返回，不会落盘。
+    record_ssh_history(Arc::clone(ssh_history), history_record).await;
 
     tokio::spawn(ingest_proc_events(
         Arc::clone(registry),

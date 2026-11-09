@@ -70,6 +70,8 @@
   var lastSessions = [];
   // 最近一次 runtime.list 结果；失败时为空数组，表单保持自定义模式。
   var lastRuntimes = [];
+  // 最近一次 ssh.history.list 结果；只含非敏感字段，用于“最近连接”下拉。
+  var lastSshHistory = [];
   // 当前选中的 opencode 会话（两级选择的第一级）。
   var selectedSession = null;
   // 迁移请求在飞时禁用弹窗提交/取消。
@@ -129,6 +131,8 @@
     elements.createKeyPassphraseToggle = document.getElementById(
       "termx-create-key-passphrase-toggle"
     );
+    elements.createHistoryGroup = document.getElementById("termx-create-history-group");
+    elements.createHistory = document.getElementById("termx-create-history");
     elements.createAnyHostKey = document.getElementById("termx-create-any-host-key");
     elements.createCols = document.getElementById("termx-create-cols");
     elements.createRows = document.getElementById("termx-create-rows");
@@ -334,6 +338,9 @@
     }
     if (elements.createAuth) {
       elements.createAuth.addEventListener("change", updateCreateAuth);
+    }
+    if (elements.createHistory) {
+      elements.createHistory.addEventListener("change", applyCreateHistory);
     }
     bindSecretToggle(
       elements.createPasswordToggle,
@@ -1654,6 +1661,8 @@
     renderCreateSessions(lastSessions, selectedSession || WEB_ROOT_SESSION_ID);
     renderCreateRuntimes(lastRuntimes, "");
     showCreateDialog();
+    // 最近连接失败不阻塞创建；空历史时下拉隐藏。
+    loadCreateHistory();
     // runtime.list 失败不阻塞创建：保持“自定义 cmd/args”。
     rpc("runtime.list", {}).then(
       function (result) {
@@ -1722,6 +1731,10 @@
     }
     setInputValue(elements.createCols, String(DEFAULT_COLS));
     setInputValue(elements.createRows, String(DEFAULT_ROWS));
+    if (elements.createHistory) {
+      elements.createHistory.value = "";
+    }
+    updateCreateHistoryVisibility();
     updateCreateType();
     updateCreateAuth();
     updateCreateSubmit();
@@ -1732,6 +1745,103 @@
     if (element) {
       element.value = value;
     }
+  }
+
+  /** 读取 SSH 最近连接；失败或为空时隐藏下拉，不阻塞创建。 */
+  function loadCreateHistory() {
+    lastSshHistory = [];
+    renderCreateHistory(lastSshHistory);
+    rpc("ssh.history.list", {}).then(
+      function (result) {
+        if (!isCreateDialogOpen()) {
+          return;
+        }
+        lastSshHistory = normalizeSshHistory(result);
+        renderCreateHistory(lastSshHistory);
+      },
+      function () {
+        if (!isCreateDialogOpen()) {
+          return;
+        }
+        lastSshHistory = [];
+        renderCreateHistory(lastSshHistory);
+      }
+    );
+  }
+
+  /** `ssh.history.list` 结果统一成数组。 */
+  function normalizeSshHistory(result) {
+    if (result && Array.isArray(result.entries)) {
+      return result.entries;
+    }
+    if (Array.isArray(result)) {
+      return result;
+    }
+    return [];
+  }
+
+  /** 渲染“最近连接”下拉；空历史隐藏整行。 */
+  function renderCreateHistory(entries) {
+    var select = elements.createHistory;
+    var group = elements.createHistoryGroup;
+    if (!select || !group) {
+      return;
+    }
+    while (select.firstChild) {
+      select.removeChild(select.firstChild);
+    }
+    if (!entries.length) {
+      appendOptionTo(select, "", "暂无最近连接", null);
+      updateCreateHistoryVisibility();
+      return;
+    }
+    appendOptionTo(select, "", "选择最近连接…", null);
+    for (var i = 0; i < entries.length; i += 1) {
+      var entry = entries[i];
+      if (!entry || !entry.host || !entry.user) {
+        continue;
+      }
+      var label = entry.user + "@" + entry.host + ":" + entry.port;
+      if (entry.auth_type) {
+        label += " · " + (entry.auth_type === "key" ? "私钥" : "密码");
+      }
+      appendOptionTo(select, String(i), label, null);
+    }
+    select.value = "";
+    updateCreateHistoryVisibility();
+  }
+
+  /** 按是否有历史控制下拉显隐与禁用。 */
+  function updateCreateHistoryVisibility() {
+    var select = elements.createHistory;
+    var group = elements.createHistoryGroup;
+    if (!select || !group) {
+      return;
+    }
+    var hasHistory = lastSshHistory.length > 0;
+    select.disabled = !hasHistory;
+    group.classList.toggle("termx-form-hidden", !hasHistory);
+  }
+
+  /** 选择历史后只填 host/port/user/auth_type，不填密码/口令/私钥路径。 */
+  function applyCreateHistory() {
+    var select = elements.createHistory;
+    var index = select ? Number(select.value) : -1;
+    var entry = index >= 0 ? lastSshHistory[index] : null;
+    if (!entry || !entry.host) {
+      return;
+    }
+    setInputValue(elements.createHost, entry.host);
+    setInputValue(elements.createPort, String(entry.port || 22));
+    setInputValue(elements.createUser, entry.user || "");
+    if (elements.createAuth) {
+      elements.createAuth.value = entry.auth_type === "key" ? "key" : "password";
+    }
+    // 历史不含密码/口令/私钥路径；清空旧输入避免串用其他主机。
+    clearCreateSecrets();
+    setInputValue(elements.createKeyPath, "");
+    updateCreateAuth();
+    updateCreateSubmit();
   }
 
   /** `runtime.list` 结果统一成数组。 */

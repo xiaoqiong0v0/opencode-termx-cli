@@ -96,6 +96,7 @@ export interface TermxConfig {
   log: { maxDays: number };
   limits: {
     maxTerminals: number;
+    sshHistoryLimit: number;
     clientIdlePolicy: ClientIdlePolicy;
     clientIdleTimeoutMs: number;
   };
@@ -116,6 +117,8 @@ const DEFAULT_SERVICE_BIN = "termx-service";
 const DEFAULT_LOG_MAX_DAYS = 7;
 /** 默认同时运行终端上限。 */
 const DEFAULT_MAX_TERMINALS = 16;
+/** 默认 SSH 连接历史条数上限；0 表示禁用。 */
+const DEFAULT_SSH_HISTORY_LIMIT = 64;
 /** 默认无存活会话超时（毫秒）；0 表示关闭。 */
 const DEFAULT_CLIENT_IDLE_TIMEOUT_MS = 300_000;
 /** 默认无存活会话到期策略。 */
@@ -185,6 +188,8 @@ const TEMPLATE = `{
   "limits": {
     // 同时运行终端上限
     "maxTerminals": ${DEFAULT_MAX_TERMINALS},
+    // SSH 连接历史条数上限；0 表示禁用
+    "sshHistoryLimit": ${DEFAULT_SSH_HISTORY_LIMIT},
     // 无存活 opencode 会话时的到期策略：never / no_children / any
     "clientIdlePolicy": "${DEFAULT_CLIENT_IDLE_POLICY}",
     // 无存活 opencode 会话超时（毫秒）；0 表示关闭
@@ -310,6 +315,7 @@ function normalizeConfig(raw: unknown): TermxConfig {
     log: { maxDays: asInt(logCfg.maxDays, DEFAULT_LOG_MAX_DAYS, 1, 3650) },
     limits: {
       maxTerminals: asInt(limits.maxTerminals, DEFAULT_MAX_TERMINALS, 1, 4096),
+      sshHistoryLimit: asInt(limits.sshHistoryLimit, DEFAULT_SSH_HISTORY_LIMIT, 0, 4096),
       clientIdlePolicy: asClientIdlePolicy(limits.clientIdlePolicy),
       clientIdleTimeoutMs: asInt(
         limits.clientIdleTimeoutMs,

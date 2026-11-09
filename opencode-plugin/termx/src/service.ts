@@ -194,6 +194,7 @@ function buildServiceEnv(config: TermxConfig): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     TERMX_MAX_TERMINALS: String(config.limits.maxTerminals),
+    TERMX_SSH_HISTORY_LIMIT: String(config.limits.sshHistoryLimit),
     TERMX_CLIENT_IDLE_POLICY: config.limits.clientIdlePolicy,
     TERMX_CLIENT_IDLE_TIMEOUT_MS: String(config.limits.clientIdleTimeoutMs),
     TERMX_INTERACTION_TICK_MS: String(config.interaction.tickMs),

@@ -75,6 +75,9 @@
 | `session_closed` | `{ root_session_id }` | `{ ok }` |
 | `session.list` | `{}` | `{ sessions: [{ root_session_id, live, last_seen_ms?, terminals }] }` |
 | `runtime.list` | `{}` | `{ runtimes: [{ id, name, version, platform, arch, available }] }`；只含当前平台兼容项，不含本机路径 |
+| `ssh.history.list` | `{}` | `{ entries: [{ host, port, user, auth_type, use_count, last_used }] }`；仅管理员，按 `last_used` 降序，不含密码/口令/私钥路径 |
+| `ssh.history.remove` | `{ host, port, user }` | `{ removed }`；仅管理员，按 host+port+user 删除单条 |
+| `ssh.history.clear` | `{}` | `{ removed }`；仅管理员，清空全部历史 |
 | `terminal.create` | `{ mode: "pty"\|"stdio", cmd?, args?, cwd?, env?, cols?, rows?, root_session_id, name, force?, idle_timeout?: {value, unit:"s"\|"ms", action?: "detach"\|"terminate"}, ssh?: { host, port, user, auth, helper_path?, helper_local_path?, helper_sha256?, upload_helper?, host_key_policy?, trusted_host_key? }, runtime_id?, allow_injection? }` | `{ terminal_id, cursor }` |
 | `terminal.claim` | `{ locator, force? }` | `{ owner, lease }` |
 | `terminal.release` | `{ locator }` | `{ ok }` |
@@ -110,6 +113,7 @@
   - helper 不可用（未配置、预检失败、注入不可用、上传/摘要/握手/版本/`spawn` 失败）：关闭 helper 通道并回退 fallback（`helper:false`、`bestEffort:true`、`version:"russh-fallback"`），不阻塞普通命令。`consent_required` 例外：必须原样返回给客户端，不 fallback。请求包含 `cwd`/`env` 时因 fallback 无法应用而返回 `bad_request`（SSH 层同样拒绝，不只依赖 core 工厂）。
   - fallback 远端 `pid`/`pgid` 为 `0`；`foreground_pgrp` 缺省、`tree` 为空；无 `exit-status`（仅 channel 关闭）时退出码为 `-1`（best-effort）。
   - 终端级能力经 `attach`/`status` 的 `snapshot.capabilities` 暴露（见 §7）；`hello.capabilities` 是服务级声明，不代表任一终端的 helper 状态。
+- `ssh.history.*`：仅 `admin:true` 连接可用（普通连接返回 `permission_denied`）。历史只在 SSH `terminal.create` 成功后写入；失败/取消/`consent_required`/主机密钥未知或变化均不写。去重键 `host + port + user`，成功一次 `use_count += 1` 并刷新 `last_used`；超限按 `use_count` 最小淘汰，相同 `use_count` 淘汰 `last_used` 最旧。存储为 `<config_dir>/ssh_history.json`（Unix `0600`、原子写、跨进程锁、损坏按空处理），字段只含 `host/port/user/auth_type/use_count/last_used`，**不含**密码、私钥口令或私钥路径。
 - `env?` 为 **JSON 对象 map**（如 `{"TERM":"xterm-256color"}`），不是元组/二元数组。
 - `idle_timeout` 省略或 `value=0` 表示**永不超时**；`action` 仅在 `value>0` 时必填，`value=0` 可缺省。默认 `0`。该规则由 `IdleTimeout::validate` 校验，`terminal.create` 在创建终端前调用。
 - `last_activity` 由 `terminal.create` 写入的 `started` 事件初始化；此后在 `output`、`terminal.send`、`terminal.attach`、`terminal.resize` 时刷新为服务端当前时间（RFC3339 UTC）；`idle_timeout` 的 `detach` 动作会在发送 `detached{reason:"idle_timeout"}` 后刷新它，避免同一空闲周期重复触发。

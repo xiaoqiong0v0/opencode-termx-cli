@@ -21,6 +21,7 @@
 | `web.password` | 空 | Web 登录密码；启动方通过环境变量 `TERMX_WEB_PASSWORD` 传给 service，不进命令行/日志 |
 | `log.maxDays` | `7` | service 文件日志保留天数 |
 | `limits.maxTerminals` | `16` | 同时运行终端上限（传给 service env） |
+| `limits.sshHistoryLimit` | `64` | SSH 连接历史条数上限；`0` 关闭（传给 `TERMX_SSH_HISTORY_LIMIT`） |
 | `limits.clientIdlePolicy` | `"no_children"` | 无存活会话到期策略：`never` / `no_children` / `any`（传给 `TERMX_CLIENT_IDLE_POLICY`） |
 | `limits.clientIdleTimeoutMs` | `300000` | 无存活会话超时（毫秒，默认 5 分钟）；`0` 关闭（传给 `TERMX_CLIENT_IDLE_TIMEOUT_MS`） |
 | `interaction.tickMs` | `250` | 交互识别 ticker 周期 |
@@ -41,7 +42,8 @@
 - `TERMX_TOKEN`：覆盖 token 文件。
 - `TERMX_TOOL_LANG` / `TERMX_WEB_LANG`：语言。
 - `TERMX_WEB_PASSWORD`：覆盖 `web.password`（测试/临时用；插件仅在非空时转传给 service）。
-- 其余 service 调参（`TERMX_MAX_TERMINALS`、`TERMX_CLIENT_IDLE_POLICY`、`TERMX_CLIENT_IDLE_TIMEOUT_MS`、`TERMX_INTERACTION_*`）由插件按配置转成 env 传给子进程。
+- 其余 service 调参（`TERMX_MAX_TERMINALS`、`TERMX_SSH_HISTORY_LIMIT`、`TERMX_CLIENT_IDLE_POLICY`、`TERMX_CLIENT_IDLE_TIMEOUT_MS`、`TERMX_INTERACTION_*`）由插件按配置转成 env 传给子进程。
+- `TERMX_SSH_HISTORY_LIMIT`：SSH 连接历史条数上限，默认 `64`；`0` 表示禁用历史记录与列表。
 - `TERMX_CLIENT_IDLE_TIMEOUT_MS`：终端所属 `root_session_id` 无会话心跳的时长上限（毫秒），默认 `300000`（5 分钟），`0` 关闭；与按活动时间的 `idle_timeout` 独立。
 - `TERMX_CLIENT_IDLE_POLICY`：到期策略，默认 `no_children`（仍有用户子进程则继续保活）；`any` 到期即终止；`never` 永不因无会话终止。
 - `TERMX_SESSION_TTL_MS`：会话心跳 TTL（毫秒），默认 `90000`（90 秒）；超过该时间未收到 `heartbeat {root_session_id}` 视为会话结束。
@@ -90,6 +92,7 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
 - **新建终端**：header「新建终端」打开表单，绑定会话（含「其他/未绑定」`@web`）、名称（默认 `default`）、类型 `local`/`ssh`。
   - `local`：程序、参数（空格分隔，支持单/双引号）、cwd、环境变量（每行 `KEY=VALUE`）、cols/rows。
   - `ssh`：host/port/user、密码或私钥路径/口令（私钥路径可留空：service 依次探测本机 `~/.ssh/id_ed25519`、`~/.ssh/id_rsa`，显式路径优先）、固定 `termx-pwsh`（结构化事件；普通 ssh 请用 `local` 自定义程序，raw-only）、cols/rows；helper 路径/上传/摘要由 service 按注入配置自动处理。主机密钥默认 `ask`：未知主机弹出指纹确认，匹配 known_hosts 直接连接，指纹变化硬失败；`accept_any` 仅在高级/不安全选项中显式开启，且不写 known_hosts。回环地址不再默认静默接受。
+  - **最近连接**：SSH 区块顶部提供下拉（`ssh.history.list`），选择后只填充 host/port/user/auth_type，**不填充**密码、私钥口令或私钥路径，并清空表单里已有的秘密输入；空历史或读取失败时隐藏下拉，不阻塞创建。
   - `local` 自定义 cmd/args 不接入 shell 事件：只显示原始控制台，不生成信息页/transcript；模型用 `read --tail-lines`/`--tail-chars`/`search` 获取输出。
   - 提交 `terminal.create`（`mode:"pty"`）；绑定「其他/未绑定」时 `root_session_id` 使用保留值 `@web`。成功后刷新两级选择并选中新终端，失败在弹窗内显示错误。
   - **密码/口令只随本次创建请求发送**（内存表单 → WebSocket），不写页面文本、日志或 localStorage；关闭弹窗时清空。
@@ -128,6 +131,20 @@ termx-service --config-dir <DIR> [--port <u16>] [--token-file <FILE>]
 - `platform` / `arch` 与 `std::env::consts` 对齐：`windows|linux|macos`、`x86_64|aarch64`。
 - `runtime.list` 只返回当前平台兼容项；`available` 表示 bin 存在且可执行（不暴露绝对路径）。
 - `terminal.create.runtime_id` 与自定义 `cmd/args` 互斥；未给 `runtime_id` 时保持旧行为。
+
+## 3.3 SSH 连接历史
+
+- 路径：`<config_dir>/ssh_history.json`；锁文件 `<config_dir>/ssh_history.json.lock`。
+- 上限：`ssh_history_limit` / `TERMX_SSH_HISTORY_LIMIT`，默认 `64`；`0` 禁用。
+- 权限：Unix `0600`；Windows 继承目录 ACL（不额外夸大已收紧）。
+- 写入：同目录临时文件 + `rename` 原子替换；同进程互斥 + 跨进程排他文件锁串行化读-改-写。
+- 损坏：JSON 解析失败按空历史处理并记录警告，不阻断 `terminal.create`；下一次成功记录会覆盖为合法文件。
+- 记录字段：`host`、`port`、`user`、`auth_type`（`password` / `key`）、`use_count`、`last_used`（RFC3339 UTC）。
+- **不保存**密码、私钥口令、私钥内容或私钥路径。
+- 行为：仅 SSH `terminal.create` 成功后记录；失败、取消、`consent_required`、主机密钥未知/变化等路径不记录。
+- 去重键：`host + port + user`；重复成功连接只 `use_count += 1` 并刷新 `last_used`。
+- 淘汰：超限先淘汰 `use_count` 最小者；相同 `use_count` 淘汰 `last_used` 最旧者。
+- 列表：`ssh.history.list` 仅管理员（Web 代理）可用，按 `last_used` 降序；可选用 `ssh.history.remove` / `ssh.history.clear`。
 
 ## 4. termx-cli / termx-client
 - 必须显式 `--config-dir` 或 `--endpoint`（或非空 `TERMX_CONFIG_DIR`）；无平台默认。
