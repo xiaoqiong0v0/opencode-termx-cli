@@ -1,6 +1,6 @@
 [submodule "termx-pwsh"]
 	path = terminals/termx-pwsh
-	url = https://github.com/xiaoqiong0v0/PowerShell.git
+	url = https://github.com/xiaoqiong0v0/termx-pwsh.git
 [submodule "termx-bash"]
-	path = terminals/bash
-	url = https://git.savannah.gnu.org/git/bash.git
+	path = terminals/termx-bash
+	url = https://github.com/xiaoqiong0v0/termx-bash.git
