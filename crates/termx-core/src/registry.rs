@@ -466,6 +466,13 @@ impl Registry {
         let pgid = backend.pgid();
         let ssh = params.ssh.is_some();
         let runtime_id = params.runtime_id.clone();
+        let allow_late_output = params.runtime_id.as_deref() == Some("termx-pwsh")
+            || params
+                .cmd
+                .trim()
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|name| name == "termx-pwsh");
 
         let entry = TerminalEntry {
             id: id.clone(),
@@ -501,7 +508,11 @@ impl Registry {
             clientless_since: None,
             pending_interrupt: None,
             capabilities: backend.capabilities(),
-            transcript: TranscriptBuffer::with_in_band_osc(self.transcript_capacity, in_band_osc),
+            transcript: TranscriptBuffer::with_in_band_osc_and_late_output(
+                self.transcript_capacity,
+                in_band_osc,
+                allow_late_output,
+            ),
             analyzer: InteractionAnalyzer::with_start_time(
                 self.interaction_config,
                 OffsetDateTime::now_utc(),

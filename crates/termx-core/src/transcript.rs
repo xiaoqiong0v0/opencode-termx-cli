@@ -88,6 +88,11 @@ pub struct TranscriptBuffer {
     /// 使用带外事件通道的运行时（如 `termx-pwsh`/`termx-bash`）必须关闭该
     /// 开关，否则子程序仍可通过 stdout 伪造命令结束。
     in_band_osc: bool,
+    /// 真实 D 之后仍允许把输出追加到最后一条命令。
+    ///
+    /// 仅用于宿主无法保证 D 在最后一段输出之后的平台（当前 Windows
+    /// ConPTY 的 `termx-pwsh`）；命令状态仍保持 `done`，只追加迟到输出。
+    allow_late_output: bool,
 }
 
 impl TranscriptBuffer {
@@ -103,6 +108,18 @@ impl TranscriptBuffer {
     /// `in_band_osc=false` 时 `record_output` 不再把输出喂给 OSC 扫描器，
     /// 事件只能来自带外通道。
     pub fn with_in_band_osc(capacity: usize, in_band_osc: bool) -> Self {
+        Self::with_in_band_osc_and_late_output(capacity, in_band_osc, false)
+    }
+
+    /// 以容量、in-band OSC 开关与迟到输出策略创建。
+    ///
+    /// `allow_late_output=true` 时，真实 D 之后的输出仍追加到最后一条
+    /// 命令；命令状态不回到 running，只刷新输出内容。
+    pub fn with_in_band_osc_and_late_output(
+        capacity: usize,
+        in_band_osc: bool,
+        allow_late_output: bool,
+    ) -> Self {
         Self {
             capacity: capacity.max(1),
             revision: 0,
@@ -111,6 +128,7 @@ impl TranscriptBuffer {
             commands: VecDeque::new(),
             scanner: OscScanner::new(),
             in_band_osc,
+            allow_late_output,
         }
     }
 
@@ -288,11 +306,13 @@ impl TranscriptBuffer {
         if matches!(
             last.status,
             TranscriptStatus::Exited | TranscriptStatus::Interrupted | TranscriptStatus::Error
-        ) || (last.status == TranscriptStatus::Done && !last.best_effort)
+        ) || (last.status == TranscriptStatus::Done
+            && !last.best_effort
+            && !self.allow_late_output)
         {
             // 真实结束（shell-integration D）之后到达的输出属于
             // 下一个 prompt/续行，不应复活上一条命令；只有静默
-            // best-effort 结束的记录允许被迟到输出复活。
+            // best-effort 结束或显式允许迟到输出时例外。
             return false;
         }
         if last.truncated {
@@ -835,6 +855,20 @@ mod tests {
             result.commands[0].output.is_empty(),
             "已真实结束的命令不应接收后续输出"
         );
+    }
+
+    #[test]
+    fn late_output_can_be_appended_when_enabled() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        buffer.record_command("Write-Output one; Write-Output two", t0);
+        assert!(buffer.record_command_end(Some(0), TranscriptSource::ShellIntegration, t0));
+        assert!(buffer.record_output("one\r\n", t0));
+        assert!(buffer.record_output("two\r\n", t0 + time::Duration::milliseconds(10)));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert_eq!(command.output, "one\ntwo");
     }
 
     #[test]
