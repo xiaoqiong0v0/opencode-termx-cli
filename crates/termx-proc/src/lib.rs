@@ -42,7 +42,7 @@ pub enum BarrierReport {
         /// 已入队的 `Output` 事件累计数（从 1 起，0 表示尚无输出）。
         output_seq: u64,
     },
-    /// 当前平台或后端不提供输出屏障（Windows/stdio/unsupported）。
+    /// 当前平台或后端不提供输出屏障（stdio/unsupported）。
     Unsupported,
 }
 

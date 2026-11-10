@@ -1077,14 +1077,15 @@ impl Registry {
     /// 通过 [`Registry::take_pending_transcript_generation`] 原地认领，避免
     /// 首段输出先于 `C` 处理时被上一命令的终态丢弃。
     ///
-    /// `termx-bash` 的 `C` 与 PTY 输出同样来自两条链路，因此即使启用带外
-    /// 事件也必须 send-time 预记录；`termx-pwsh` 保持原行为。raw-only 终端
-    /// 继续依赖 in-band OSC/静默判定。终端不存在时返回 [`CoreError::NotFound`]。
+    /// `termx-bash`/`termx-pwsh` 的 `C` 与 PTY 输出都可能来自两条链路，
+    /// 即使启用带外事件也必须 send-time 预记录，避免首段输出先于 `C`
+    /// 被上一命令的终态丢弃。raw-only 终端继续依赖 in-band OSC/静默判定。
+    /// 终端不存在时返回 [`CoreError::NotFound`]。
     pub fn records_transcript_on_send(&self, locator: &TerminalLocator) -> Result<bool, CoreError> {
         let id = self.resolve(locator)?;
         self.by_id
             .get(&id)
-            .map(|entry| !entry.shell_events || is_termx_bash(entry))
+            .map(|entry| !entry.shell_events || is_structured_shell(entry))
             .ok_or(CoreError::NotFound)
     }
 
@@ -2286,18 +2287,20 @@ fn signal_name(signal: i32) -> String {
     name.to_string()
 }
 
-/// 是否为 termx-bash 终端（本地 runtime_id 或远端 cmd basename）。
+/// 是否为结构化 shell 终端（termx-bash / termx-pwsh）。
 ///
-/// `termx-bash` 的 `C` 事件与 PTY 输出可能逆序到达；`terminal.send` 必须
-/// 先落 pending 命令记录，等 `C` 到达后由代次认领，不能只靠 `C` 新建。
-fn is_termx_bash(entry: &TerminalEntry) -> bool {
-    entry.runtime_id.as_deref() == Some("termx-bash")
-        || entry
-            .command
-            .trim()
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|name| name == "termx-bash")
+/// 两者的 `C` 事件与 PTY 输出都可能逆序到达；`terminal.send` 必须先落
+/// pending 命令记录，等 `C` 到达后由代次认领，不能只靠 `C` 新建。
+fn is_structured_shell(entry: &TerminalEntry) -> bool {
+    matches!(
+        entry.runtime_id.as_deref(),
+        Some("termx-bash" | "termx-pwsh")
+    ) || entry
+        .command
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| matches!(name, "termx-bash" | "termx-pwsh"))
 }
 
 /// 终态生命周期状态对应的命令记录状态；非终态返回 `None`。

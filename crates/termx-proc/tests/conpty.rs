@@ -151,3 +151,56 @@ async fn invalid_program() {
         Ok(_) => panic!("不存在的程序不应创建成功"),
     }
 }
+
+/// 输出屏障：返回前必须已把投递时刻可读的 ConPTY 输出入队（含打断阻塞读）。
+#[tokio::test]
+async fn output_barrier_drains_readable_output() {
+    use termx_proc::{BarrierReport, DEFAULT_BARRIER_TIMEOUT};
+
+    // 先输出标记再长时间运行，保证屏障确认的序号对应真实输出。
+    let (mut session, mut rx) = PtySession::spawn(cmd_config(&[
+        "/C",
+        "echo BARRIER_MARK & ping -n 30 127.0.0.1 > nul",
+    ]))
+    .expect("启动 cmd 失败");
+    let barrier = session.barrier_handle();
+
+    // 屏障只排空“投递时刻已可读”的输出；重复屏障并消费已确认事件，直到看到
+    // 标记（ConPTY 会先输出初始化序列）。
+    let mut seen = 0u64;
+    let mut bytes = Vec::new();
+    let found = timeout(Duration::from_secs(10), async {
+        loop {
+            let target = match barrier
+                .barrier(DEFAULT_BARRIER_TIMEOUT)
+                .expect("屏障不应超时")
+            {
+                BarrierReport::Drained { output_seq } => output_seq,
+                BarrierReport::Unsupported => panic!("ConPTY 应支持输出屏障"),
+            };
+            // 屏障确认的输出必须已经在事件通道中，且顺序不变。
+            while seen < target {
+                match rx.recv().await {
+                    Some(ProcEvent::Output { data, .. }) => {
+                        seen += 1;
+                        bytes.extend_from_slice(&data);
+                    }
+                    _ => return false,
+                }
+            }
+            if String::from_utf8_lossy(&bytes).contains("BARRIER_MARK") {
+                return true;
+            }
+        }
+    })
+    .await
+    .expect("屏障应在超时内看到输出");
+
+    assert!(
+        found,
+        "屏障确认的输出应在通道中且包含标记: seen={seen}, target 已达, bytes={:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    session.terminate().expect("terminate 失败");
+}

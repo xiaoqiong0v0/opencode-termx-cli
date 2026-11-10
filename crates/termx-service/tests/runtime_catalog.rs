@@ -377,7 +377,7 @@ fn millis(at: OffsetDateTime) -> i64 {
 }
 
 #[tokio::test]
-async fn event_channel_terminal_uses_host_command_instead_of_send_record() {
+async fn event_channel_terminal_pre_records_pending_before_command_start() {
     let dir = tempdir().expect("创建临时目录失败");
     install_runtime(dir.path());
     let mut service = TestService::start_with_config_and_factory(
@@ -388,7 +388,7 @@ async fn event_channel_terminal_uses_host_command_instead_of_send_record() {
     let mut client = connect(&service).await;
     handshake(&mut client, &service.token).await;
 
-    // 事件通道终端：send 只写后端，不预记录 transcript。
+    // 事件通道终端：send 先落 pending，C 到达后按代次认领，避免首段输出丢失。
     let response = call(
         &mut client,
         "c-events-create",
@@ -431,18 +431,20 @@ async fn event_channel_terminal_uses_host_command_instead_of_send_record() {
     {
         let registry = service.registry.lock().expect("registry 锁");
         assert!(
-            !registry
+            registry
                 .records_transcript_on_send(&by_id(&created.terminal_id))
                 .expect("查询事件通道终端"),
-            "事件通道终端不应保留 send-time 记录"
+            "事件通道终端应保留 send-time pending"
         );
         let result = registry
             .transcript(&by_id(&created.terminal_id), None)
             .expect("读取 transcript");
-        assert!(result.commands.is_empty(), "send 不应预记录事件通道命令");
+        assert_eq!(result.commands.len(), 1, "send 应预记录 pending 命令");
+        assert_eq!(result.commands[0].command, "run");
+        assert_eq!(result.commands[0].status, TranscriptStatus::Running);
     }
 
-    // 宿主 C(command,start) 新建记录，D 用宿主结束时间结束。
+    // 宿主 C(command,start) 认领 pending；D 用宿主结束时间结束。
     let started = OffsetDateTime::now_utc();
     let ended = started + time::Duration::milliseconds(100);
     let terminal_id = TerminalId::new(created.terminal_id.clone());

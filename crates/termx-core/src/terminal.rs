@@ -77,7 +77,7 @@ pub struct TerminalEntry {
     ///
     /// 为 `true` 时 transcript 的 `C`/`D` 由宿主事件建立；`terminal.send`
     /// 是否预记录命令由 [`crate::Registry::records_transcript_on_send`] 决定
-    /// （`termx-bash` 需要预记录，避免首段输出先于 `C` 被丢弃）。
+    /// （`termx-bash`/`termx-pwsh` 需要预记录，避免首段输出先于 `C` 被丢弃）。
     pub shell_events: bool,
     /// 创建时指定的 runtime ID；旧 cmd/args 终端为 `None`。
     pub runtime_id: Option<String>,

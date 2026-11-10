@@ -84,9 +84,10 @@ pub trait TerminalBackend: Send + Sync {
 
     /// 请求输出屏障：读侧排空当前可读输出并返回累计序号。
     ///
-    /// 本地 Unix PTY 返回 [`BarrierReport::Drained`]；stdio/SSH/Windows 等
-    /// 没有本地读侧控制通道的后端返回 [`BarrierReport::Unsupported`]。
-    /// 调用方必须在 registry 锁之外、通过 `spawn_blocking` 调用（可能阻塞）。
+    /// 本地 PTY（Unix PTY / Windows ConPTY）返回 [`BarrierReport::Drained`]；
+    /// stdio/SSH 等没有本地读侧控制通道的后端返回
+    /// [`BarrierReport::Unsupported`]。调用方必须在 registry 锁之外、通过
+    /// `spawn_blocking` 调用（可能阻塞）。
     fn barrier(&self, _timeout: Duration) -> Result<BarrierReport, CoreError> {
         Ok(BarrierReport::Unsupported)
     }

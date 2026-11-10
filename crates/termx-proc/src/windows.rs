@@ -10,18 +10,24 @@
 //! - ConPTY 输出管道不会在客户端退出时自动 EOF，因此由退出监视线程在进程
 //!   结束后关闭伪控制台，迫使读线程读到 EOF 后再发送唯一的 `Exited`；
 //! - 输出读端由读线程独占，进程句柄与 HPCON 通过 `Arc` 共享，避免跨线程关闭
-//!   同一对象。
+//!   同一对象；
+//! - 输出屏障由请求方用 `CancelSynchronousIo` 打断读线程阻塞中的 `ReadFile`：
+//!   读线程被取消后不当作 EOF，而是排空当前已可读输出、确认后继续读取，因此
+//!   屏障返回时对应 `Output` 已入队（与 Unix 后端语义一致，不依赖时间窗口）。
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use termx_protocol::ProcNode;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, warn};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
@@ -30,18 +36,20 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
+use windows::Win32::System::IO::CancelSynchronousIo;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    PROCESS_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentThreadId, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenThread,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_TERMINATE, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{Error as WinError, PCWSTR, PWSTR};
 
@@ -62,6 +70,12 @@ const TERMINATE_EXIT_CODE: u32 = 1;
 /// 进程退出后等待 conhost 把尾部输出刷入管道的宽限时长。
 const EXIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// `CancelSynchronousIo` 未命中（读线程尚未真正进入 `ReadFile`）后的重试间隔。
+///
+/// 只用于异常路径收敛：正常路径在读线程阻塞时一次取消即命中；该重试不参与
+/// 事件排序，也不用于等待输出产生。
+const CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// 与退出监视线程共享的伪控制台；`None` 表示已关闭。
 type SharedConsole = Arc<Mutex<Option<PseudoConsole>>>;
 
@@ -78,28 +92,241 @@ pub struct PtySession {
     job: Option<OwnedHandle>,
     /// 伪控制台句柄（共享、幂等关闭）。
     hpc: SharedConsole,
+    /// 输出屏障控制端；与读线程共享，`barrier_handle` 克隆它。
+    barrier: Arc<BarrierControl>,
     /// `terminate` 是否已执行（幂等标记）。
     terminated: bool,
 }
 
-/// Windows ConPTY 不提供输出屏障的控制通道。
+/// ConPTY 输出屏障句柄：请求读线程先排空当前可读的 PTY 输出。
 ///
-/// 调用 `barrier` 明确返回 [`BarrierReport::Unsupported`]；service/helper 的
-/// D 事件排序逻辑据此跳过等待，保持既有行为。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BarrierHandle;
+/// 句柄是 `Arc` 克隆，只共享屏障状态，不借用 `PtySession`（因此等待期间不会
+/// 持有会话互斥锁），可在 service 的阻塞线程池或 helper 的事件转发任务里安全
+/// 使用。
+#[derive(Debug, Clone)]
+pub struct BarrierHandle {
+    /// 请求/确认计数、输出序号与读线程登记信息。
+    inner: Arc<BarrierControl>,
+}
 
 impl BarrierHandle {
-    /// 明确不支持输出屏障。
-    pub fn barrier(&self, _timeout: Duration) -> Result<BarrierReport, ProcError> {
-        Ok(BarrierReport::Unsupported)
+    /// 请求读线程排空当前可读输出并等待确认。
+    ///
+    /// 语义与 Unix 后端一致：返回 [`BarrierReport::Drained`] 时，编号不超过
+    /// `output_seq` 的 `Output` 事件已全部入队；读线程已结束时直接返回当前
+    /// 序号；只有等待超过 `timeout` 才返回 [`ProcError::BarrierTimeout`]。
+    pub fn barrier(&self, timeout: Duration) -> Result<BarrierReport, ProcError> {
+        self.inner.barrier(timeout)
+    }
+}
+
+/// 屏障共享状态：请求/确认计数、读线程登记与关闭标志。
+#[derive(Debug, Default)]
+struct BarrierState {
+    /// 已投递的屏障请求数。
+    requested: u64,
+    /// 读线程已处理的请求数。
+    acked: u64,
+    /// 最近一次确认时的输出事件序号。
+    acked_seq: u64,
+    /// 读线程是否已结束（终端退出或输出管道关闭）。
+    closed: bool,
+    /// 读线程 ID；`None` 表示尚未登记。
+    reader_tid: Option<u32>,
+    /// 读线程是否已发布“即将阻塞在 `ReadFile`”。
+    reader_blocking: bool,
+}
+
+/// 与读线程共享的屏障控制块。
+#[derive(Debug, Default)]
+struct BarrierControl {
+    /// 请求/确认状态与读线程登记。
+    state: Mutex<BarrierState>,
+    /// 状态变化通知。
+    cv: Condvar,
+    /// 读线程累计入队的 `Output` 事件数。
+    output_seq: AtomicU64,
+}
+
+impl BarrierControl {
+    /// 当前已入队的输出事件数。
+    fn output_seq(&self) -> u64 {
+        self.output_seq.load(Ordering::SeqCst)
+    }
+
+    /// 入队一段输出并递增屏障序号；空数据不产生事件。
+    ///
+    /// 返回 `false` 表示接收端已丢弃，读线程应停止。
+    fn send_output(&self, tx: &Sender<ProcEvent>, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        self.output_seq.fetch_add(1, Ordering::SeqCst);
+        tx.blocking_send(ProcEvent::Output {
+            data: data.to_vec(),
+            stream: OutputStream::Pty,
+        })
+        .is_ok()
+    }
+
+    /// 登记读线程 ID，供屏障请求用 `CancelSynchronousIo` 唤醒阻塞的读取。
+    fn register_reader(&self, tid: u32) {
+        self.lock_state().reader_tid = Some(tid);
+    }
+
+    /// 读线程是否已结束。
+    fn is_closed(&self) -> bool {
+        self.lock_state().closed
+    }
+
+    /// 是否有尚未确认的屏障请求。
+    fn has_pending(&self) -> bool {
+        let state = self.lock_state();
+        !state.closed && state.requested > state.acked
+    }
+
+    /// 发布“即将阻塞在 `ReadFile`”，与请求方共用一把锁消除丢失唤醒。
+    ///
+    /// 返回 `false` 表示已有待处理请求或读线程已关闭，调用方应回到循环顶部
+    /// 重新判断，而不是进入阻塞读取。
+    fn enter_blocking_read(&self) -> bool {
+        let mut state = self.lock_state();
+        if state.closed || state.requested > state.acked {
+            return false;
+        }
+        state.reader_blocking = true;
+        true
+    }
+
+    /// 结束“即将阻塞读”的发布；`ReadFile` 返回后调用。
+    fn leave_blocking_read(&self) {
+        self.lock_state().reader_blocking = false;
+    }
+
+    /// 投递一次屏障请求并等待读线程确认。
+    ///
+    /// 读线程已结束时直接返回当前输出序号（不会再有新输出，顺序已确定）；
+    /// 只有等待超时才返回 [`ProcError::BarrierTimeout`]。
+    fn barrier(&self, timeout: Duration) -> Result<BarrierReport, ProcError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock_state();
+        if state.closed {
+            return Ok(BarrierReport::Drained {
+                output_seq: self.output_seq(),
+            });
+        }
+
+        state.requested = state.requested.saturating_add(1);
+        let request = state.requested;
+        let mut retry_cancel = true;
+        loop {
+            if state.acked >= request {
+                return Ok(BarrierReport::Drained {
+                    output_seq: state.acked_seq,
+                });
+            }
+            if state.closed {
+                return Ok(BarrierReport::Drained {
+                    output_seq: self.output_seq(),
+                });
+            }
+
+            if retry_cancel {
+                retry_cancel = self.cancel_blocked_reader(&state);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ProcError::BarrierTimeout);
+            }
+            let wait = if retry_cancel {
+                (deadline - now).min(CANCEL_RETRY_INTERVAL)
+            } else {
+                deadline - now
+            };
+            let (guard, _) = self
+                .cv
+                .wait_timeout(state, wait)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = guard;
+        }
+    }
+
+    /// 尝试取消读线程当前的同步 `ReadFile`。
+    ///
+    /// 返回 `true` 表示需要稍后重试：读线程已发布阻塞意图，但取消调用此刻未
+    /// 命中（`ERROR_NOT_FOUND`，读线程刚好还没进入 `ReadFile`）。其它失败
+    /// （线程已退出、无权打开）不再重试，由 `closed` 或超时收敛。
+    fn cancel_blocked_reader(&self, state: &BarrierState) -> bool {
+        let Some(tid) = state.reader_tid else {
+            return false;
+        };
+        if !state.reader_blocking {
+            // 未阻塞：读线程会在进入 `ReadFile` 前看到本次请求。
+            return false;
+        }
+        match open_thread_and_cancel(tid) {
+            Ok(()) => false,
+            Err(err) if win32_code(&err) == ERROR_NOT_FOUND.0 => {
+                debug!(thread_id = tid, "取消 ConPTY 读取未命中，稍后重试");
+                true
+            }
+            Err(err) => {
+                // 线程已退出或无权取消：等读线程自己收敛（closed 或超时）。
+                debug!(thread_id = tid, error = %err, "取消 ConPTY 读取失败");
+                false
+            }
+        }
+    }
+
+    /// 处理一批屏障请求：排空当前可读输出后确认。
+    ///
+    /// 只确认进入本函数时已投递的请求；期间新到的请求留到下一轮，保证每个
+    /// 请求都对应一次“排空已可读输出”，不借用别人的排空结果。
+    fn handle_requests(&self, output: &OwnedHandle, tx: &Sender<ProcEvent>) -> ReaderStep {
+        let target = {
+            let state = self.lock_state();
+            if state.closed {
+                return ReaderStep::Detached;
+            }
+            if state.requested <= state.acked {
+                return ReaderStep::Continue;
+            }
+            state.requested
+        };
+
+        let outcome = drain_readable(output, tx, self);
+
+        let mut state = self.lock_state();
+        state.acked = state.acked.max(target);
+        state.acked_seq = self.output_seq();
+        if !matches!(outcome, DrainOutcome::Done) {
+            state.closed = true;
+        }
+        self.cv.notify_all();
+        outcome.into()
+    }
+
+    /// 标记读线程结束并唤醒所有等待者（幂等）。
+    fn mark_closed(&self) {
+        let mut state = self.lock_state();
+        state.closed = true;
+        state.reader_blocking = false;
+        self.cv.notify_all();
+    }
+
+    /// 获取屏障状态锁；中毒时取回内部值（状态只有计数与标志，可继续使用）。
+    fn lock_state(&self) -> MutexGuard<'_, BarrierState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl PtySession {
-    /// Windows 无内部屏障控制通道：返回 no-op 句柄。
+    /// 输出屏障句柄：与读线程共享同一控制块，不借用会话锁。
     pub fn barrier_handle(&self) -> BarrierHandle {
-        BarrierHandle
+        BarrierHandle {
+            inner: Arc::clone(&self.barrier),
+        }
     }
 }
 
@@ -148,12 +375,14 @@ impl PtySession {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let console: SharedConsole = Arc::new(Mutex::new(Some(console)));
         let process = Arc::new(process);
+        let barrier = Arc::new(BarrierControl::default());
 
         let reader = std::thread::Builder::new()
             .name("termx-conpty-read".to_string())
             .spawn({
                 let process = Arc::clone(&process);
-                move || read_loop(parent_out, process, tx)
+                let barrier = Arc::clone(&barrier);
+                move || read_loop(parent_out, process, tx, barrier)
             });
         if let Err(err) = reader {
             // job / console 随局部变量析构，KILL_ON_JOB_CLOSE 保证子进程被清理。
@@ -177,6 +406,7 @@ impl PtySession {
             input: Some(parent_in),
             job: Some(job),
             hpc: console,
+            barrier,
             terminated: false,
         };
         Ok((session, rx))
@@ -700,25 +930,67 @@ fn watch_exit(process: Arc<OwnedHandle>, console: SharedConsole) {
     close_console(&console);
 }
 
-/// 后台读线程：阻塞读取输出直到 EOF，再等待进程退出并发送唯一的 `Exited`。
-fn read_loop(output: OwnedHandle, process: Arc<OwnedHandle>, tx: Sender<ProcEvent>) {
+/// 后台读线程：阻塞读取输出直到 EOF，并响应输出屏障请求。
+///
+/// 屏障请求到来时用 `CancelSynchronousIo` 打断阻塞中的 `ReadFile`；读线程看到
+/// `ERROR_OPERATION_ABORTED` 后回到循环顶部，先排空已可读输出并确认，再继续
+/// 正常读取。所有退出路径（含提前返回与 panic）都会标记屏障关闭，等待方不会
+/// 永久卡住。
+fn read_loop(
+    output: OwnedHandle,
+    process: Arc<OwnedHandle>,
+    tx: Sender<ProcEvent>,
+    barrier: Arc<BarrierControl>,
+) {
+    // 任何退出路径都唤醒屏障等待者。
+    let _closed_guard = ReaderGuard {
+        barrier: Arc::clone(&barrier),
+    };
+    // SAFETY: GetCurrentThreadId 无参数、无副作用，返回本线程 ID。
+    barrier.register_reader(unsafe { GetCurrentThreadId() });
+
     let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-    loop {
+    'read: loop {
+        // 读线程可能被 terminate 之外的路径标记关闭：直接走退出流程。
+        if barrier.is_closed() {
+            break;
+        }
+
+        // 有待处理屏障请求：先排空当前可读输出，保证请求返回前 Output 已入队。
+        while barrier.has_pending() {
+            match barrier.handle_requests(&output, &tx) {
+                ReaderStep::Continue => {}
+                // 管道已结束：走 EOF 流程（等进程退出并发送 `Exited`）。
+                ReaderStep::Eof => break 'read,
+                // 接收端已丢弃：停止读取并让句柄随作用域关闭。
+                ReaderStep::Detached => return,
+            }
+        }
+
+        // 与请求方在同一把锁下发布阻塞意图：请求若已到达则不进入阻塞读，
+        // 从而消除“取消早于 ReadFile 开始”的丢失唤醒。
+        if !barrier.enter_blocking_read() {
+            continue;
+        }
         let mut read = 0u32;
-        match unsafe { ReadFile(output.get(), Some(&mut buffer), Some(&mut read), None) } {
+        // SAFETY: `output` 是读线程独占的有效管道读端；`buffer` 是有效缓冲区，
+        // `read` 指向栈上 u32。
+        let result = unsafe { ReadFile(output.get(), Some(&mut buffer), Some(&mut read), None) };
+        barrier.leave_blocking_read();
+
+        match result {
             Ok(()) if read == 0 => break,
             Ok(()) => {
-                let chunk = buffer[..read as usize].to_vec();
-                let event = ProcEvent::Output {
-                    data: chunk,
-                    stream: OutputStream::Pty,
-                };
-                if tx.blocking_send(event).is_err() {
+                if !barrier.send_output(&tx, &buffer[..read as usize]) {
                     // 接收端已丢弃：停止读取并让句柄随作用域关闭。
                     return;
                 }
             }
             Err(err) => {
+                // 屏障取消会打断阻塞读，这不是 EOF：回循环顶部处理请求。
+                if win32_code(&err) == ERROR_OPERATION_ABORTED.0 {
+                    continue;
+                }
                 // ERROR_BROKEN_PIPE / 管道关闭都按 EOF 处理。
                 debug!(error = %err, "ConPTY 输出读取结束");
                 break;
@@ -726,12 +998,134 @@ fn read_loop(output: OwnedHandle, process: Arc<OwnedHandle>, tx: Sender<ProcEven
         }
     }
 
+    // 读端已 EOF：先唤醒屏障等待者，再等进程退出并发送唯一的 `Exited`。
+    barrier.mark_closed();
+
     let _ = unsafe { WaitForSingleObject(process.get(), INFINITE) };
     let mut code = 0u32;
     if let Err(err) = unsafe { GetExitCodeProcess(process.get(), &mut code) } {
         debug!(error = %err, "GetExitCodeProcess 失败，按 0 处理");
     }
     let _ = tx.blocking_send(ProcEvent::Exited(code as i32));
+}
+
+/// 读线程退出守卫：正常结束、提前返回或 panic 都唤醒屏障等待者。
+struct ReaderGuard {
+    /// 与读线程共享的屏障控制块。
+    barrier: Arc<BarrierControl>,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.barrier.mark_closed();
+    }
+}
+
+/// 读线程处理屏障请求后的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderStep {
+    /// 请求已确认，继续正常读取。
+    Continue,
+    /// 输出管道已结束，走 EOF 流程（等进程退出并发送 `Exited`）。
+    Eof,
+    /// 事件接收端已丢弃，直接结束读线程。
+    Detached,
+}
+
+/// 排空当前可读输出的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// 已排空（可能读不到任何字节）。
+    Done,
+    /// 输出管道已结束。
+    Eof,
+    /// 事件接收端已丢弃。
+    Detached,
+}
+
+impl From<DrainOutcome> for ReaderStep {
+    fn from(outcome: DrainOutcome) -> Self {
+        match outcome {
+            DrainOutcome::Done => Self::Continue,
+            DrainOutcome::Eof => Self::Eof,
+            DrainOutcome::Detached => Self::Detached,
+        }
+    }
+}
+
+/// 排空“当前已可读”的 ConPTY 输出并全部入队。
+///
+/// `PeekNamedPipe` 只查询可读字节数、不阻塞，也不引入时间窗口：读到 0 即返回，
+/// 屏障之后才产生的输出仍由正常读取路径处理。
+fn drain_readable(
+    output: &OwnedHandle,
+    tx: &Sender<ProcEvent>,
+    barrier: &BarrierControl,
+) -> DrainOutcome {
+    let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+    loop {
+        let Some(available) = available_bytes(output) else {
+            return DrainOutcome::Eof;
+        };
+        if available == 0 {
+            return DrainOutcome::Done;
+        }
+        let want = (available as usize).min(buffer.len());
+        let mut read = 0u32;
+        // SAFETY: `output` 是读线程独占的有效管道读端；`PeekNamedPipe` 已确认
+        // 至少有 `available` 字节可读，因此本次 `ReadFile` 不会阻塞。
+        match unsafe {
+            ReadFile(
+                output.get(),
+                Some(&mut buffer[..want]),
+                Some(&mut read),
+                None,
+            )
+        } {
+            Ok(()) if read == 0 => return DrainOutcome::Eof,
+            Ok(()) => {
+                if !barrier.send_output(tx, &buffer[..read as usize]) {
+                    return DrainOutcome::Detached;
+                }
+            }
+            Err(err) => {
+                debug!(error = %err, "排空 ConPTY 输出失败");
+                return DrainOutcome::Eof;
+            }
+        }
+    }
+}
+
+/// `PeekNamedPipe`：返回当前可读字节数；查询失败返回 `None`。
+fn available_bytes(output: &OwnedHandle) -> Option<u32> {
+    let mut available = 0u32;
+    // SAFETY: `output` 是有效管道读端；不提供缓冲，仅查询可读字节数。
+    match unsafe { PeekNamedPipe(output.get(), None, 0, None, Some(&mut available), None) } {
+        Ok(()) => Some(available),
+        Err(err) => {
+            debug!(error = %err, "PeekNamedPipe 失败");
+            None
+        }
+    }
+}
+
+/// 打开读线程句柄并取消其当前同步 I/O。
+///
+/// 返回 `Err` 时调用方按“线程已退出/尚未进入系统调用”处理，不在此重试。
+fn open_thread_and_cancel(tid: u32) -> windows::core::Result<()> {
+    // SAFETY: `THREAD_TERMINATE` 是 CancelSynchronousIo 要求的访问权限；句柄只
+    // 在本函数内使用，随 `OwnedHandle` 析构关闭。
+    let thread = unsafe { OpenThread(THREAD_TERMINATE, false, tid) }?;
+    let thread = OwnedHandle::from_raw(thread);
+    unsafe { CancelSynchronousIo(thread.get()) }
+}
+
+/// 取 Win32 错误码。
+///
+/// `windows` 把 `GetLastError` 结果编码为 `HRESULT_FROM_WIN32`（`0x8007_xxxx`），
+/// 低 16 位即原始错误码。
+fn win32_code(error: &WinError) -> u32 {
+    error.code().0 as u32 & 0xFFFF
 }
 
 /// 采集当前系统全部进程（ToolHelp）。
@@ -922,5 +1316,101 @@ mod tests {
         assert_eq!(split_env_entry("PATH=C:\\x"), Some(("PATH", "C:\\x")));
         assert_eq!(split_env_entry("=C:=C:\\work"), Some(("=C:", "C:\\work")));
         assert_eq!(split_env_entry("NO_EQUALS"), None);
+    }
+
+    /// 向管道写端写入全部字节（测试数据远小于管道缓冲，一次即可写完）。
+    fn write_pipe(handle: &OwnedHandle, data: &[u8]) {
+        let mut written = 0u32;
+        unsafe { WriteFile(handle.get(), Some(data), Some(&mut written), None) }.expect("写入管道");
+        assert_eq!(written as usize, data.len(), "管道写入不完整");
+    }
+
+    /// 创建一对独立的测试管道，返回 `(写端, 读端)`。
+    fn test_pipe() -> (OwnedHandle, OwnedHandle) {
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe { CreatePipe(&mut read, &mut write, None, 0) }.expect("创建测试管道失败");
+        (OwnedHandle::from_raw(write), OwnedHandle::from_raw(read))
+    }
+
+    /// 读出事件通道中的全部输出字节（不等待）。
+    fn collect_output(rx: &mut Receiver<ProcEvent>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProcEvent::Output { data, .. } = event {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn drain_readable_queues_all_pending_pipe_bytes() {
+        let (writer, reader) = test_pipe();
+
+        let payload = b"BARRIER_MARK";
+        write_pipe(&writer, payload);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let barrier = BarrierControl::default();
+        assert_eq!(
+            drain_readable(&reader, &tx, &barrier),
+            DrainOutcome::Done,
+            "排空应成功"
+        );
+        drop(tx);
+
+        assert_eq!(barrier.output_seq(), 1, "每段入队输出对应一个序号");
+        assert_eq!(collect_output(&mut rx), payload);
+    }
+
+    #[test]
+    fn barrier_times_out_without_reader() {
+        let handle = BarrierHandle {
+            inner: Arc::new(BarrierControl::default()),
+        };
+        match handle.barrier(Duration::from_millis(50)) {
+            Err(ProcError::BarrierTimeout) => {}
+            other => panic!("无读线程时应返回 BarrierTimeout，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn barrier_returns_current_seq_after_reader_closed() {
+        let inner = Arc::new(BarrierControl::default());
+        inner.output_seq.store(3, Ordering::SeqCst);
+        inner.mark_closed();
+
+        let handle = BarrierHandle { inner };
+        match handle.barrier(Duration::from_millis(50)) {
+            Ok(BarrierReport::Drained { output_seq }) => assert_eq!(output_seq, 3),
+            other => panic!("读线程结束后应直接返回当前序号，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_request_is_visible_before_blocking_read() {
+        let barrier = BarrierControl::default();
+        barrier.register_reader(42);
+
+        // 读线程先发布阻塞意图，随后请求方投递请求：取消目标可被找到。
+        assert!(barrier.enter_blocking_read(), "无请求时应允许进入阻塞读");
+        {
+            let mut state = barrier.lock_state();
+            state.requested = 1;
+        }
+        assert!(barrier.has_pending(), "请求应可见");
+        {
+            let state = barrier.lock_state();
+            assert_eq!(state.reader_tid, Some(42));
+            assert!(state.reader_blocking, "阻塞意图应已发布");
+        }
+
+        // 读线程返回后请求优先于再次阻塞。
+        barrier.leave_blocking_read();
+        assert!(
+            !barrier.enter_blocking_read(),
+            "有待处理请求时不应进入阻塞读"
+        );
     }
 }
