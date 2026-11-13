@@ -14,6 +14,8 @@ pub enum ShellEventKind {
     CommandStart,
     /// 命令结束（`D`）。
     CommandEnd,
+    /// 命令输出（`O`）：`data` 为 base64 编码的 UTF-8 文本。
+    CommandOutput,
     /// 命令取消（`X`）：多行输入未执行，撤销 `terminal.send` 留下的 pending 记录。
     CommandAbort,
 }
@@ -26,6 +28,7 @@ impl ShellEventKind {
             Self::PromptEnd => "B",
             Self::CommandStart => "C",
             Self::CommandEnd => "D",
+            Self::CommandOutput => "O",
             Self::CommandAbort => "X",
         }
     }
@@ -37,6 +40,7 @@ impl ShellEventKind {
             "B" => Some(Self::PromptEnd),
             "C" => Some(Self::CommandStart),
             "D" => Some(Self::CommandEnd),
+            "O" => Some(Self::CommandOutput),
             "X" => Some(Self::CommandAbort),
             _ => None,
         }
@@ -58,6 +62,11 @@ pub struct ShellEvent {
     pub started_at_ms: Option<i64>,
     /// `D` 命令结束的 Unix 毫秒时间戳（UTC）；旧探针不填。
     pub ended_at_ms: Option<i64>,
+    /// `O` 命令输出的 base64 编码 UTF-8 文本；其他事件为 `None`。
+    ///
+    /// 使用 base64 是为了避免 JSON 转义、换行与二进制/非 UTF-8 边界问题；
+    /// 单帧输出由宿主按 UTF-8 字符边界分片，service 按到达顺序拼接。
+    pub data: Option<String>,
 }
 
 #[cfg(test)]
@@ -72,6 +81,7 @@ mod tests {
             ShellEventKind::PromptEnd,
             ShellEventKind::CommandStart,
             ShellEventKind::CommandEnd,
+            ShellEventKind::CommandOutput,
             ShellEventKind::CommandAbort,
         ] {
             assert_eq!(ShellEventKind::parse(kind.as_str()), Some(kind));

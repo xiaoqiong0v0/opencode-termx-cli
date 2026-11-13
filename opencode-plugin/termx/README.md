@@ -10,6 +10,7 @@ opencode 插件：通过本机 `termx-service` 提供单个 **`termx_cli`** 终�
   配置目录默认在 `~/.opencode/plugins-cache/@xiaoqiong0v0/opencode-termx/termx-service/config`。
 - 若设置 `service.endpoint` 则直接连接、不自动启动；`service.autostart=false` 时只复用已运行实例。
 - 常用环境覆盖：`TERMX_CONFIG_DIR`、`TERMX_ENDPOINT`、`TERMX_TOKEN`、`TERMX_TOOL_LANG`（en/zh）。
+- `exec.timeoutMs`（默认 `5000`）与 `exec.pollMs`（默认 `1000`）控制 `exec` 默认同步等待上限与 busy 轮询间隔。
 - Web：默认仅本机 `http://127.0.0.1:<web.port>`（回环免登录，`web.port=0` 不启动）；远程需 `web.allowRemote=true` + `web.password`，登录页 `/login`。
 - opencode 会自动安装插件依赖（`.opencode/node_modules`）。
 
@@ -20,10 +21,21 @@ opencode 插件：通过本机 `termx-service` 提供单个 **`termx_cli`** 终�
 常用子命令：
 
 - `local ["<cmd>"]` / `ssh <user@host[:port]>`：创建常驻终端（`-n` 命名，默认 `default`）。
-- `exec "<command>" [-w]`：向已存在终端发送命令；`-w` 等待约 1 秒静默后返回新增输出（非精确命令边界）。
-- `run "<cmd>" [--pty]`：一次性创建、等待终态，返回输出与退出码。
-- `read [-n name]` / `send "<text>"` / `status` / `list` / `terminate` / `prune` 等：管理与读写终端。
+- `exec "<command>" [--base64 | --file PATH] [--async] [--timeout ms]`：向已存在终端发送命令；默认最多同步等待 `exec.timeoutMs`（默认 5s，可用 `--timeout` 覆盖）直到本次命令 transcript 完成。正常成功只返回输出正文；空输出、错误/中断、非零退出、静默完成（`best_effort`）、超时分别用本地化提示或 `[termx exec] ...` 首行说明，超时不中断进程。`--async` 立即返回；`-w` 已移除。多行/多条命令文本**不会**被合并成一条命令：每条实际执行的命令都是独立 transcript 记录，`exec` 只能匹配其中一条；需要收集结果时用 `read --last N`，必要时用 `--async`。
+- `read [-n name] [--last N | -s buffer|history] [--timeout ms] [--includeCommand]`：默认只读当前/最后一条命令；busy 时先等待 `exec.timeoutMs`；仍 busy 且未显式 `-s` 时只返回 `[termx read] ... state=busy`，`-s buffer` 给当前快照，`-s history` 给 `note=completed-only` 首行 + 最后一条已完成命令的输出。`--last N`（`-l N`）按块返回最后 N 条**已完成**命令（`status != running`）的输出，每块以稳定标记 `--- termx result i/N ---` 开头，标记内只放紧凑状态 flags（如 `[error exit_code=1]`、`[interrupted]`、`[best_effort]`）；绝不包含命令文本、`$ command`、cursor、终端 URL 或浏览器 URL。正常 idle 只返回标记与输出，不显示 `[termx read]` 首行；有界等待后仍 busy 时使用 `[termx read] ... source=history state=busy note=completed-only`。`--last` 不能与 `-s`、`--includeCommand` 或旧读取参数混用（会报参数冲突）；`N < 1` 直接报错。正常 idle 只返回输出（`--includeCommand` 加 `$ command`）；失败（error/interrupted/非零退出）优先于 `best_effort` 显示状态首行。旧 `--cursor/--max-bytes/--tail-lines/--tail-chars` 仍可用，但不能与 `-s` 或 `--last` 混用。
+- `run "<cmd>" [--pty]`：一次性创建、等待终态；成功只返回输出正文，退出码只出现在错误/中断 JSON（`output_type:"error"|"interrupted"`）里，空输出返回 `output_type:"empty"`。
+- `send "<text>" [--enter] [--base64 | --file PATH]` / `status` / `list` / `terminate` / `prune` 等：管理与写入终端。
 - `rebind --target-root <id>`：迁移绑定到其它 opencode 会话，必须经用户批准。
+
+### 载荷来源（exec / send）
+
+三种来源互斥：内联文本（默认）、`--base64 <b64>`、`--file <path>`。
+
+- `--base64` 允许参数里带空白/换行（先压紧再校验），只接受标准字母表且长度是 4 的倍数。
+- `--file` 读**插件进程本机**的 UTF-8 文件（不是远端文件）；`~`、`~/`、`~\` 展开为 home，相对路径按插件 cwd 解析。
+- 两者都严格解码：剥掉一个前导 UTF-8 BOM；非法 UTF-8 或含 NUL（多为 UTF-16/二进制）直接报错，不静默发送。
+- `exec` 对 base64/file 载荷做 CRLF→LF 并去掉外沿空白（内部换行保留）；`send` 按解码后的文本原样写入（不解释转义、不归一换行）。
+- 空载荷沿用“缺少命令/文本”错误；回执与错误只给来源/长度/路径，不回显载荷内容。
 
 分词规则与旧 `term_cli` 一致：支持单/双引号与空引号，未闭合引号直接报错。
 

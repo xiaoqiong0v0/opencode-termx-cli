@@ -72,12 +72,21 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// P1 的 in-band marker 会被 shell 回显并写入历史，污染 raw/历史记录；
 /// 等 hook-based shell integration 接上后再启用精确退出码。
 const TRANSCRIPT_MARKER_ENABLED: bool = false;
+/// 旧端兼容开关：强制 `termx-pwsh` 继续用 PTY 输出写 transcript。
+///
+/// 新端默认用带外 `O` 作为 transcript 输出来源；只有显式设置
+/// `TERMX_PWSH_PTY_TRANSCRIPT=1/true/on/yes` 才回到旧路径（含
+/// `allow_late_output`）。不得把它作为新端的正常路径。
+const PWSH_PTY_TRANSCRIPT_ENV: &str = "TERMX_PWSH_PTY_TRANSCRIPT";
 /// 单终端交互采样（`foreground_pgrp` + `tree`）的超时上限。
 ///
 /// 每个终端独立任务并带超时：任一后端的 `tree()` 卡住只影响自身，不会拖住
 /// 其它终端的采集，也不会阻塞 ticker 响应停止信号。
 const INTERACTION_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
-/// D 事件应用前的输出屏障上限；超时即退化为静默判定。
+/// D 事件应用前的输出屏障上限。
+///
+/// 超时只记录警告并继续应用 D：命令边界与退出码是权威信息，不能因为
+/// PTY 兜底输出顺序不完整而丢失。
 const OUTPUT_BARRIER_TIMEOUT: Duration = termx_proc::DEFAULT_BARRIER_TIMEOUT;
 /// 鉴权头名。
 const AUTHORIZATION_HEADER: &str = "authorization";
@@ -1982,6 +1991,30 @@ fn ssh_needs_helper(cmd: &str) -> bool {
         .is_some_and(is_structured_runtime)
 }
 
+/// 创建参数是否指向 `termx-pwsh`（runtime_id 或 cmd basename）。
+fn is_pwsh_runtime(params: &CreateParams) -> bool {
+    params.runtime_id.as_deref() == Some("termx-pwsh")
+        || params
+            .cmd
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name == "termx-pwsh")
+}
+
+/// 是否显式要求保留旧端 `termx-pwsh` 的 PTY transcript 路径。
+fn pwsh_pty_transcript_fallback() -> bool {
+    std::env::var(PWSH_PTY_TRANSCRIPT_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// SSH 历史记录键：host、port、user、auth_type。
 type SshHistoryRecord = (String, u16, String, &'static str);
 
@@ -2143,6 +2176,12 @@ async fn handle_create(
     } else {
         None
     };
+    // 新端 `termx-pwsh` 用带外 `O` 作为 transcript 输出来源：PTY 只负责
+    // xterm 显示，不再追加 transcript，避免 O + PTY 双写与尾段污染。
+    // 旧端兼容（保留 PTY transcript + allow_late_output）必须显式用
+    // `TERMX_PWSH_PTY_TRANSCRIPT=1` 打开，不能作为新端默认路径。
+    let transcript_output_from_events =
+        event_channel.is_some() && is_pwsh_runtime(&params) && !pwsh_pty_transcript_fallback();
 
     // 只做参数/冲突预检，不提前终止旧后端：否则旧进程退出的 `exited` 可能
     // 抢在 `register_create` 落 `interrupted` 之前。置换统一在锁内完成。
@@ -2178,6 +2217,7 @@ async fn handle_create(
             Arc::clone(&backend),
             foreground_pgrp,
             !event_channel_active,
+            transcript_output_from_events,
         )
     };
     let (result, displaced) = match registered {
@@ -2202,11 +2242,12 @@ async fn handle_create(
         TerminalId::new(result.terminal_id.clone()),
         events,
         Arc::clone(&output_gate),
+        !transcript_output_from_events,
     ));
     if let Some(channel) = event_channel {
         let (receiver, cancel) = channel.split();
         tokio::spawn(ingest_shell_events(
-            Arc::clone(registry),
+            Arc::clone(&registry),
             TerminalId::new(result.terminal_id.clone()),
             receiver,
             cancel,
@@ -2551,6 +2592,7 @@ async fn ingest_proc_events(
     terminal_id: TerminalId,
     mut events: Receiver<ProcEvent>,
     output_gate: Arc<OutputGate>,
+    record_pty_transcript: bool,
 ) {
     // 远端 helper 与本地通道共用同一套 command-id + 代次判定；跟踪器跨事件保留。
     let mut tracker = ShellEventTracker::new();
@@ -2566,6 +2608,7 @@ async fn ingest_proc_events(
                 &mut tracker,
                 event,
                 OffsetDateTime::now_utc(),
+                record_pty_transcript,
             )
         };
         match result {
@@ -2596,6 +2639,7 @@ fn apply_proc_event(
     tracker: &mut ShellEventTracker,
     event: ProcEvent,
     now: OffsetDateTime,
+    record_pty_transcript: bool,
 ) -> (Result<(), CoreError>, bool) {
     match event {
         ProcEvent::Output { data, stream } => {
@@ -2607,10 +2651,19 @@ fn apply_proc_event(
                 },
             );
             // 同一把锁内写入有界 transcript（短操作），再喂交互识别器。
+            // `transcript_output_from_events` 的终端由带外 `O` 提供输出，
+            // PTY 只用于显示，不能再追加，避免双写与尾段污染。
             let result = match reported {
                 Ok(_) => {
                     let text = String::from_utf8_lossy(&data);
-                    if let Err(error) = registry.record_transcript_output(terminal_id, &text, now) {
+                    let transcript_result = if record_pty_transcript {
+                        registry.record_transcript_output(terminal_id, &text, now)
+                    } else {
+                        // O 终端的 PTY 输出作为兜底：有 O 时丢弃，无 O
+                        // （native/直接 console）在 D 时并入 transcript。
+                        registry.record_pty_transcript_output(terminal_id, &text, now)
+                    };
+                    if let Err(error) = transcript_result {
                         tracing::debug!(%terminal_id, %error, "记录 transcript 输出失败");
                     }
                     registry.observe_output(terminal_id, &data, now).map(|_| ())
@@ -2647,8 +2700,10 @@ fn apply_proc_event(
 ///
 /// 只把 command-id 与代次都匹配的 `D` 交给
 /// [`Registry::record_transcript_end_for_generation`]；迟到/不匹配的 `D` 被
-/// 忽略，不会结束新命令。通道断开或终端被移除后退出，
-/// `cancel` 随任务一起释放，关闭 listener 并清理 socket/pipe。
+/// 忽略，不会结束新命令。通道断开或终端被移除后退出：退出前把终端切回
+/// 非事件输出模式（`set_transcript_output_from_events(false)`），让后续
+/// idle tick 能提升 PTY 兜底；`cancel` 随任务一起释放，关闭 listener 并
+/// 清理 socket/pipe。
 async fn ingest_shell_events(
     registry: Arc<Mutex<Registry>>,
     terminal_id: TerminalId,
@@ -2659,7 +2714,9 @@ async fn ingest_shell_events(
 ) {
     let mut tracker = ShellEventTracker::new();
     while let Some(event) = events.recv().await {
-        // 只有匹配当前 C 的 D 需要顺序屏障；A/B/C/X 立即应用。
+        // PTY 兜底输出仍可能承载 native/直接 console 文本，所以匹配的 D
+        // 应用前先做顺序屏障，尽量让 Output 先进入 transcript。`O` 与 `D`
+        // 本身在同一条 FIFO 通道内，天然先于 D 应用。
         let command_end = event.kind == crate::shell_events::ShellEventKind::CommandEnd
             && event.id.is_some()
             && tracker.active_command_id() == event.id.as_deref();
@@ -2671,14 +2728,13 @@ async fn ingest_shell_events(
             )
             .await
         {
-            // 屏障失败/超时：丢弃该 D，让静默判定收尾；迟到的输出仍可被
-            // best-effort 记录复活，避免挂到已真实结束的命令上。
+            // 屏障失败/超时：只降级为“输出可能不完整”，仍然应用 D。
+            // 命令边界与退出码必须保留，否则 transcript 会丢失真实结束
+            // 状态并退化为静默判定。
             tracing::warn!(
                 terminal_id = %terminal_id,
-                "输出屏障未完成，丢弃命令结束事件并退化为静默判定"
+                "输出屏障未完成，仍应用命令结束事件（PTY 兜底输出顺序可能不完整）"
             );
-            let _ = tracker.observe(&event, 0);
-            continue;
         }
 
         let applied = {
@@ -2696,6 +2752,23 @@ async fn ingest_shell_events(
             // 终端被 force 替换或删除：结束摄取。
             Err(CoreError::NotFound) => break,
             Err(error) => tracing::debug!(%error, terminal_id = %terminal_id, "shell 事件写入失败"),
+        }
+    }
+
+    // 通道结束（宿主退出/管道断开）：不会再有 `O` 或 `D`。把终端切回非事件
+    // 输出模式，让下一次 idle tick 的静默判定能提升 `C..D` 期间收集的 PTY
+    // 兜底。只在短锁内写一个布尔值，不在此处 `await`/阻塞。
+    let switched = {
+        let mut registry = lock_registry(&registry);
+        registry.set_transcript_output_from_events(&terminal_id, false)
+    };
+    match switched {
+        Ok(true) => tracing::debug!(%terminal_id, "事件通道结束，transcript 切回 PTY 兜底模式"),
+        Ok(false) => {}
+        // 终端已被移除：无需再切换。
+        Err(CoreError::NotFound) => {}
+        Err(error) => {
+            tracing::debug!(%error, terminal_id = %terminal_id, "切换 transcript 输出模式失败")
         }
     }
 }
@@ -3246,6 +3319,7 @@ mod tests {
         registry: &Arc<Mutex<Registry>>,
         terminal_id: &str,
         events: Vec<ProcEvent>,
+        record_pty_transcript: bool,
     ) {
         let (tx, rx) = channel(8);
         let gate = Arc::new(OutputGate::new());
@@ -3254,6 +3328,7 @@ mod tests {
             TerminalId::new(terminal_id.to_string()),
             rx,
             gate,
+            record_pty_transcript,
         ));
         for event in events {
             tx.send(event).await.expect("摄取任务应仍在运行");
@@ -3293,6 +3368,20 @@ mod tests {
             command: None,
             started_at_ms: None,
             ended_at_ms: None,
+            data: None,
+        })
+    }
+
+    /// 构造带 base64 文本的 `O` 事件。
+    fn shell_output_event(text: &str, id: &str) -> ProcEvent {
+        ProcEvent::ShellEvent(ShellEvent {
+            kind: ShellEventKind::CommandOutput,
+            code: None,
+            id: Some(id.to_string()),
+            command: None,
+            started_at_ms: None,
+            ended_at_ms: None,
+            data: Some(BASE64_STANDARD.encode(text.as_bytes())),
         })
     }
 
@@ -3316,6 +3405,7 @@ mod tests {
                 shell_proc_event(ShellEventKind::CommandStart, None, "cmd-1"),
                 shell_proc_event(ShellEventKind::CommandEnd, Some(7), "cmd-1"),
             ],
+            true,
         )
         .await;
 
@@ -3343,6 +3433,7 @@ mod tests {
             &mut tracker,
             shell_proc_event(ShellEventKind::CommandStart, None, "cmd-1"),
             now(),
+            true,
         );
         assert!(!terminal);
         // service 已记录新命令 g2，旧 C 的迟到 D 必须被忽略。
@@ -3355,6 +3446,7 @@ mod tests {
             &mut tracker,
             shell_proc_event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
             now() + time::Duration::seconds(2),
+            true,
         );
         assert!(result.is_ok());
         assert!(!terminal);
@@ -3394,6 +3486,7 @@ mod tests {
                 data: b"hi".to_vec(),
                 stream: OutputStream::Pty,
             }],
+            true,
         )
         .await;
 
@@ -3401,5 +3494,39 @@ mod tests {
         assert_eq!(command.status, termx_protocol::TranscriptStatus::Running);
         assert_eq!(command.exit_code, None);
         assert_eq!(command.ended_at, None);
+    }
+
+    #[tokio::test]
+    async fn output_events_fill_transcript_without_pty_tail() {
+        let (registry, terminal_id) = proc_event_terminal();
+        {
+            let mut guard = lock_registry(&registry);
+            guard
+                .record_transcript_command(&TerminalId::new(terminal_id.clone()), "first", now())
+                .expect("记录命令");
+        }
+        feed_proc_events(
+            &registry,
+            &terminal_id,
+            vec![
+                // PTY 只负责显示：即使先到也不能写 transcript。
+                ProcEvent::Output {
+                    data: b"prompt-echo".to_vec(),
+                    stream: OutputStream::Pty,
+                },
+                shell_proc_event(ShellEventKind::CommandStart, None, "cmd-1"),
+                shell_output_event("one\n", "cmd-1"),
+                shell_output_event("two\n", "cmd-1"),
+                shell_proc_event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+            ],
+            false,
+        )
+        .await;
+
+        let command = first_transcript(&registry, &terminal_id);
+        assert_eq!(command.status, termx_protocol::TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(0));
+        assert_eq!(command.output, "one\ntwo");
+        assert!(!command.output.contains("prompt-echo"));
     }
 }

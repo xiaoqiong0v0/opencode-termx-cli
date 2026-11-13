@@ -3,10 +3,13 @@
 //! 传输、token 校验与 JSON Lines 帧解析在 [`termx_shell_events`] 中；本模块
 //! 只保留与 registry 相关的判定逻辑：
 //! - `C` 绑定当时最后一条 transcript 命令的代次；
+//! - `O` 只有 command-id 与当前 active 一致时解码 base64/UTF-8 并追加到该
+//!   代次命令，不生成 xterm 输出；
 //! - `D` 只有 command-id 与代次都匹配时才结束 transcript，避免旧命令的迟到
 //!   `D` 关掉新命令；
 //! - 通道失败/断开只让 transcript 退化为静默判定，不伪造退出码。
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use termx_core::{CoreError, Registry, TerminalId};
 use time::OffsetDateTime;
 
@@ -73,6 +76,8 @@ impl ShellEventTracker {
                 Some((generation, event.code))
             }
             ShellEventKind::PromptStart | ShellEventKind::PromptEnd => None,
+            // `O` 不改变 active 命令；匹配与追加由 `apply_event` 处理。
+            ShellEventKind::CommandOutput => None,
             // `X`：多行输入未执行，丢弃当前 active，避免迟到的 `D` 误结束。
             ShellEventKind::CommandAbort => {
                 self.active = None;
@@ -114,6 +119,9 @@ pub fn apply_event(
             )
         }
         ShellEventKind::PromptStart | ShellEventKind::PromptEnd => Ok(false),
+        ShellEventKind::CommandOutput => {
+            apply_command_output(registry, terminal_id, tracker, event, now)
+        }
         // `X`：撤销 `terminal.send` 留下但未执行的 pending 记录。
         ShellEventKind::CommandAbort => {
             let _ = tracker.observe(event, 0);
@@ -121,6 +129,38 @@ pub fn apply_event(
             Ok(false)
         }
     }
+}
+
+/// 处理 `O`：只有 command-id 与当前 active 一致时把输出追加到该命令。
+///
+/// `O` 与 `C`/`D` 走同一条 FIFO 通道；这里再校验 command-id 与代次，避免
+/// 旧命令或伪造事件污染新命令。base64/UTF-8 解码失败按无变更处理。
+fn apply_command_output(
+    registry: &mut Registry,
+    terminal_id: &TerminalId,
+    tracker: &ShellEventTracker,
+    event: &ShellEvent,
+    now: OffsetDateTime,
+) -> Result<bool, CoreError> {
+    let Some(active_id) = tracker.active_command_id() else {
+        return Ok(false);
+    };
+    if event.id.as_deref() != Some(active_id) {
+        return Ok(false);
+    }
+    let Some(generation) = tracker.active_generation() else {
+        return Ok(false);
+    };
+    let Some(data) = event.data.as_deref() else {
+        return Ok(false);
+    };
+    let Ok(bytes) = STANDARD.decode(data) else {
+        return Ok(false);
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(false);
+    };
+    registry.record_transcript_output_for_generation(terminal_id, generation, &text, now)
 }
 
 /// 处理 `C`：认领 pending 或新建记录，并绑定代次供后续 `D` 使用。

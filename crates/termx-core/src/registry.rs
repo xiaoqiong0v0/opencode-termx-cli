@@ -408,21 +408,27 @@ impl Registry {
         backend: Arc<dyn TerminalBackend>,
         foreground_pgrp: Option<u32>,
     ) -> Result<(CreateResult, Option<Arc<dyn TerminalBackend>>), CoreError> {
-        self.register_create_with(params, backend, foreground_pgrp, true)
+        self.register_create_with(params, backend, foreground_pgrp, true, false)
     }
 
-    /// 注册一个已启动的后端，并指定是否解析 stdout 上的 in-band OSC。
+    /// 注册一个已启动的后端，并指定事件来源与 transcript 输出来源。
     ///
     /// `in_band_osc=false` 用于自带带外事件通道的运行时（本地 `termx-pwsh`/
     /// `termx-bash` 或远端 helper 通道）：子程序输出的 `133/633` 不再结束命令，
     /// 退出码只来自事件通道；同时 `terminal.send` 不再预记录 transcript 命令。
     /// 其他语义与 [`Registry::register_create`] 完全一致。
+    ///
+    /// `transcript_output_from_events=true` 表示命令输出改由带外 `O` 事件提供，
+    /// PTY 输出只用于显示、不再追加到 transcript；此时也不启用迟到的 PTY
+    /// 尾段兜底（`allow_late_output`），静默结束不提前提升兜底（避免与迟到
+    /// `O` 重复）。旧端/远端/raw 终端传 `false`。
     pub fn register_create_with(
         &mut self,
         params: CreateParams,
         backend: Arc<dyn TerminalBackend>,
         foreground_pgrp: Option<u32>,
         in_band_osc: bool,
+        transcript_output_from_events: bool,
     ) -> Result<(CreateResult, Option<Arc<dyn TerminalBackend>>), CoreError> {
         validate_create(&params)?;
 
@@ -466,13 +472,14 @@ impl Registry {
         let pgid = backend.pgid();
         let ssh = params.ssh.is_some();
         let runtime_id = params.runtime_id.clone();
-        let allow_late_output = params.runtime_id.as_deref() == Some("termx-pwsh")
-            || params
-                .cmd
-                .trim()
-                .rsplit(['/', '\\'])
-                .next()
-                .is_some_and(|name| name == "termx-pwsh");
+        let allow_late_output = !transcript_output_from_events
+            && (params.runtime_id.as_deref() == Some("termx-pwsh")
+                || params
+                    .cmd
+                    .trim()
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|name| name == "termx-pwsh"));
 
         let entry = TerminalEntry {
             id: id.clone(),
@@ -512,7 +519,8 @@ impl Registry {
                 self.transcript_capacity,
                 in_band_osc,
                 allow_late_output,
-            ),
+            )
+            .with_output_from_events(transcript_output_from_events),
             analyzer: InteractionAnalyzer::with_start_time(
                 self.interaction_config,
                 OffsetDateTime::now_utc(),
@@ -713,6 +721,37 @@ impl Registry {
         Ok(entry.transcript.record_output(text, now))
     }
 
+    /// 按代次追加一段带外 `O` 输出。
+    ///
+    /// 只有当前最后一条命令的 generation 与 `generation` 匹配时才追加，避免
+    /// 迟到/跨命令输出污染新命令。空文本或未知终端按无变更处理。
+    pub fn record_transcript_output_for_generation(
+        &mut self,
+        id: &TerminalId,
+        generation: u64,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, CoreError> {
+        if text.is_empty() {
+            return Ok(false);
+        }
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry
+            .transcript
+            .record_output_for_generation(generation, text, now))
+    }
+
+    /// 收集 PTY 输出作为无 `O` 命令的兜底，不立即进入 transcript。
+    pub fn record_pty_transcript_output(
+        &mut self,
+        id: &TerminalId,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.record_pty_output_for_current(text, now))
+    }
+
     /// 以 `shell_integration` 来源结束当前命令。
     ///
     /// 用于不携带代次证据的调用方（如 in-band OSC）；带外事件通道应使用
@@ -776,6 +815,9 @@ impl Registry {
     }
 
     /// 对所有终端执行静默结束判定，返回被标记为 `done` 的命令数。
+    ///
+    /// `output_from_events=true` 的终端不由静默判定结束（`O` 来源命令只由
+    /// 宿主 `D` 结束），见 [`TranscriptBuffer::finalize_quiet`]。
     pub fn finalize_quiet_transcripts(&mut self, now: OffsetDateTime, quiet: Duration) -> usize {
         let mut finalized = 0;
         for entry in self.by_id.values_mut() {
@@ -784,6 +826,20 @@ impl Registry {
             }
         }
         finalized
+    }
+
+    /// 切换终端 transcript 文本是否权威地来自带外 `O` 事件。
+    ///
+    /// 事件通道结束（宿主退出/管道断开）后由 service 调回 `false`，让下一次
+    /// idle tick 的静默判定可以提升 `C..D` 期间收集的 PTY 兜底；未知终端
+    /// 返回 [`CoreError::NotFound`]。返回是否发生变更。
+    pub fn set_transcript_output_from_events(
+        &mut self,
+        id: &TerminalId,
+        output_from_events: bool,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.set_output_from_events(output_from_events))
     }
 
     /// 读取最近命令记录；`limit` 为 `None`/0 时返回全部保留记录。

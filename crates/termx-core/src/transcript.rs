@@ -38,6 +38,11 @@ struct CommandRecord {
     status: TranscriptStatus,
     /// 原始输出（保留 ANSI，读取时清洗）。
     output: String,
+    /// PTY 兜底输出：仅在命令没有任何 `O` 事件时于结束时并入 `output`。
+    /// 用于 native/直接 console 命令；有 `O` 时丢弃，避免双写。
+    pty_output: String,
+    /// 当前命令是否已收到 `O` 输出事件。
+    event_output_seen: bool,
     /// 输出是否已因超过上限被截断（只追加一次标记）。
     truncated: bool,
     /// 最后一次收到输出的时间；用于静默判定。
@@ -93,6 +98,13 @@ pub struct TranscriptBuffer {
     /// 仅用于宿主无法保证 D 在最后一段输出之后的平台（当前 Windows
     /// ConPTY 的 `termx-pwsh`）；命令状态仍保持 `done`，只追加迟到输出。
     allow_late_output: bool,
+    /// transcript 文本是否权威地来自带外 `O` 事件。
+    ///
+    /// `true` 时命令只由宿主 `D` 结束：静默判定完全不生效，避免 1s 无输出
+    /// 就把仍在运行的长命令标成 `done`（影长命令需等到 `D` 才返回输出）；
+    /// 兜底只是“没有 O 时”的补充，也不提前提升。事件通道死亡后由 service
+    /// 调回 `false`，让后续 idle tick 能提升 PTY 兜底。默认 `false`。
+    output_from_events: bool,
 }
 
 impl TranscriptBuffer {
@@ -129,7 +141,34 @@ impl TranscriptBuffer {
             scanner: OscScanner::new(),
             in_band_osc,
             allow_late_output,
+            output_from_events: false,
         }
+    }
+
+    /// 设置 transcript 文本是否权威地来自带外 `O` 事件；返回自身便于链式构造。
+    ///
+    /// 默认 `false`（PTY/OSC 路径）；`termx-pwsh` 本地带外事件终端传 `true`。
+    pub fn with_output_from_events(mut self, output_from_events: bool) -> Self {
+        self.output_from_events = output_from_events;
+        self
+    }
+
+    /// 当前 transcript 文本是否权威地来自带外 `O` 事件。
+    pub fn output_from_events(&self) -> bool {
+        self.output_from_events
+    }
+
+    /// 切换 transcript 文本是否权威地来自带外 `O` 事件。
+    ///
+    /// 事件通道断开/失败后由 service 切回 `false`，让静默判定重新可以提升
+    /// `C..D` 期间收集的 PTY 兜底。不改变已有记录，也不递增修订号；返回是否
+    /// 发生变更。
+    pub fn set_output_from_events(&mut self, output_from_events: bool) -> bool {
+        if self.output_from_events == output_from_events {
+            return false;
+        }
+        self.output_from_events = output_from_events;
+        true
     }
 
     /// 当前是否解析 in-band OSC。
@@ -241,6 +280,8 @@ impl TranscriptBuffer {
             ended_at: None,
             status: TranscriptStatus::Running,
             output: String::new(),
+            pty_output: String::new(),
+            event_output_seen: false,
             truncated: false,
             last_output_at: now,
             exit_code: None,
@@ -295,6 +336,65 @@ impl TranscriptBuffer {
             self.bump();
             return true;
         }
+        false
+    }
+
+    /// 按代次追加一段输出（带外 `O` 事件使用）。
+    ///
+    /// 只有当前最后一条命令的 generation 匹配时才追加，避免迟到/跨命令的
+    /// 输出污染新命令。不解析 in-band OSC；`O` 的文本已是命令输出本身。
+    /// 空文本、代次不匹配或命令已真实结束时忽略。返回是否发生变更。
+    pub fn record_output_for_generation(
+        &mut self,
+        generation: u64,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let Some(last) = self.commands.back() else {
+            return false;
+        };
+        if last.generation != generation {
+            return false;
+        }
+        if let Some(last) = self.commands.back_mut() {
+            if !last.event_output_seen {
+                last.event_output_seen = true;
+                // O 是权威文本；丢弃此前收集的 PTY 兜底，避免双写。
+                last.pty_output.clear();
+            }
+        }
+        if self.append_output(text, now) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 收集 PTY 输出作为兜底：仅当命令最终没有任何 `O` 时，在内结束
+    /// 时并入 transcript。用于 native/直接 console 文本；有 O 时会被丢弃。
+    ///
+    /// 不递增 revision、不改变状态；prompt/D 后的输出不会命中 running 命令。
+    pub fn record_pty_output_for_current(&mut self, text: &str, now: OffsetDateTime) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let Some(last) = self.commands.back_mut() else {
+            return false;
+        };
+        if last.status != TranscriptStatus::Running || last.event_output_seen {
+            return false;
+        }
+        last.last_output_at = now;
+        if last.pty_output.len() >= MAX_OUTPUT_BYTES {
+            return false;
+        }
+        let remaining = MAX_OUTPUT_BYTES.saturating_sub(last.pty_output.len());
+        let take = floor_char_boundary(text, remaining.min(text.len()));
+        last.pty_output.push_str(&text[..take]);
         false
     }
 
@@ -397,8 +497,17 @@ impl TranscriptBuffer {
     ///
     /// `ended_at` 取最后一次输出时间（无输出时即开始时间）。静默推断
     /// 来源标为 `process_group` 且 `best_effort=true`；不伪造退出码。
+    ///
+    /// `output_from_events=true` 时**完全不生效**（返回 `false`，状态/输出
+    /// 不变）：`O` 来源命令只由宿主 `D` 结束，1s 静默不能提前把一个仍在
+    /// 运行的长命令标成完成。事件通道死亡后 service 会先切回
+    /// `output_from_events=false`，下一次 tick 才允许提升 PTY 兜底。
+    ///
     /// 返回是否发生变更。
     pub fn finalize_quiet(&mut self, now: OffsetDateTime, quiet: Duration) -> bool {
+        if self.output_from_events {
+            return false;
+        }
         let Some(last) = self.commands.back_mut() else {
             return false;
         };
@@ -409,6 +518,7 @@ impl TranscriptBuffer {
         if idle < time::Duration::try_from(quiet).unwrap_or(time::Duration::ZERO) {
             return false;
         }
+        promote_pty_fallback(last);
         last.status = TranscriptStatus::Done;
         last.ended_at = Some(last.last_output_at);
         last.source = Some(TranscriptSource::ProcessGroup);
@@ -427,6 +537,7 @@ impl TranscriptBuffer {
         if last.status != TranscriptStatus::Running {
             return false;
         }
+        promote_pty_fallback(last);
         last.status = status;
         last.ended_at = Some(now);
         self.bump();
@@ -509,6 +620,15 @@ impl Default for TranscriptBuffer {
     }
 }
 
+/// 命令没有任何 `O` 输出时，把收集到的 PTY 兜底并入正式输出。
+fn promote_pty_fallback(record: &mut CommandRecord) {
+    if record.event_output_seen || record.pty_output.is_empty() {
+        return;
+    }
+    let fallback = std::mem::take(&mut record.pty_output);
+    append_output_limited(record, &fallback);
+}
+
 /// 结束一条命令记录：`running` 或可升级的 `best_effort done` 才生效。
 ///
 /// 返回是否发生变更；不触碰修订号，由调用方统一 bump。
@@ -522,6 +642,7 @@ fn finish_command(
     if record.status != TranscriptStatus::Running && !upgradeable {
         return false;
     }
+    promote_pty_fallback(record);
     record.status = TranscriptStatus::Done;
     record.ended_at = Some(now);
     record.exit_code = exit_code;
@@ -1152,6 +1273,113 @@ mod tests {
         assert_eq!(command.status, TranscriptStatus::Done);
         assert_eq!(command.exit_code, Some(4));
         assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
+    }
+
+    #[test]
+    fn pty_fallback_is_promoted_when_command_has_no_output_events() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false);
+        let t0 = base();
+        let generation = buffer.record_command("cmd /c echo hi", t0);
+        buffer.record_pty_output_for_current("hi\r\n", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "hi");
+    }
+
+    #[test]
+    fn pty_fallback_is_discarded_when_output_event_exists() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false);
+        let t0 = base();
+        let generation = buffer.record_command("Write-Output hi", t0);
+        buffer.record_pty_output_for_current("PTY duplicate\r\n", t0);
+        assert!(buffer.record_output_for_generation(generation, "hi\n", t0));
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "hi");
+    }
+
+    #[test]
+    fn quiet_finalize_ignored_for_event_output() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false).with_output_from_events(true);
+        let t0 = base();
+        buffer.record_command("Start-Sleep 3; Write-Output late", t0);
+        // PTY 兜底先到（混合 host/native 命令），静默判定必须完全不生效。
+        buffer.record_pty_output_for_current("PTY fallback\r\n", t0);
+        assert!(!buffer.finalize_quiet(t0 + time::Duration::seconds(3), DEFAULT_QUIET_FINALIZE));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Running);
+        assert!(command.ended_at.is_none(), "O 来源命令只能由 D 结束");
+        assert!(!command.best_effort);
+        assert_eq!(command.output, "");
+    }
+
+    #[test]
+    fn quiet_finalize_after_event_channel_death_promotes_fallback() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false).with_output_from_events(true);
+        let t0 = base();
+        buffer.record_command("cmd /c echo hi", t0);
+        buffer.record_pty_output_for_current("hi\r\n", t0);
+
+        assert!(
+            buffer.set_output_from_events(false),
+            "通道死亡后应切回兜底模式"
+        );
+        assert!(!buffer.set_output_from_events(false), "重复切换不再变更");
+        assert!(buffer.finalize_quiet(t0 + time::Duration::seconds(2), DEFAULT_QUIET_FINALIZE));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.status, TranscriptStatus::Done);
+        assert!(command.best_effort);
+        assert_eq!(command.output, "hi");
+    }
+
+    #[test]
+    fn late_event_output_not_duplicated_with_fallback() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false).with_output_from_events(true);
+        let t0 = base();
+        let generation = buffer.record_command("Write-Output late", t0);
+        buffer.record_pty_output_for_current("PTY fallback\r\n", t0);
+        assert!(!buffer.finalize_quiet(t0 + time::Duration::seconds(2), DEFAULT_QUIET_FINALIZE));
+
+        // 迟到的 O 到达：只应留下 O 文本，不得与兜底重复。
+        assert!(buffer.record_output_for_generation(
+            generation,
+            "event text\n",
+            t0 + time::Duration::seconds(3)
+        ));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "event text");
+        assert!(
+            !command.output.contains("PTY fallback"),
+            "静默提升兜底会与迟到 O 重复: {:?}",
+            command.output
+        );
+    }
+
+    #[test]
+    fn quiet_finalize_promotes_fallback_without_event_output() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false);
+        let t0 = base();
+        buffer.record_command("cmd /c echo hi", t0);
+        buffer.record_pty_output_for_current("hi\r\n", t0);
+        assert!(buffer.finalize_quiet(t0 + time::Duration::seconds(2), DEFAULT_QUIET_FINALIZE));
+
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "hi");
+        assert!(command.best_effort);
     }
 
     #[test]

@@ -214,7 +214,13 @@ fn structured_terminal() -> (Registry, String) {
     let create_params = params("structured");
     registry.prepare_create(&create_params).expect("预检应成功");
     let (created, displaced) = registry
-        .register_create_with(create_params, Arc::new(MockBackend::new()), None, false)
+        .register_create_with(
+            create_params,
+            Arc::new(MockBackend::new()),
+            None,
+            false,
+            false,
+        )
         .expect("注册应成功");
     assert!(displaced.is_none());
     (registry, created.terminal_id)

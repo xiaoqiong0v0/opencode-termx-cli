@@ -27,7 +27,7 @@
 ```
 
 - `termx-helper` 保持一份 core + platform：`core` 只负责协议、握手、事件转发与生命周期；`unix` 负责 PTY/UDS/termios 适配，`windows` 负责 ConPTY/named pipe 适配。平台差异只用 `cfg` 选择模块，不在 core 内按平台分叉。
-- 受管 shell：`termx-pwsh` 与 `termx-bash` 使用同一带外事件协议（A/B/C/D/X）。本地由 runtime catalog 提供；远端由 helper 在 `spawn.events=true` 时注入 `TERMX_EVENT_ENDPOINT/TOKEN`。普通 bash/sh 仍是 raw-only。两者的带外事件与 PTY 输出都是两条链路：`terminal.send` 先落 pending 命令记录，`D` 前通过 PTY 输出屏障（Unix `FIONREAD`/控制 pipe，Windows `CancelSynchronousIo`/`PeekNamedPipe`）保证先于它的 Output 已排队/转发；Windows `termx-pwsh` 对 ConPTY 晚于 D 的尾段输出启用 `allow_late_output`，追加到最后一条已结束命令。不靠 sleep 时间窗口或往 stdout/OSC 注入 marker。
+- 受管 shell：`termx-pwsh` 与 `termx-bash` 使用同一带外事件协议（A/B/C/D/X）。本地由 runtime catalog 提供；远端由 helper 在 `spawn.events=true` 时注入 `TERMX_EVENT_ENDPOINT/TOKEN`。普通 bash/sh 仍是 raw-only。Windows `termx-pwsh` 的命令输出由宿主 `O` 事件提供，PTY 只负责 xterm 显示；`C/O/D` 同一 FIFO，命令外的 prompt 与回显无 active command-id，不进入 transcript（命令内 `Read-Host` 等提示仍有 id，作为 `O` 记录）。native/直接 console 文本在 `C..D` 间进入有界 PTY 兜底，只有整条命令没有 `O` 时才并入 transcript；TUI/脱离当前 console 不承诺文本。不靠 sleep、prompt 字符、OSC/token 注入或 PTY 尾段猜测。
 
 ## 2. 核心原则
 1. **服务拥有终端**：会话、PTY、进程树、buffer、事件全部在 `termx-service`；opencode/Web/CLI 只是客户端。

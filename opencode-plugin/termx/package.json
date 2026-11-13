@@ -19,6 +19,7 @@
     "build": "tsc && node scripts/copy-runtime.mjs",
     "build:opencode": "node scripts/build-opencode.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "repository": {

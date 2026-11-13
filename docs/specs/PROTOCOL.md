@@ -331,6 +331,7 @@
   - 关闭 in-band OSC 的判定是严格三级门槛：`ssh + pty + basename(cmd)` 属于结构化程序（`termx-pwsh`/`termx-bash`，后端快照 `shell_events()`）、helper 声明 `shell_events`、`started.events=true`；任一不满足（含旧 helper、普通 SSH、fallback）都保持 in-band 解析，不伪造退出码。
   - 公开 WebSocket `Capabilities` 不新增字段；事件通道状态只影响 service 内部 transcript 判定。
 - 本地结构化 runtime：`termx-pwsh`、`termx-bash`（见 CONFIG §3.2）。只有这些 runtime ID 的本地 PTY 会创建带外事件通道；直接启动的普通 shell 保持 raw-only，`structured_events=false`。
+- 本地 `termx-pwsh` 的宿主输出事件 `O`：`{"v":1,"event":"O","id":"<command-id>","data":"<base64 UTF-8>"}`。`O` 只在 active command-id 存在时发送，与 `C/D` 同一 FIFO；service 按 command-id/代次追加 transcript，不生成 xterm output。命令外的 prompt、输入回显与 `D` 后输出没有 active id，不得进入 transcript；命令执行中的交互提示（如 `Read-Host`）仍有 active id，目前作为 `O` 记录。native/直接 console 的文本由 `C..D` PTY 兜底，仅在整条命令没有 `O` 时并入 transcript；TUI/脱离当前 console 不承诺文本。默认不使用 OSC/token/sleep 或 PTY 尾段猜测。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全

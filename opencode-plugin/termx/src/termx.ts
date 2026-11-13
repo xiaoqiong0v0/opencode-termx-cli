@@ -89,7 +89,7 @@ const server: Plugin = async () => {
   const connection = createConnection(config);
   // 参考旧项目：插件初始化即后台启动 service，不阻塞 opencode；已有实例会被 probe 复用。
   if (config.service.autostart) connection.warmup();
-  /** read/exec -w 的每终端增量游标。 */
+  /** read 的每终端增量游标。 */
   const cursors = new Map<string, number>();
 
   // 会话心跳：每个 opencode 会话使用自己的连接；Web 不经过插件，不发心跳。
@@ -135,6 +135,7 @@ const server: Plugin = async () => {
   const deps: CliDeps = {
     t,
     cursors,
+    exec: config.exec,
     async client(ctx): Promise<TermxClient> {
       const root = ctx.sessionID || process.env.TERMX_ROOT_SESSION_ID || "default";
       const client = await connection.client(root);

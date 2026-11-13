@@ -2,10 +2,13 @@
 //!
 //! `termx-pwsh` 在启动时读取宿主注入的 `TERMX_EVENT_ENDPOINT` 与
 //! `TERMX_EVENT_TOKEN`，连接后先发一行 token 握手，再按 JSON Lines 发送
-//! `A/B/C/D/X` 事件。通道不占用 TCP 端口。
+//! `A/B/C/D/O/X` 事件。通道不占用 TCP 端口。
 //!
-//! 本 crate 只负责传输与帧解析；`C`/`D` 的 command-id + transcript 代次语义
+//! 本 crate 只负责传输与帧解析；`C`/`D`/`O` 的 command-id + transcript 代次语义
 //! 由 service 的 `ShellEventTracker` 实现。
+//!
+//! `O` 携带命令输出（`id` + base64 `data`），与 `C`/`D` 走同一条 FIFO 队列，
+//! 因此输出先于命令结束事件到达；prompt 与命令行回显不属于命令输出。
 //!
 //! 安全与健壮性：
 //! - token 使用常量时间比较，日志不输出 token 或 endpoint 中的随机名；
@@ -120,6 +123,8 @@ struct WireEvent {
     started_at_ms: Option<i64>,
     #[serde(default)]
     ended_at_ms: Option<i64>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 /// 监听端只持有 `AsyncRead`；服务端不需要回写。
@@ -161,6 +166,7 @@ where
             command: wire.command,
             started_at_ms: wire.started_at_ms,
             ended_at_ms: wire.ended_at_ms,
+            data: wire.data,
         };
         if sender.send(event).await.is_err() {
             break;
@@ -307,5 +313,27 @@ impl Drop for UnixSocketCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `O` 的 base64 data 必须能解析；旧事件没有 data 时按 None 兼容。
+    #[test]
+    fn wire_event_parses_output_data_and_legacy_events() {
+        let output: WireEvent =
+            serde_json::from_str(r#"{"v":1,"event":"O","id":"cmd-1","data":"aGVsbG8="}"#)
+                .expect("O 事件应可解析");
+        assert_eq!(output.event, "O");
+        assert_eq!(output.id.as_deref(), Some("cmd-1"));
+        assert_eq!(output.data.as_deref(), Some("aGVsbG8="));
+
+        let legacy: WireEvent =
+            serde_json::from_str(r#"{"v":1,"event":"D","code":0,"id":"cmd-1"}"#)
+                .expect("旧 D 事件应兼容");
+        assert_eq!(legacy.event, "D");
+        assert_eq!(legacy.data, None);
     }
 }

@@ -750,6 +750,7 @@ mod tests {
             command: Some("echo hi".to_string()),
             started_at_ms: Some(1_700_000_000_000),
             ended_at_ms: Some(1_700_000_001_000),
+            data: None,
         });
         assert_eq!(
             event,
@@ -811,6 +812,7 @@ mod tests {
                 command: None,
                 started_at_ms: None,
                 ended_at_ms: None,
+                data: None,
             }
         }
 

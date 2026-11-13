@@ -1259,6 +1259,9 @@ async fn handle_event(
                         command,
                         started_at_ms,
                         ended_at_ms,
+                        // 远端 helper 协议尚未转发 `O` 的 data；远端 transcript
+                        // 继续走 PTY 输出路径。
+                        data: None,
                     },
                 ))
                 .await
@@ -1731,6 +1734,7 @@ mod tests {
                     command: Some("echo hi".to_string()),
                     started_at_ms: Some(1_700_000_000_000),
                     ended_at_ms: Some(1_700_000_001_000),
+                    data: None,
                 }
             ))
         );

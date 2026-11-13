@@ -281,6 +281,7 @@ async fn termx_bash_is_structured_while_plain_bash_is_raw_only() {
             command: Some("echo hi".to_string()),
             started_at_ms: Some(millis(started)),
             ended_at_ms: None,
+            data: None,
         };
         apply_event(&mut registry, &terminal_id, &mut tracker, &start, started).expect("C 事件");
     }
@@ -293,6 +294,7 @@ async fn termx_bash_is_structured_while_plain_bash_is_raw_only() {
             command: None,
             started_at_ms: None,
             ended_at_ms: Some(millis(ended)),
+            data: None,
         };
         assert!(
             apply_event(&mut registry, &terminal_id, &mut tracker, &end, ended).expect("D 事件")
@@ -458,6 +460,7 @@ async fn event_channel_terminal_pre_records_pending_before_command_start() {
             command: Some("run".to_string()),
             started_at_ms: Some(millis(started)),
             ended_at_ms: None,
+            data: None,
         };
         assert!(
             !apply_event(&mut registry, &terminal_id, &mut tracker, &start, started)
@@ -470,6 +473,7 @@ async fn event_channel_terminal_pre_records_pending_before_command_start() {
             command: None,
             started_at_ms: None,
             ended_at_ms: Some(millis(ended)),
+            data: None,
         };
         assert!(
             apply_event(&mut registry, &terminal_id, &mut tracker, &end, ended).expect("D 事件")

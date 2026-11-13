@@ -6,8 +6,8 @@
 //! 1. 后端读侧屏障：排空当前已可读的 PTY 输出并把 `Output` 入队；
 //! 2. 处理进度门：等 `ingest_proc_events` 处理到屏障返回的序号后，才应用 D。
 //!
-//! 超时/失败时返回 `false`，调用方应丢弃该 D，让 transcript 退化为静默判定，
-//! 不得伪造退出码。
+//! 超时/失败时返回 `false`，调用方应记录警告但**仍然应用该 D**：命令边界与
+//! 退出码必须保留，只是 PTY 兜底输出的顺序可能不完整。不得丢弃 D 或伪造退出码。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,7 +101,8 @@ async fn wait_processed(
 /// D 事件应用前的输出屏障。
 ///
 /// 先让后端排空当前可读输出，再等 `ingest_proc_events` 处理到该输出序号。
-/// 返回 `false` 表示屏障失败或超时，调用方应丢弃该 D 并退化为静默判定。
+/// 返回 `false` 表示屏障失败或超时；调用方记录警告后仍应应用该 D（命令
+/// 边界/退出码不丢），只是 PTY 兜底输出顺序可能不完整。
 /// 后端不支持屏障（stdio/Windows/SSH）时返回 `true`，保持既有行为。
 pub async fn barrier_before_command_end(
     backend: Arc<dyn TerminalBackend>,
@@ -112,11 +113,11 @@ pub async fn barrier_before_command_end(
         Ok(Ok(BarrierReport::Drained { output_seq })) => output_seq,
         Ok(Ok(BarrierReport::Unsupported)) => return true,
         Ok(Err(error)) => {
-            warn!(%error, "PTY 输出屏障失败，transcript 退化为静默判定");
+            warn!(%error, "PTY 输出屏障失败，命令结束事件仍会应用");
             return false;
         }
         Err(error) => {
-            warn!(%error, "PTY 输出屏障任务失败，transcript 退化为静默判定");
+            warn!(%error, "PTY 输出屏障任务失败，命令结束事件仍会应用");
             return false;
         }
     };
@@ -131,7 +132,7 @@ pub async fn barrier_before_command_end(
     warn!(
         target,
         processed = gate.processed(),
-        "等待 PTY 输出处理超时，transcript 退化为静默判定"
+        "等待 PTY 输出处理超时，命令结束事件仍会应用"
     );
     false
 }
@@ -238,6 +239,7 @@ mod tests {
             command: None,
             started_at_ms: None,
             ended_at_ms: None,
+            data: None,
         }
     }
 
@@ -316,13 +318,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn barrier_timeout_degrades_to_silent_determination() {
+    async fn barrier_timeout_reports_failure_without_dropping_boundary() {
+        let mut registry = registry();
+        let created = registry.create(params()).expect("create");
+        let id = TerminalId::new(created.terminal_id.clone());
+        let t0 = base();
+        let mut tracker = crate::shell_events::ShellEventTracker::new();
+        registry
+            .record_transcript_command(&id, "echo hi", t0)
+            .expect("记录命令");
+        assert!(
+            !crate::shell_events::apply_event(
+                &mut registry,
+                &id,
+                &mut tracker,
+                &event(ShellEventKind::CommandStart, None),
+                t0,
+            )
+            .expect("C")
+        );
+
         let gate = OutputGate::new();
         let backend = Arc::new(FixedBackend {
             report: BarrierReport::Drained { output_seq: 1 },
         });
         let ready = barrier_before_command_end(backend, &gate, Duration::from_millis(50)).await;
-        assert!(!ready, "超时应返回 false，让调用方丢弃 D");
+        assert!(!ready, "超时应返回 false，让调用方记录警告后仍应用 D");
+
+        // 模拟 ingest 的失败分支：屏障未完成仍应用 D，命令边界与退出码不丢。
+        assert!(
+            crate::shell_events::apply_event(
+                &mut registry,
+                &id,
+                &mut tracker,
+                &event(ShellEventKind::CommandEnd, Some(9)),
+                t0,
+            )
+            .expect("D")
+        );
+        let commands = registry
+            .transcript(&by_id(&created.terminal_id), None)
+            .expect("读取 transcript")
+            .commands;
+        assert_eq!(commands[0].status, TranscriptStatus::Done);
+        assert_eq!(commands[0].exit_code, Some(9));
     }
 
     #[tokio::test]

@@ -10,14 +10,15 @@ const HELP_EN = `termx_cli: single CLI tool for termx terminals.
 
 Usage:
   termx_cli help
-  termx_cli local ["<cmd>"] [-n name] [-c cwd] [--env K=V]... [--cols N] [--rows N] [--force]
+  termx_cli local ["<cmd>"] [--runtime ID] [-n name] [-c cwd] [--env K=V]... [--cols N] [--rows N] [--force]
   termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--allow-injection] [--cols N] [--rows N] [--force]
-  termx_cli exec "<command>" [-n name] [-w] [--timeout ms]
+  termx_cli exec "<command>" [-n name] [--async] [--timeout ms] [--base64 | --file PATH]
   termx_cli run "<cmd>" [-n name] [--pty] [--cwd dir] [--env K=V]... [--timeout ms] [--force]
-  termx_cli read [-n name] [--cursor N [--max-bytes N] | --tail-lines N | --tail-chars N]
+  termx_cli read [-n name] [--last N | -s buffer|history] [--timeout ms] [--includeCommand]
+            [legacy: --cursor N [--max-bytes N] | --tail-lines N | --tail-chars N; not with --last/-s]
   termx_cli search [-n name] --pattern <pattern> [--nth N] [--only-matches]
   termx_cli transcript [-n name] [--json]
-  termx_cli send "<text>" [-n name] [--enter]
+  termx_cli send "<text>" [-n name] [--enter] [--base64 | --file PATH]
   termx_cli resize [-n name] --cols N --rows N
   termx_cli signal [-n name] SIGINT|SIGTERM|SIGKILL
   termx_cli status [-n name]
@@ -38,12 +39,31 @@ Rules:
   - local/ssh create persistent terminals; exec/read/send/resize/signal/status/... address them by -n.
   - local without <cmd> starts the platform default shell. A command line is split like a shell
     word list (quotes supported) and executed directly; use "bash -lc '<command>'" for shell syntax.
-  - exec sends to an existing terminal and returns after submitting. -w records a cursor, waits
-    about 1s of silence (or timeout/terminal end), then returns new output. This is not an exact
-    command boundary.
-  - read continues from the per-terminal cursor unless --cursor is given. --tail-lines /
-    --tail-chars return only the last N raw lines / Unicode characters and do not advance the
-    cursor. --max-bytes applies only with --cursor.
+  - exec sends to an existing terminal and waits up to exec.timeoutMs (default 5s; --timeout
+    overrides) for that command's transcript to finish. A normal success returns only the output
+    text; empty output, errors, best-effort completion and timeouts add a "[termx exec] ..." first
+    line. It does not echo the command or use silence as a command boundary. --async returns
+    immediately; -w has been removed. Multi-line or multiple-command text is NOT merged into one
+    command: each executed command is recorded as a separate transcript record, exec may only
+    match one record, and read --last N collects their results (use --async if needed).
+  - exec/send payload sources: inline text (default), --base64 <b64>, or --file PATH.
+    --base64 accepts standard base64 with optional whitespace/newlines and must decode as
+    UTF-8; --file reads a file on the plugin host (not the remote host) and expands a leading
+    ~. Both strip one leading UTF-8 BOM and reject invalid UTF-8 or NUL instead of sending;
+    they are mutually exclusive. exec normalizes CRLF to LF and trims outer whitespace while
+    keeping inner newlines; send writes the decoded text as-is (no escape decoding, no
+    newline normalization). Payload content is never echoed in receipts or errors.
+  - read returns only the current/last command output. When busy it first waits up to
+    exec.timeoutMs (--timeout overrides); if still running it returns a status header only unless
+    -s buffer is given. -s history reads the last completed command; -s buffer reads the live
+    snapshot (idle falls back to the last completed command). --includeCommand prefixes
+    "$ <command>". Normal idle results are output only; busy/timeout/error/best_effort add a
+    "[termx read] ..." first line. --last N (-l N) returns the outputs of the last N completed
+    commands (status != running) as blocks marked "--- termx result i/N ---"; it never includes
+    command text, cursor, terminal URL or browser URL. Normal idle has no header; if still busy
+    after the bounded wait the header uses note=completed-only. --last cannot be combined with
+    -s, --includeCommand, or legacy flags. Legacy --cursor/--max-bytes/--tail-lines/--tail-chars
+    still work but are not the default path.
   - search scans raw output backwards. --nth 1 is the last match; default returns from that
     match to the end; --only-matches returns just the matched line. No line numbers or
     absolute positions are returned, and trimmed history may make old positions unavailable.
@@ -63,14 +83,15 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
 
 用法：
   termx_cli help
-  termx_cli local ["<cmd>"] [-n name] [-c cwd] [--env K=V]... [--cols N] [--rows N] [--force]
+  termx_cli local ["<cmd>"] [--runtime ID] [-n name] [-c cwd] [--env K=V]... [--cols N] [--rows N] [--force]
   termx_cli ssh <user@host[:port]> [-n name] [--password PW | --key PATH [--passphrase PP]] [--any-host-key] [--helper PATH | --upload-helper --helper-local PATH [--helper-sha SHA]] [--allow-injection] [--cols N] [--rows N] [--force]
-  termx_cli exec "<command>" [-n name] [-w] [--timeout ms]
+  termx_cli exec "<command>" [-n name] [--async] [--timeout ms] [--base64 | --file PATH]
   termx_cli run "<cmd>" [-n name] [--pty] [--cwd dir] [--env K=V]... [--timeout ms] [--force]
-  termx_cli read [-n name] [--cursor N [--max-bytes N] | --tail-lines N | --tail-chars N]
+  termx_cli read [-n name] [--last N | -s buffer|history] [--timeout ms] [--includeCommand]
+            [legacy: --cursor N [--max-bytes N] | --tail-lines N | --tail-chars N; not with --last/-s]
   termx_cli search [-n name] --pattern <pattern> [--nth N] [--only-matches]
   termx_cli transcript [-n name] [--json]
-  termx_cli send "<text>" [-n name] [--enter]
+  termx_cli send "<text>" [-n name] [--enter] [--base64 | --file PATH]
   termx_cli resize [-n name] --cols N --rows N
   termx_cli signal [-n name] SIGINT|SIGTERM|SIGKILL
   termx_cli status [-n name]
@@ -90,11 +111,25 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   - local/ssh 创建常驻终端；exec/read/send/resize/signal/status 等用 -n 定位。
   - local 不带 <cmd> 时启动平台默认 shell。命令行按 shell 词表规则拆词（支持引号）后直接执行；
     需要 shell 语法时用 "bash -lc '<command>'"。
-  - exec 向已存在终端发送命令，提交后即返回。-w 会记录 cursor，等待约 1 秒静默
-    （或超时/终态）后返回新增输出；这不是精确命令边界。
-  - read 默认从该终端的增量 cursor 继续；可用 --cursor 指定。--tail-lines / --tail-chars
-    只返回最后 N 行原始文本 / 最多 N 个 Unicode 字符，不推进 cursor；--max-bytes 仅配合
-    --cursor 使用。
+  - exec 向已存在终端发送命令，默认最多同步等待 exec.timeoutMs（默认 5 秒，可用 --timeout
+    覆盖）直到该命令 transcript 结束。正常成功只返回输出正文；空输出、错误、静默完成和超时
+    会在首行加 “[termx exec] ...”。不回显命令，也不用静默猜测命令边界。--async 立即返回；
+    -w 已移除。多行或多条命令的文本不会被 exec 合并成一条命令：每条实际执行的命令都是独立的
+    transcript 记录，exec 只能匹配其中一条；需要收集结果时用 read --last N。
+  - exec/send 的载荷来源：内联文本（默认）、--base64 <b64>、--file PATH。--base64 允许
+    空白/换行，按标准字母表解码且结果必须是 UTF-8；--file 读取插件进程本机文件（不是远端），
+    开头的 ~ 会展开。两者都剥掉一个前导 UTF-8 BOM，非法 UTF-8 或含 NUL 时报错而不发送；
+    两者互斥。exec 把 CRLF 归一为 LF 并去掉外沿空白（内部换行保留）；send 按解码后的文本
+    原样写入（不解释转义、不归一换行）。回执与错误信息都不回显载荷内容。
+  - read 只返回当前/最后一条命令的输出。busy 时先最多等待 exec.timeoutMs（--timeout 覆盖）；
+    仍在运行且未显式 -s buffer 时只返回状态首行。-s history 读最后一条已完成命令；
+    -s buffer 读实时快照（空闲时回退到最后一条已完成命令）。--includeCommand 会在输出前加
+    “$ <command>”。正常 idle 只返回输出；busy/超时/error/best_effort 才加 “[termx read] ...”
+    首行。--last N（-l N）按块返回最后 N 条已完成命令（status != running）的输出，块标记为
+    “--- termx result i/N ---”；绝不包含命令文本、cursor、终端 URL 或浏览器 URL。正常 idle
+    不显示首行；等待上限后仍 busy 时首行为 note=completed-only。--last 不能与 -s、
+    --includeCommand 或旧参数同时使用。legacy --cursor/--max-bytes/--tail-lines/--tail-chars
+    仍可用，但不是默认路径。
   - search 从末尾倒搜原始输出；--nth 1 为最后一个匹配。默认返回该匹配到末尾；
     --only-matches 只返回匹配所在行。不返回行号或绝对位置，历史被裁剪后旧位置不保证可用。
   - transcript 返回信息页记录的命令（起止时间、状态、清洗后输出）；--json 返回原始结构。
@@ -116,12 +151,19 @@ const en = {
   "cli.err.unclosedQuote": "Error: unclosed quote in args",
   "cli.err.unknownCommand": "Error: unknown subcommand: {cmd}",
   "cli.err.missingCommand": "Error: command text is required",
+  "cli.err.badRuntimeArgs": "Error: --runtime cannot be combined with a command",
   "cli.err.missingText": "Error: text is required",
   "cli.err.unknownFlag": "Error: unknown option: {flag}",
   "cli.err.missingValue": "Error: option requires a value: {flag}",
   "cli.err.badNumber": "Error: invalid number for {flag}: {value}",
   "cli.err.readMode":
     "Error: use exactly one of --cursor, --tail-lines or --tail-chars (and --max-bytes only with --cursor)",
+  "cli.err.badSource": "Error: -s source must be buffer or history: {value}",
+  "cli.err.readSourceConflict":
+    "Error: -s cannot be combined with legacy --cursor/--max-bytes/--tail-lines/--tail-chars",
+  "cli.err.badLast": "Error: --last must be >= 1",
+  "cli.err.readLastConflict":
+    "Error: --last cannot be combined with -s, --includeCommand, or legacy --cursor/--max-bytes/--tail-lines/--tail-chars",
   "cli.err.missingPattern": "Error: --pattern is required",
   "cli.err.badNth": "Error: --nth must be >= 1",
   "cli.err.badEnv": "Error: --env must be K=V: {value}",
@@ -140,8 +182,26 @@ const en = {
     "Error: no running terminal matches the given name; pass --terminal-id from Web or the original session",
   "cli.err.rebindCancelled": "Rebind cancelled",
   "cli.err.connection": "Error: not connected to termx-service",
+  "cli.err.payloadConflict": "Error: use either --base64 or --file, not both",
+  "cli.err.payloadBadBase64":
+    "Error: invalid base64 payload (standard alphabet, length must be a multiple of 4)",
+  "cli.err.payloadBadEncoding":
+    "Error: payload is not valid UTF-8 or contains NUL (likely UTF-16/binary); save it as UTF-8",
+  "cli.err.payloadFileError": "Error: cannot read file: {path}",
 
-  "cli.ok.submitted": "submitted",
+  "exec.async":
+    "Command submitted in async mode; it is still running. Use termx_cli status to check completion, then termx_cli read.",
+  "exec.timeout":
+    "Command still running after {seconds}s; it was not interrupted. Use termx_cli status to check completion, then termx_cli read.",
+  "exec.noOutput": "Command completed with no output.",
+  "exec.noResult":
+    "Command finished but no matching result was recorded (terminal may have changed). Check status.",
+  "exec.disconnected": "Terminal disconnected while waiting for the command result.",
+  "exec.wRemoved":
+    "-w has been removed. exec waits up to exec.timeoutMs by default; use --async for immediate return.",
+  "read.noOutput": "No output yet.",
+  "read.disconnected": "Terminal disconnected before output could be read.",
+
   "cli.ok.detachedAll": "detached={count}",
   "cli.ok.terminatedAll": "terminated={count}",
   "cli.read.reset": "[reset: {reason}]",
@@ -175,12 +235,19 @@ const zh: Record<MessageKey, string> = {
   "cli.err.unclosedQuote": "错误：args 中存在未闭合的引号",
   "cli.err.unknownCommand": "错误：未知子命令：{cmd}",
   "cli.err.missingCommand": "错误：必须提供命令文本",
+  "cli.err.badRuntimeArgs": "错误：--runtime 不能与命令/参数同时使用",
   "cli.err.missingText": "错误：必须提供文本",
   "cli.err.unknownFlag": "错误：未知参数：{flag}",
   "cli.err.missingValue": "错误：参数缺少取值：{flag}",
   "cli.err.badNumber": "错误：参数 {flag} 的数字非法：{value}",
   "cli.err.readMode":
     "错误：--cursor、--tail-lines、--tail-chars 只能三选一（--max-bytes 仅配合 --cursor）",
+  "cli.err.badSource": "错误：-s 来源只能是 buffer 或 history：{value}",
+  "cli.err.readSourceConflict":
+    "错误：-s 不能与旧参数 --cursor/--max-bytes/--tail-lines/--tail-chars 同时使用",
+  "cli.err.badLast": "错误：--last 必须 >= 1",
+  "cli.err.readLastConflict":
+    "错误：--last 不能与 -s、--includeCommand 或旧参数 --cursor/--max-bytes/--tail-lines/--tail-chars 同时使用",
   "cli.err.missingPattern": "错误：必须提供 --pattern",
   "cli.err.badNth": "错误：--nth 必须 >= 1",
   "cli.err.badEnv": "错误：--env 必须为 K=V：{value}",
@@ -199,8 +266,26 @@ const zh: Record<MessageKey, string> = {
     "错误：没有匹配该名称的运行中终端；请用 --terminal-id 传入从 Web 或原会话获取的 ID",
   "cli.err.rebindCancelled": "已取消迁移",
   "cli.err.connection": "错误：未连接到 termx-service",
+  "cli.err.payloadConflict": "错误：--base64 与 --file 只能二选一",
+  "cli.err.payloadBadBase64":
+    "错误：base64 载荷不合法（标准字母表，长度须为 4 的倍数）",
+  "cli.err.payloadBadEncoding":
+    "错误：载荷不是合法 UTF-8 或含 NUL（可能是 UTF-16/二进制）；请保存为 UTF-8",
+  "cli.err.payloadFileError": "错误：无法读取文件：{path}",
 
-  "cli.ok.submitted": "已提交",
+  "exec.async":
+    "命令已按异步模式提交，仍在该终端运行；用 termx_cli status 查完成状态，再用 termx_cli read 读取输出。",
+  "exec.timeout":
+    "命令运行超过 {seconds} 秒仍未结束（未中断）；用 termx_cli status 查完成状态，再用 termx_cli read 读取输出。",
+  "exec.noOutput": "命令已完成，没有输出。",
+  "exec.noResult":
+    "命令已结束，但没有记录到对应结果（终端状态可能已变化）。请用 status 检查。",
+  "exec.disconnected": "等待命令结果时终端已断开。",
+  "exec.wRemoved":
+    "-w 已移除。exec 默认最多等待 exec.timeoutMs；需要立即异步请用 --async。",
+  "read.noOutput": "暂时没有输出。",
+  "read.disconnected": "读取输出前终端已断开。",
+
   "cli.ok.detachedAll": "detached={count}",
   "cli.ok.terminatedAll": "terminated={count}",
   "cli.read.reset": "[reset: {reason}]",

@@ -19,6 +19,8 @@
 | `web.port` | `0` | Web 服务端口；`0` = 不启动 |
 | `web.allowRemote` | `false` | 是否允许远程访问；`false` 只绑定 `127.0.0.1`（回环免登录） |
 | `web.password` | 空 | Web 登录密码；启动方通过环境变量 `TERMX_WEB_PASSWORD` 传给 service，不进命令行/日志 |
+| `exec.timeoutMs` | `5000` | `exec` 默认同步等待 / `read` busy 等待上限（毫秒）；`0` = 立即异步/不等待；`--timeout ms` 可按调用覆盖 |
+| `exec.pollMs` | `1000` | busy 等待时的轮询间隔（毫秒） |
 | `log.maxDays` | `7` | service 文件日志保留天数 |
 | `limits.maxTerminals` | `16` | 同时运行终端上限（传给 service env） |
 | `limits.sshHistoryLimit` | `64` | SSH 连接历史条数上限；`0` 关闭（传给 `TERMX_SSH_HISTORY_LIMIT`） |

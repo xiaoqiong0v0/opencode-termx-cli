@@ -80,11 +80,21 @@ export interface RemoteConfig {
   injection: InjectionConfig;
 }
 
+/** exec / read 共享的同步等待与轮询配置。 */
+export interface ExecConfig {
+  /** 默认同步等待上限（毫秒）；0 = 立即异步/不等待。 */
+  timeoutMs: number;
+  /** busy 时的轮询间隔（毫秒）。 */
+  pollMs: number;
+}
+
 /** 插件完整配置。 */
 export interface TermxConfig {
   toolLang: Lang;
   webLang: Lang;
   service: ServiceConfig;
+  /** exec 默认同步等待与 busy 轮询。 */
+  exec: ExecConfig;
   /** Web 服务配置：`password` 只经子进程环境变量传递。 */
   web: WebConfig;
   /** 注入默认值：`local.injection` / `remote.injection` 未覆盖的字段继承这里。 */
@@ -127,6 +137,10 @@ const DEFAULT_CLIENT_IDLE_POLICY: ClientIdlePolicy = "no_children";
 const DEFAULT_TICK_MS = 250;
 /** 默认无输出阈值（毫秒）。 */
 const DEFAULT_NO_OUTPUT_MS = 5000;
+/** 默认 exec 同步等待上限（毫秒）。 */
+const DEFAULT_EXEC_TIMEOUT_MS = 5000;
+/** 默认 exec/read busy 轮询间隔（毫秒）。 */
+const DEFAULT_EXEC_POLL_MS = 1000;
 /** 默认 Web 端口；0 表示不启动 Web 服务。 */
 const DEFAULT_WEB_PORT = 0;
 /** 默认只允许本机访问 Web。 */
@@ -155,6 +169,12 @@ const TEMPLATE = `{
     "tokenFile": "",
     // 显式 WebSocket endpoint；非空时优先且不自动启动
     "endpoint": ""
+  },
+  "exec": {
+    // exec 默认同步等待 / read busy 等待上限（毫秒）；0 = 立即异步/不等待
+    "timeoutMs": ${DEFAULT_EXEC_TIMEOUT_MS},
+    // busy 时的轮询间隔（毫秒）
+    "pollMs": ${DEFAULT_EXEC_POLL_MS}
   },
   "web": {
     // Web 服务端口；0 表示不启动 Web 服务
@@ -276,6 +296,7 @@ function readConfig(path: string): unknown {
 function normalizeConfig(raw: unknown): TermxConfig {
   const root = asRecord(raw);
   const service = asRecord(root.service);
+  const exec = asRecord(root.exec);
   const web = asRecord(root.web);
   const baseInjection = asRecord(root.injection);
   const localInjection = asRecord(asRecord(root.local).injection);
@@ -303,6 +324,10 @@ function normalizeConfig(raw: unknown): TermxConfig {
       port: asInt(service.port, 0, 0, 65535),
       tokenFile,
       endpoint,
+    },
+    exec: {
+      timeoutMs: asInt(exec.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS, 0, 86_400_000),
+      pollMs: asInt(exec.pollMs, DEFAULT_EXEC_POLL_MS, 1, 60_000),
     },
     web: {
       port: asInt(web.port, DEFAULT_WEB_PORT, 0, 65535),

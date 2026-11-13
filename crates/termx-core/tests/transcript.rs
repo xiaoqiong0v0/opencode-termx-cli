@@ -195,7 +195,7 @@ fn register_create_with_disables_in_band_osc_for_shell_events() {
     let params = params("ses-1", "build");
     registry.prepare_create(&params).expect("预检");
     let (created, displaced) = registry
-        .register_create_with(params, Arc::new(MockBackend::new()), None, false)
+        .register_create_with(params, Arc::new(MockBackend::new()), None, false, false)
         .expect("注册");
     assert!(displaced.is_none());
     let id = TerminalId::new(created.terminal_id.clone());
@@ -231,7 +231,7 @@ fn records_transcript_on_send_follows_event_channel() {
     let params = params("ses-1", "events");
     registry.prepare_create(&params).expect("预检");
     let (created, displaced) = registry
-        .register_create_with(params, Arc::new(MockBackend::new()), None, false)
+        .register_create_with(params, Arc::new(MockBackend::new()), None, false, false)
         .expect("注册事件通道终端");
     assert!(displaced.is_none());
     assert!(

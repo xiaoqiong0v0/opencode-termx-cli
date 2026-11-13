@@ -11,6 +11,7 @@
 - [ARCHITECTURE](design/ARCHITECTURE.md)：分层、状态机、依赖方向与质量门禁。
 - [FRAMEWORK_REDESIGN](design/FRAMEWORK_REDESIGN.md)：Runtime、分发、协议演进方案。
 - [ADAPTER](design/ADAPTER.md)：opencode 工具到 RPC 的映射与事件通知。
+- [HOST_OUTPUT_EVENTS](design/HOST_OUTPUT_EVENTS.md)：pwsh 宿主 O 输出事件、PTY 显示分流与模型输出。
 
 ## 过程
 

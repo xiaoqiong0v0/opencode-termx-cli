@@ -5,9 +5,21 @@
 
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger";
 import { parseCliArgs, splitCliArgs } from "./cli-args.js";
+import type { ExecConfig } from "./config.js";
 import type { MessageKey, Translator } from "./i18n.js";
+import { normalizeExecText, PayloadError, resolvePayload } from "./payload.js";
+import type { ResolvedPayload } from "./payload.js";
+import {
+  formatReadHeader,
+  formatReadResult,
+  formatResultBlock,
+  joinResultBlocks,
+  lastItem,
+} from "./read-output.js";
+import type { ReadHeaderNote, ReadHeaderState, ReadSource } from "./read-output.js";
 import { fromB64 } from "./termx-rpc.mjs";
 import type { TermxClient, TermxEvent } from "./termx-rpc.mjs";
+import { waitForIdle } from "./wait.js";
 
 const log = createLogger("opencode-termx");
 
@@ -17,14 +29,17 @@ const DEFAULT_NAME = "default";
 const DEFAULT_COLS = 120;
 /** PTY 默认行数。 */
 const DEFAULT_ROWS = 30;
-/** exec -w 判定静默的阈值（毫秒）。 */
-const WAIT_SILENCE_MS = 1_000;
-/** exec -w 轮询间隔（毫秒）。 */
-const WAIT_POLL_MS = 250;
 /** run 默认等待超时（毫秒）。 */
 const DEFAULT_RUN_TIMEOUT_MS = 60_000;
-/** exec -w 单次读取的字节上限。 */
-const WAIT_MAX_BYTES = 65_536;
+/** 成功但没有任何可捕获文本时的自解释结果（仅 run 使用）。 */
+const EMPTY_OUTPUT_JSON = JSON.stringify({
+  output_type: "empty",
+  message: "no captured command output",
+  read_with: "terminal.read",
+});
+/** exec 首行前缀；状态字段为协议化标识，不翻译。 */
+const EXEC_HEADER = "[termx exec]";
+
 /** 允许的信号。 */
 const SUPPORTED_SIGNALS = new Set(["SIGINT", "SIGTERM", "SIGKILL"]);
 /** 终态集合。 */
@@ -52,6 +67,8 @@ export interface CliDeps {
   client(ctx: CliContext): Promise<TermxClient>;
   /** 每终端增量读取游标，key 为 `rootSessionId + NUL + name`。 */
   cursors: Map<string, number>;
+  /** exec/read 默认同步等待与轮询配置。 */
+  exec: ExecConfig;
 }
 
 /** 可本地化的 CLI 失败。 */
@@ -95,6 +112,21 @@ type SizeResult =
   | { ok: true; cols?: number; rows?: number }
   | { ok: false; text: string };
 
+/** read 来源解析结果。 */
+type SourceResult =
+  | { ok: true; value?: ReadSource }
+  | { ok: false; failure: CliFailure };
+
+/** transcript 命令列表、末条命令、最后一条已完成命令与 busy 判定。 */
+interface TranscriptView {
+  /** 本次读取到的全部命令（按时间顺序）。 */
+  commands: TranscriptCommand[];
+  last?: TranscriptCommand;
+  /** 最后一条 `status !== "running"` 的命令；busy 时 `-s history` 用它。 */
+  lastCompleted?: TranscriptCommand;
+  busy: boolean;
+}
+
 /** SSH 目标解析结果。 */
 type SshTargetResult =
   | { ok: true; user: string; host: string; port: number }
@@ -116,15 +148,6 @@ interface CreateResult {
   cursor: number;
 }
 
-interface SnapshotView {
-  state?: string;
-  cursor?: number;
-  [key: string]: unknown;
-}
-
-interface StatusResult {
-  snapshot?: SnapshotView;
-}
 
 interface OutputChunk {
   seq?: number;
@@ -156,6 +179,8 @@ interface TranscriptCommand {
   started_at: string;
   ended_at?: string | null;
   status?: string;
+  exit_code?: number | null;
+  best_effort?: boolean;
   output?: string;
 }
 
@@ -163,6 +188,13 @@ interface TranscriptCommand {
 interface TranscriptResult {
   commands?: TranscriptCommand[];
   revision?: number;
+}
+
+/** exec -w 发送前快照，用于确认轮询到的是本次命令而非上一条同名命令。 */
+interface TranscriptBaseline {
+  revision: number;
+  count: number;
+  last?: TranscriptCommand;
 }
 
 /** 一次读取/等待的输出快照。 */
@@ -191,6 +223,7 @@ interface CreateOptions {
   rows?: number;
   name: string;
   force: boolean;
+  runtimeId?: string;
   ssh?: Record<string, unknown>;
 }
 
@@ -277,6 +310,45 @@ const HANDLERS: Record<string, Handler> = {
 function fail(t: Translator, failure: CliFailure): string {
   return `${t(failure.key, failure.vars)}\n\n${t("cli.help")}`;
 }
+
+/**
+ * 载荷解析错误 → 本地化失败（不回显 base64/文件内容，文件错误只回显用户给的路径）。
+ * @param error 载荷解析错误
+ * @param file 用户传入的 --file 值
+ * @returns 可交给 fail() 的失败描述
+ */
+function payloadFailure(error: PayloadError, file?: string): CliFailure {
+  if (error.code === "conflict") return { key: "cli.err.payloadConflict" };
+  if (error.code === "base64") return { key: "cli.err.payloadBadBase64" };
+  if (error.code === "decode") return { key: "cli.err.payloadBadEncoding" };
+  return { key: "cli.err.payloadFileError", vars: { path: file ?? "" } };
+}
+
+/**
+ * 按 --base64 / --file 解析载荷；失败时返回已本地化的错误文本。
+ * 日志只记错误码与来源，绝不记录载荷内容。
+ */
+async function readPayload(
+  positionals: string[],
+  values: FlagValues,
+  t: Translator,
+): Promise<{ ok: true; payload: ResolvedPayload } | { ok: false; text: string }> {
+  const file = textValue(values, "file");
+  try {
+    const payload = await resolvePayload(positionals.join(" "), {
+      base64: boolValue(values, "base64"),
+      file,
+    });
+    return { ok: true, payload };
+  } catch (error) {
+    if (error instanceof PayloadError) {
+      log.warn("termx 载荷解析失败", error.code);
+      return { ok: false, text: fail(t, payloadFailure(error, file)) };
+    }
+    throw error;
+  }
+}
+
 
 /** 统一错误文本（只输出 message/code，不带原始参数）。 */
 function fmtError(t: Translator, error: unknown): string {
@@ -487,6 +559,7 @@ async function createTerminal(
     force: options.force,
     idle_timeout: null,
   };
+  if (options.runtimeId) params.runtime_id = options.runtimeId;
   if (options.ssh) params.ssh = options.ssh;
   return client.request<CreateResult>("terminal.create", params);
 }
@@ -497,29 +570,35 @@ async function doLocal(tokens: string[], env: CommandEnv): Promise<string> {
     name: { short: "n", type: "string" },
     cwd: { short: "c", type: "string" },
     env: { type: "list" },
+    runtime: { type: "string" },
     cols: { type: "string" },
     rows: { type: "string" },
     force: { type: "boolean" },
   });
   if (!parsed.ok) return fail(env.t, parsed.failure);
 
+  const runtimeId = textValue(parsed.values, "runtime");
   const size = resolveSize(parsed.values, env.t);
   if (!size.ok) return size.text;
   const environment = envMap(listValue(parsed.values, "env"));
   if (!environment.ok) return fail(env.t, environment.failure);
 
   const words = commandWords(parsed.positionals);
+  if (runtimeId && words) {
+    return fail(env.t, { key: "cli.err.badRuntimeArgs" });
+  }
   const name = nameOf(parsed.values);
   const created = await createTerminal(env.client, env.ctx, {
     mode: "pty",
-    cmd: words?.cmd ?? defaultShell(),
-    args: words?.args ?? [],
+    cmd: runtimeId ? "" : words?.cmd ?? defaultShell(),
+    args: runtimeId ? [] : words?.args ?? [],
     cwd: textValue(parsed.values, "cwd"),
     env: environment.value,
     cols: size.cols,
     rows: size.rows,
     name,
     force: boolValue(parsed.values, "force"),
+    runtimeId,
   });
   // 同名重建后旧游标失效，从新终端基线继续。
   env.deps.cursors.set(cursorKey(env.ctx, name), created.cursor);
@@ -659,36 +738,172 @@ function buildSshHelper(
   };
 }
 
-/** exec：向已存在终端发送命令；-w 时等待静默后返回输出。 */
+/** exec：向已存在终端发送命令，默认等待本次命令的 transcript 完成。 */
 async function doExec(tokens: string[], env: CommandEnv): Promise<string> {
+  // -w/--waitResult 已移除：显式拒绝，避免旧调用静默退回异步。
+  if (usesRemovedWaitFlag(tokens)) {
+    return `${env.t("exec.wRemoved")}\n\n${env.t("cli.help")}`;
+  }
   const parsed = parseFlags(tokens, {
     name: { short: "n", type: "string" },
-    wait: { short: "w", type: "boolean" },
+    async: { type: "boolean" },
     timeout: { type: "string" },
+    base64: { type: "boolean" },
+    file: { type: "string" },
   });
   if (!parsed.ok) return fail(env.t, parsed.failure);
 
-  const command = parsed.positionals.join(" ").trim();
+  const payload = await readPayload(parsed.positionals, parsed.values, env.t);
+  if (!payload.ok) return payload.text;
+
+  // 文本模式保持原行为（join + trim）；base64/file 归一 CRLF 并去掉外沿空白，
+  // 否则末尾换行会在 enter 之后多提交一条空命令。
+  const command =
+    payload.payload.source === "text"
+      ? parsed.positionals.join(" ").trim()
+      : normalizeExecText(payload.payload.text);
   if (!command) return fail(env.t, { key: "cli.err.missingCommand" });
   const timeout = readInt(parsed.values, "timeout");
   if (!timeout.ok) return fail(env.t, timeout.failure);
 
+  const waitMs = Math.max(0, timeout.value ?? env.deps.exec.timeoutMs);
+  const asyncMode = boolValue(parsed.values, "async") || waitMs <= 0;
   const name = nameOf(parsed.values);
   const target = locator(env.ctx, name);
+
+  let before: TranscriptResult;
+  try {
+    before = await env.client.request<TranscriptResult>("terminal.transcript", target);
+  } catch (error) {
+    const disconnected = goneMessage(env.t, error);
+    if (disconnected) return disconnected;
+    throw error;
+  }
+  const baseline = transcriptBaseline(before);
+
   await claimQuietly(env.client, target);
-  const baseline = await currentCursor(env.client, target);
-  await env.client.request("terminal.send", { ...target, text: command, enter: true });
+  try {
+    await env.client.request("terminal.send", { ...target, text: command, enter: true });
+  } catch (error) {
+    const disconnected = goneMessage(env.t, error);
+    if (disconnected) return disconnected;
+    throw error;
+  }
 
-  if (!boolValue(parsed.values, "wait")) return env.t("cli.ok.submitted");
+  if (asyncMode) return env.t("exec.async");
 
-  const result = await collectQuietOutput(
-    env.client,
-    target,
-    baseline,
-    timeout.value ?? DEFAULT_RUN_TIMEOUT_MS,
-  );
-  env.deps.cursors.set(cursorKey(env.ctx, name), result.cursor);
-  return formatOutput(env.t, result);
+  const startedAt = Date.now();
+  let current: TranscriptCommand | undefined;
+  while (true) {
+    let result: TranscriptResult;
+    try {
+      result = await env.client.request<TranscriptResult>("terminal.transcript", target);
+    } catch (error) {
+      const disconnected = goneMessage(env.t, error);
+      if (disconnected) return disconnected;
+      throw error;
+    }
+    const commands = result.commands || [];
+    const last = commands[commands.length - 1];
+    // 代次推进只说明 transcript 变了；还必须确认末条就是刚发送的命令，
+    // 否则同名上一条/被 X 撤销的 pending 会被误判为完成。静默判定
+    // （best_effort）也算完成，否则没有真实 D 的 cmd/SSH/旧路径会等到超时。
+    if (
+      (result.revision ?? 0) > baseline.revision &&
+      isSentCommand(last, commands.length, command, baseline)
+    ) {
+      if (last && last.status !== "running") return formatExecResult(env.t, last);
+      current = last;
+    } else if ((result.revision ?? 0) > baseline.revision) {
+      // 宿主 X/多行撤销可能先建 pending 再删除；不要再用已撤销的记录。
+      current = undefined;
+    }
+    if (Date.now() >= startedAt + waitMs) break;
+    await delay(env.deps.exec.pollMs);
+  }
+  if (current) {
+    return env.t("exec.timeout", { seconds: elapsedSeconds(startedAt) });
+  }
+  return env.t("exec.noResult");
+}
+
+/** 是否显式使用了已移除的 -w/--waitResult（`--` 之后的字面量不算）。 */
+function usesRemovedWaitFlag(tokens: string[]): boolean {
+  const end = tokens.indexOf("--");
+  const head = end >= 0 ? tokens.slice(0, end) : tokens;
+  return head.includes("-w") || head.includes("--waitResult");
+}
+
+/** 取发送前的 transcript 基线。 */
+function transcriptBaseline(result: TranscriptResult): TranscriptBaseline {
+  const commands = result.commands || [];
+  return {
+    revision: result.revision ?? 0,
+    count: commands.length,
+    last: commands[commands.length - 1],
+  };
+}
+
+/**
+ * 轮询到的末条命令是否就是刚发送的那一条。
+ *
+ * 同名命令可能已存在于上一条记录：仅 `command` 相等不够。发送后记录数应
+ * 增加（send-time pending 或宿主 `C` 都会新增）；容量满或同毫秒新增时以
+ * `started_at` 变化兜底。宿主 `X` 删除 pending 时计数不增且末条仍是发送前
+ * 的同名记录，因此不会回退到上一条命令。
+ */
+function isSentCommand(
+  last: TranscriptCommand | undefined,
+  count: number,
+  command: string,
+  baseline: TranscriptBaseline,
+): boolean {
+  if (!last || last.command !== command) return false;
+  if (!baseline.last) return true;
+  return count > baseline.count || last.started_at !== baseline.last.started_at;
+}
+
+/**
+ * 判断是否确实由本次调用完成，并生成 exec 结果。
+ *
+ * 正常成功只返回输出正文；best_effort/错误/中断才加 `[termx exec]` 首行。
+ */
+function formatExecResult(t: Translator, command: TranscriptCommand): string {
+  const output = stripTrailingNewline(command.output ?? "");
+  const body = output || t("exec.noOutput");
+  const exitCode = typeof command.exit_code === "number" ? command.exit_code : undefined;
+  const failed =
+    command.status === "error" ||
+    command.status === "interrupted" ||
+    (exitCode !== undefined && exitCode !== 0);
+  if (failed) {
+    const state = command.status === "interrupted" ? "interrupted" : "error";
+    return `${EXEC_HEADER} state=${state} exit_code=${exitCode ?? "unknown"}\n\n${body}`;
+  }
+  if (command.best_effort) {
+    return `${EXEC_HEADER} state=done best_effort=true\n\n${body}`;
+  }
+  return output || t("exec.noOutput");
+}
+
+/** 终端已不存在/已断开时的本地化文案；其它错误返回 null。 */
+function goneMessage(t: Translator, error: unknown): string | null {
+  if (!isGoneError(error)) return null;
+  return t("exec.disconnected");
+}
+
+/** 终端被清理或连接关闭：等待结果期间的“断开”判定。 */
+function isGoneError(error: unknown): boolean {
+  const value = error as { code?: unknown; message?: unknown } | undefined;
+  const code = typeof value?.code === "string" ? value.code : "";
+  if (code === "not_found" || code === "already_terminal") return true;
+  const message = typeof value?.message === "string" ? value.message : String(error);
+  return message.includes("连接已关闭") || message.includes("连接错误");
+}
+
+/** 等待秒数（向上取整到至少 1 秒，用于超时提示）。 */
+function elapsedSeconds(startedAt: number): number {
+  return Math.max(1, Math.round((Date.now() - startedAt) / 1000));
 }
 
 /** run：一次性创建终端，等待终态并返回输出/退出码。 */
@@ -732,10 +947,14 @@ async function doRun(tokens: string[], env: CommandEnv): Promise<string> {
   return formatRun(env.t, outcome);
 }
 
-/** read：增量读取 output，或按尾部行/字符读取原始输出。 */
+/** read：默认读取当前/最后一条命令；legacy flags 保留原始读取路径。 */
 async function doRead(tokens: string[], env: CommandEnv): Promise<string> {
   const parsed = parseFlags(tokens, {
     name: { short: "n", type: "string" },
+    source: { short: "s", type: "string" },
+    includeCommand: { type: "boolean" },
+    timeout: { short: "t", type: "string" },
+    last: { short: "l", type: "string" },
     cursor: { type: "string" },
     "max-bytes": { type: "string" },
     "tail-lines": { type: "string" },
@@ -743,6 +962,29 @@ async function doRead(tokens: string[], env: CommandEnv): Promise<string> {
   });
   if (!parsed.ok) return fail(env.t, parsed.failure);
 
+  const last = readInt(parsed.values, "last");
+  if (!last.ok) return fail(env.t, last.failure);
+  if (last.value !== undefined) {
+    if (last.value < 1) return fail(env.t, { key: "cli.err.badLast" });
+    // 多命令模式绝不写命令文本：显式拒绝所有单条读取/回显参数。
+    if (hasReadLastConflict(parsed.values)) {
+      return fail(env.t, { key: "cli.err.readLastConflict" });
+    }
+    const lastTimeout = readInt(parsed.values, "timeout");
+    if (!lastTimeout.ok) return fail(env.t, lastTimeout.failure);
+    const lastWaitMs = Math.max(0, lastTimeout.value ?? env.deps.exec.timeoutMs);
+    const lastName = nameOf(parsed.values);
+    return readLast(
+      env,
+      locator(env.ctx, lastName),
+      lastName,
+      last.value,
+      lastWaitMs,
+    );
+  }
+
+  const source = readSource(parsed.values);
+  if (!source.ok) return fail(env.t, source.failure);
   const cursor = readInt(parsed.values, "cursor");
   if (!cursor.ok) return fail(env.t, cursor.failure);
   const maxBytes = readInt(parsed.values, "max-bytes");
@@ -754,27 +996,274 @@ async function doRead(tokens: string[], env: CommandEnv): Promise<string> {
 
   const name = nameOf(parsed.values);
   const target = locator(env.ctx, name);
-  const tailMode = tailLines.value !== undefined || tailChars.value !== undefined;
+  const legacy =
+    cursor.value !== undefined ||
+    maxBytes.value !== undefined ||
+    tailLines.value !== undefined ||
+    tailChars.value !== undefined;
+  // 旧读取参数与 `-s` 语义互斥：不静默忽略 `-s`，直接报参数冲突。
+  if (legacy && textValue(parsed.values, "source") !== undefined) {
+    return fail(env.t, { key: "cli.err.readSourceConflict" });
+  }
+  if (legacy) {
+    return legacyRead(env, target, {
+      cursor: cursor.value,
+      maxBytes: maxBytes.value,
+      tailLines: tailLines.value,
+      tailChars: tailChars.value,
+    });
+  }
+
+  const timeout = readInt(parsed.values, "timeout");
+  if (!timeout.ok) return fail(env.t, timeout.failure);
+  const waitMs = Math.max(0, timeout.value ?? env.deps.exec.timeoutMs);
+  return readCurrent(
+    env,
+    target,
+    name,
+    source.value,
+    boolValue(parsed.values, "includeCommand"),
+    waitMs,
+  );
+}
+
+/** `--last` 与单条读取/命令回显参数互斥（按原始出现判定，忽略取值是否合法）。 */
+function hasReadLastConflict(values: FlagValues): boolean {
+  return (
+    textValue(values, "source") !== undefined ||
+    boolValue(values, "includeCommand") ||
+    textValue(values, "cursor") !== undefined ||
+    textValue(values, "max-bytes") !== undefined ||
+    textValue(values, "tail-lines") !== undefined ||
+    textValue(values, "tail-chars") !== undefined
+  );
+}
+
+/** 解析 `-s buffer|history`；缺省返回 undefined。 */
+function readSource(values: FlagValues): SourceResult {
+  const raw = textValue(values, "source");
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (raw === "buffer" || raw === "history") return { ok: true, value: raw };
+  return { ok: false, failure: { key: "cli.err.badSource", vars: { value: raw } } };
+}
+
+/** legacy：显式 cursor/tail 读取（保留旧语义，不作为默认路径）。 */
+async function legacyRead(
+  env: CommandEnv,
+  target: Record<string, string>,
+  options: {
+    cursor?: number;
+    maxBytes?: number;
+    tailLines?: number;
+    tailChars?: number;
+  },
+): Promise<string> {
+  const tailMode = options.tailLines !== undefined || options.tailChars !== undefined;
   if (tailMode) {
-    if (cursor.value !== undefined || maxBytes.value !== undefined) {
+    if (options.cursor !== undefined || options.maxBytes !== undefined) {
       return fail(env.t, { key: "cli.err.readMode" });
     }
-    if (tailLines.value !== undefined && tailChars.value !== undefined) {
+    if (options.tailLines !== undefined && options.tailChars !== undefined) {
       return fail(env.t, { key: "cli.err.readMode" });
     }
     const result = await env.client.request<OutputResult>("terminal.output", {
       ...target,
-      tail_lines: tailLines.value ?? null,
-      tail_chars: tailChars.value ?? null,
+      tail_lines: options.tailLines ?? null,
+      tail_chars: options.tailChars ?? null,
     });
     return result.text || "";
   }
 
-  const start = cursor.value ?? env.deps.cursors.get(cursorKey(env.ctx, name)) ?? 0;
-  const result = await readOutput(env.client, target, start, maxBytes.value);
+  const name = target.name;
+  const start =
+    options.cursor ?? env.deps.cursors.get(cursorKey(env.ctx, name)) ?? 0;
+  const result = await readOutput(env.client, target, start, options.maxBytes);
   env.deps.cursors.set(cursorKey(env.ctx, name), result.cursor);
   return formatOutput(env.t, result);
 }
+
+/**
+ * 读取 transcript；busy 时按同一有界等待策略等到 idle 或超时。
+ *
+ * 完成判定与 exec 一致：最后一条命令不再 running 即视为完成。
+ */
+async function loadTranscriptView(
+  env: CommandEnv,
+  target: Record<string, string>,
+  waitMs: number,
+): Promise<TranscriptView> {
+  let view = await readTranscript(env.client, target);
+  if (view.busy && waitMs > 0) {
+    await waitForIdle(
+      async () => (await readTranscript(env.client, target)).busy,
+      waitMs,
+      env.deps.exec.pollMs,
+    );
+    view = await readTranscript(env.client, target);
+  }
+  return view;
+}
+
+/**
+ * 默认 read：先等待 busy 结束；仍 busy 时只给状态（或显式 buffer 快照）。
+ *
+ * 正常 idle 只返回最后一条已完成命令的输出；best_effort/error 才加首行。
+ */
+async function readCurrent(
+  env: CommandEnv,
+  target: Record<string, string>,
+  name: string,
+  source: ReadSource | undefined,
+  includeCommand: boolean,
+  waitMs: number,
+): Promise<string> {
+  const noOutput = env.t("read.noOutput");
+  let view: TranscriptView;
+  try {
+    view = await loadTranscriptView(env, target, waitMs);
+  } catch (error) {
+    if (!isGoneError(error)) throw error;
+    const header = formatReadHeader(name, source ?? "status", "error", "disconnected");
+    const message = env.t("read.disconnected");
+    return formatReadResult(header, message, message);
+  }
+
+  if (view.busy) {
+    if (source === "buffer") {
+      const snapshot = stripTrailingNewline(view.last?.output ?? "");
+      const header = formatReadHeader(name, "buffer", "busy", "partial");
+      return formatReadResult(header, snapshot, noOutput);
+    }
+    if (source === "history") {
+      // busy 时 history 只给最后一条已完成命令，绝不把运行中命令当结果。
+      const header = formatReadHeader(name, "history", "busy", "completed-only");
+      return formatReadResult(
+        header,
+        commandOutput(view.lastCompleted, includeCommand, noOutput),
+        noOutput,
+      );
+    }
+    return formatReadHeader(name, "status", "busy", "timeout");
+  }
+  return formatIdleRead(name, includeCommand, view.last, noOutput);
+}
+
+/**
+ * `--last N`：返回最后 N 条已完成命令的输出（绝不包含命令文本）。
+ *
+ * 与默认 read 共用同一有界等待；仍 busy 时加 `note=completed-only` 首行，
+ * 只输出已完成命令。正常 idle 只给结果块，不加 `[termx read]` 首行。
+ */
+async function readLast(
+  env: CommandEnv,
+  target: Record<string, string>,
+  name: string,
+  last: number,
+  waitMs: number,
+): Promise<string> {
+  const noOutput = env.t("read.noOutput");
+  let view: TranscriptView;
+  try {
+    view = await loadTranscriptView(env, target, waitMs);
+  } catch (error) {
+    if (!isGoneError(error)) throw error;
+    const header = formatReadHeader(name, "status", "error", "disconnected");
+    const message = env.t("read.disconnected");
+    return formatReadResult(header, message, message);
+  }
+
+  const completed = view.commands.filter((command) => command.status !== "running");
+  const body = formatLastResults(completed.slice(-last), noOutput);
+  if (view.busy) {
+    const header = formatReadHeader(name, "history", "busy", "completed-only");
+    return formatReadResult(header, body, noOutput);
+  }
+  return formatReadResult("", body, noOutput, false);
+}
+
+/** 把已选中的已完成命令格式化为稳定结果块（绝不写命令文本）。 */
+function formatLastResults(
+  commands: TranscriptCommand[],
+  noOutput: string,
+): string {
+  return joinResultBlocks(
+    commands.map((command, index) =>
+      formatResultBlock(
+        index + 1,
+        commands.length,
+        stripTrailingNewline(command.output ?? ""),
+        noOutput,
+        {
+          status: command.status,
+          exitCode: command.exit_code,
+          bestEffort: command.best_effort,
+        },
+      ),
+    ),
+  );
+}
+
+/** 读取 transcript 末条命令并判定 busy（last.status === "running"）。 */
+async function readTranscript(
+  client: TermxClient,
+  target: Record<string, string>,
+): Promise<TranscriptView> {
+  const result = await client.request<TranscriptResult>("terminal.transcript", target);
+  const commands = result.commands || [];
+  const last = lastItem(commands);
+  let lastCompleted: TranscriptCommand | undefined;
+  for (let index = commands.length - 1; index >= 0; index -= 1) {
+    if (commands[index].status !== "running") {
+      lastCompleted = commands[index];
+      break;
+    }
+  }
+  return { commands, last, lastCompleted, busy: last?.status === "running" };
+}
+
+/** 单条命令的展示文本：`--includeCommand` 时前缀 `$ command`。 */
+function commandOutput(
+  command: TranscriptCommand | undefined,
+  includeCommand: boolean,
+  noOutput: string,
+): string {
+  if (!command) return "";
+  const body = stripTrailingNewline(command.output ?? "");
+  return includeCommand ? `$ ${command.command}\n${body || noOutput}` : body;
+}
+
+/** 正常 idle 结果：默认只给输出；best_effort/error 才显示首行。 */
+function formatIdleRead(
+  name: string,
+  includeCommand: boolean,
+  last: TranscriptCommand | undefined,
+  noOutput: string,
+): string {
+  const output = commandOutput(last, includeCommand, noOutput);
+  const note = idleNote(last);
+  if (!note) return formatReadResult("", output, noOutput, false);
+  const state: ReadHeaderState = note === "best_effort" ? "idle" : "error";
+  const header = formatReadHeader(name, "history", state, note);
+  return formatReadResult(header, output, noOutput);
+}
+
+/**
+ * idle 末条命令的提示类型；正常成功返回 undefined。
+ *
+ * 先判失败再判 best_effort：静默完成的命令若退出码非零，必须显示 failed，
+ * 不能被降级成只是“完成判定不确定”。
+ */
+function idleNote(last: TranscriptCommand | undefined): ReadHeaderNote | undefined {
+  if (!last) return undefined;
+  const exitCode = typeof last.exit_code === "number" ? last.exit_code : undefined;
+  const failed =
+    last.status === "error" ||
+    last.status === "interrupted" ||
+    (exitCode !== undefined && exitCode !== 0);
+  if (failed) return "failed";
+  return last.best_effort ? "best_effort" : undefined;
+}
+
 
 /** search：从末尾倒搜原始输出；`--nth 1` 为最后一个匹配。 */
 async function doSearch(tokens: string[], env: CommandEnv): Promise<string> {
@@ -842,11 +1331,18 @@ async function doSend(tokens: string[], env: CommandEnv): Promise<string> {
   const parsed = parseFlags(tokens, {
     name: { short: "n", type: "string" },
     enter: { type: "boolean" },
+    base64: { type: "boolean" },
+    file: { type: "string" },
   });
   if (!parsed.ok) return fail(env.t, parsed.failure);
 
-  const text = parsed.positionals.join(" ");
+  const payload = await readPayload(parsed.positionals, parsed.values, env.t);
+  if (!payload.ok) return payload.text;
+
+  // base64/file 原样写入：不解释转义、不归一换行（raw 载荷按解码后的字节发送）。
+  const text = payload.payload.text;
   if (!text) return fail(env.t, { key: "cli.err.missingText" });
+
 
   const target = locator(env.ctx, nameOf(parsed.values));
   await claimQuietly(env.client, target);
@@ -1161,20 +1657,6 @@ async function claimQuietly(
   }
 }
 
-/** 取当前基线下游标（status.snapshot.cursor）。 */
-async function currentCursor(
-  client: TermxClient,
-  target: Record<string, string>,
-): Promise<number> {
-  try {
-    const status = await client.request<StatusResult>("terminal.status", target);
-    const cursor = status?.snapshot?.cursor;
-    return typeof cursor === "number" ? cursor : 0;
-  } catch {
-    return 0;
-  }
-}
-
 /** 读取一段 output 并推进游标。 */
 async function readOutput(
   client: TermxClient,
@@ -1188,36 +1670,6 @@ async function readOutput(
     max_bytes: maxBytes ?? null,
   });
   return collectChunks(result, cursor);
-}
-
-/** 轮询读取直到静默/终态/超时。 */
-async function collectQuietOutput(
-  client: TermxClient,
-  target: Record<string, string>,
-  startCursor: number,
-  timeoutMs: number,
-): Promise<CollectedOutput> {
-  let collected: CollectedOutput = { output: "", cursor: startCursor };
-  let lastOutputAt = Date.now();
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < timeoutMs) {
-    const result = await readOutput(client, target, collected.cursor, WAIT_MAX_BYTES);
-    if (result.output) lastOutputAt = Date.now();
-    collected = {
-      output: collected.output + result.output,
-      cursor: result.cursor,
-      state: result.state,
-      resetReason: collected.resetReason ?? result.resetReason,
-    };
-
-    collected.state = await terminalState(client, target);
-    if (collected.state && TERMINAL_STATES.has(collected.state)) break;
-    if (Date.now() - lastOutputAt >= WAIT_SILENCE_MS) break;
-    await delay(WAIT_POLL_MS);
-  }
-
-  return collected;
 }
 
 /** 单次 read 响应转文本。 */
@@ -1238,15 +1690,6 @@ function resetReasonOf(result: ReadResult): string | undefined {
   if (!reset) return undefined;
   if (typeof reset === "string") return reset;
   return reset.reason ?? "unknown";
-}
-
-/** 查询终端状态。 */
-async function terminalState(
-  client: TermxClient,
-  target: Record<string, string>,
-): Promise<string | undefined> {
-  const status = await client.request<StatusResult>("terminal.status", target);
-  return status?.snapshot?.state;
 }
 
 /** 一次性 run：订阅事件并等待终态。 */
@@ -1297,7 +1740,7 @@ function exitCodeOf(event: TermxEvent): number | undefined {
   return undefined;
 }
 
-/** read/exec-w 输出格式。 */
+/** read 输出格式（附游标）。 */
 function formatOutput(t: Translator, result: CollectedOutput): string {
   const parts: string[] = [];
   if (result.resetReason) {
@@ -1308,18 +1751,21 @@ function formatOutput(t: Translator, result: CollectedOutput): string {
   return parts.join("\n");
 }
 
-/** run 输出格式（附退出码/信号；一次性终端不输出 cursor）。 */
+/** run 输出格式：成功只给正文；异常/空结果用自解释 JSON。 */
 function formatRun(t: Translator, outcome: RunOutcome): string {
-  const parts: string[] = [];
-  if (outcome.resetReason) {
-    parts.push(t("cli.read.reset", { reason: outcome.resetReason }));
+  const output = stripTrailingNewline(outcome.output ?? "");
+  if (outcome.errorCode || outcome.signal || (outcome.exitCode ?? 0) !== 0) {
+    return JSON.stringify({
+      output_type: outcome.signal ? "interrupted" : "error",
+      exit_code: outcome.exitCode ?? null,
+      signal: outcome.signal ?? null,
+      message: outcome.errorCode ?? (outcome.signal ? "command interrupted" : "command failed"),
+      output,
+    });
   }
-  if (outcome.output) parts.push(stripTrailingNewline(outcome.output));
-  if (outcome.exitCode !== undefined) parts.push(`[exit=${outcome.exitCode}]`);
-  else if (outcome.signal) parts.push(`[signal=${outcome.signal}]`);
-  else if (outcome.errorCode) parts.push(`[error=${outcome.errorCode}]`);
-  else parts.push(`[state=${outcome.state ?? "unknown"}]`);
-  return parts.join("\n");
+  if (!output) return EMPTY_OUTPUT_JSON;
+  if (outcome.resetReason) return JSON.stringify({ output_type: "text", output, message: t("cli.read.reset", { reason: outcome.resetReason }) });
+  return output;
 }
 
 /** 去掉末尾一个换行（兼容 CRLF），避免 cursor 行前出现空行。 */

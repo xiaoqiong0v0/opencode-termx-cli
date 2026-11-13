@@ -29,11 +29,11 @@ adapter 是**薄层**：只把模型工具调用映射为 `termx-service` 的 RP
 | `help` | — | — | 完整用法 |
 | `local ["<cmd>"]` | `terminal.create` | `mode:"pty"`, `cmd`（缺省平台 shell）, `-c cwd`, `--env K=V`, `--cols/--rows`, `-n name`, `--force` | `terminal_id` + 初始 `cursor`；终端常驻 |
 | `ssh <user@host[:port]>` | `terminal.create`（`ssh`） | `--password` / `--key`+`--passphrase`, `--any-host-key`, `--helper` 或 `--upload-helper --helper-local`, `--helper-sha`, `--cols/--rows`, `-n name`, `--force` | `terminal_id` + 初始 `cursor`；`cmd` 固定 `"shell"`。`--password`/`--passphrase` 会进入工具参数并可能被会话历史记录，优先用私钥/agent |
-| `exec "<command>"` | `terminal.claim` → `terminal.status` → `terminal.send` | `-n name`, `-w`, `--timeout ms` | 默认提交后返回；`-w` 记录基线 cursor，轮询 `terminal.read` 直到约 1s 静默/超时/终态，返回新增 output（非精确命令边界） |
+| `exec "<command>"` | `terminal.transcript` → `terminal.claim` → `terminal.send` → 轮询 `terminal.transcript` | `-n name`, `--async`, `--timeout ms`, `--base64` \| `--file PATH` | 默认最多等待 `exec.timeoutMs`（`--timeout` 覆盖）直到本次命令 transcript 结束；正常成功只返回输出正文，空输出/error/interrupted/`best_effort`/超时用本地化提示或 `[termx exec] ...` 首行。`--async` 立即返回；不杀进程，`-w` 已移除。多行/多条命令不会被合并成一条命令：每条实际执行的命令是独立 transcript 记录，`exec` 只匹配其中一条，收集结果用 `read --last N`。`--base64`/`--file` 为 raw 来源：严格 UTF-8（剥一个 BOM、拒绝非法 UTF-8/NUL），CRLF→LF 并去外沿空白 |
 | `run "<cmd>"` | `terminal.create` → `subscribe` → 等终态 | `--pty`（缺省 stdio）, `--cwd`, `--env`, `--timeout ms`, `-n name`（缺省 `run-<ts>`）, `--force` | 返回合并 output 与 `[exit=N]`/`[signal=...]`；`<cmd>` 按词表拆分后直接执行 |
-| `read` | `terminal.read` | `-n name`, `--cursor N`, `--max-bytes N` | 仅 output chunks；缺省用插件内每终端 cursor 增量，返回 `[cursor=N]` |
+| `read` | `terminal.transcript`（busy 时轮询）→ 必要时 `terminal.read`/`terminal.output` | `-n name`, `--last N`（`-l`）, `-s buffer\|history`, `--timeout ms`, `--includeCommand`；legacy `--cursor/--max-bytes/--tail-lines/--tail-chars`（不能与 `--last`/`-s` 混用） | 默认只读当前/最后一条命令；busy 先等待，仍 busy 且未显式 `-s` 时只返回状态首行，`-s buffer` 给快照、`-s history` 给 `note=completed-only` + 最后一条已完成命令；`--last N` 返回最后 N 条已完成命令的输出块（`--- termx result i/N [flags] ---`，无命令文本/cursor/URL），idle 无首行、仍 busy 时带 `note=completed-only`；正常 idle 只返回输出（可加 `$ command`）；不再默认返回 `[cursor=N]` 或浏览器 URL |
 | `transcript` | `terminal.transcript` | `-n name`, `--json` | 命令记录（`started_at`/`ended_at`/`status`/清洗后 `output`）；默认文本，`--json` 返回 `{commands, revision}` |
-| `send "<text>"` | `terminal.claim` → `terminal.send` | `-n name`, `--enter` | 写入文本；默认自动 claim（失败不阻断 send） |
+| `send "<text>"` | `terminal.claim` → `terminal.send` | `-n name`, `--enter`, `--base64` \| `--file PATH` | 写入文本；默认自动 claim（失败不阻断 send）。`--base64`/`--file` 按解码后的文本原样写入（不解释转义、不归一换行） |
 | `resize` | `terminal.resize` | `-n name`, `--cols`, `--rows` | pty 生效；stdio 空操作 |
 | `signal` | `terminal.signal` | `-n name`, `SIGINT|SIGTERM|SIGKILL` | 发送信号 |
 | `status` | `terminal.status` | `-n name` | `snapshot` |
