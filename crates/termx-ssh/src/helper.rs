@@ -1245,6 +1245,7 @@ async fn handle_event(
             command,
             started_at_ms,
             ended_at_ms,
+            dropped,
         } => {
             let Some(kind) = ShellEventKind::parse(&event) else {
                 tracing::warn!(%event, "helper 返回未知 shell 事件，已忽略");
@@ -1262,6 +1263,7 @@ async fn handle_event(
                         // 远端 helper 协议尚未转发 `O` 的 data；远端 transcript
                         // 继续走 PTY 输出路径。
                         data: None,
+                        dropped,
                     },
                 ))
                 .await
@@ -1718,6 +1720,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 started_at_ms: Some(1_700_000_000_000),
                 ended_at_ms: Some(1_700_000_001_000),
+                dropped: true,
             },
             &tx,
             &mut tree_waiters,
@@ -1735,6 +1738,7 @@ mod tests {
                     started_at_ms: Some(1_700_000_000_000),
                     ended_at_ms: Some(1_700_000_001_000),
                     data: None,
+                    dropped: true,
                 }
             ))
         );
@@ -1748,6 +1752,7 @@ mod tests {
                     command: None,
                     started_at_ms: None,
                     ended_at_ms: None,
+                    dropped: false,
                 },
                 &tx,
                 &mut tree_waiters,

@@ -87,7 +87,7 @@
 | `terminal.status` | `{ locator }` | `{ snapshot }`；`snapshot.structured_events` 表示是否有带外 shell 事件能力 |
 | `terminal.read` | `{ locator, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
 | `terminal.output` | `{ locator, tail_lines? \| tail_chars? \| pattern?, nth?, only_matches? }` | `{ text }`；按命令输出文本做尾部截取或倒搜（结构化终端读 transcript，raw-only 先清洗），不返回行号 |
-| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output, exit_code?, source?, best_effort?}], revision }` |
+| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output, exit_code?, source?, best_effort?, incomplete?}], revision }` |
 | `terminal.send` | `{ locator, data(base64)?, text?, enter? }` | `{ ok }` |
 | `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
 | `terminal.signal` | `{ locator, signal }` | `{ ok }` |
@@ -225,13 +225,15 @@
   ```jsonc
   [{ "command": "ls", "started_at": "2026-01-01T00:00:00Z",
      "ended_at": "2026-01-01T00:00:01Z", "status": "done", "output": "a.txt\nb.txt",
-     "exit_code": 0, "source": "shell_integration", "best_effort": false }]
+     "exit_code": 0, "source": "shell_integration", "best_effort": false,
+     "incomplete": false }]
   ```
   `ended_at` 在 `running` 时为 `null`；`output` 已由 service 清洗。
   - `exit_code`：可选退出码；无法确定时缺省（不得伪造）。旧客户端可忽略。
   - `source`：结束证据来源，`shell_integration` / `process_group` / `unknown`；未结束时缺省。
   - `best_effort`：结束判定是否为 best-effort（如静默推断）；缺省 `false`。
-  - 三个字段均向后兼容：旧 JSON 缺失时分别默认为 `null`/`null`/`false`，且默认值不参与序列化。
+  - `incomplete`：输出文本是否已知不完整（混合 `O`+PTY、宿主事件帧丢弃或 PTY 屏障失败）；缺省 `false`。它只是文本缺失标记，不改变状态/退出码。
+  - 四个字段均向后兼容：旧 JSON 缺失时分别默认为 `null`/`null`/`false`/`false`，且默认值不参与序列化。
   - **P1 本地单行 marker（当前默认关闭）**：命令内 marker 会被 shell 回显并写入历史，污染 raw/历史记录；`TRANSCRIPT_MARKER_ENABLED=false` 时完全不注入，精确 `exit_code` 暂不产出，等待 hook-based integration。开启时才在本地 `pty` 终端满足 `enter=true`、`text` 存在且 `data` 缺省时，服务端按 shell 追加不可见 OSC 序列（不改变 transcript 记录的原始 `command`）：
     - bash/zsh/sh：`<cmd>; __termx_ec=$?; printf '\033]133;D;%s\007' "$__termx_ec"`；
     - pwsh/powershell：先取 `$?`，再回落 `$LASTEXITCODE`，最后回落到 `1`，用 `[Console]::Write` 输出同一 `133;D` marker。
@@ -326,12 +328,12 @@
   - `hello_ok.capabilities` 含 `shell_events` 表示 helper 支持事件通道；旧 helper 无该能力时客户端不下发事件请求，行为与之前一致。
   - `spawn.events`（缺省 `false`）仅在客户端需要且 helper 声明能力时置 `true`；`started.events`（缺省 `false`）回报本次是否实际建立通道，创建失败只降级、不阻断 spawn。
   - Unix 远端：helper 为每个会话创建私有临时目录（`0700`）与 Unix domain socket（`0600`），生成随机 token，并通过 `TERMX_EVENT_ENDPOINT=unix:<path>` / `TERMX_EVENT_TOKEN` 注入子进程环境；只 accept 一次、首行校验 token、单帧上限，会话结束后清理 socket。不在 stdout 输出事件，也不新增 TCP 端口。
-  - 子进程按 JSON Lines 发送 `A/B/C/D`；helper 转成 `shell_event{event, code?, id?}` 协议帧。Unix 使用 UDS；Windows 使用命名管道（`pipe:<name>`），同一 token/帧格式与降级语义。
+  - 子进程按 JSON Lines 发送 `A/B/C/D`；helper 转成 `shell_event{event, code?, id?, dropped?}` 协议帧。Unix 使用 UDS；Windows 使用命名管道（`pipe:<name>`），同一 token/帧格式与降级语义。`dropped` 目前只有本地 `termx-pwsh` `D` 使用；helper 转发时保留该字段。
   - `termx-ssh` 把 `shell_event` 映射为 `ProcEvent::ShellEvent`；service 复用本地通道的 command-id + transcript 代次判定，`D` 命中时以 `source: "shell_integration"` 写入真实 `exit_code`，不匹配/迟到 `D` 被忽略。
   - 关闭 in-band OSC 的判定是严格三级门槛：`ssh + pty + basename(cmd)` 属于结构化程序（`termx-pwsh`/`termx-bash`，后端快照 `shell_events()`）、helper 声明 `shell_events`、`started.events=true`；任一不满足（含旧 helper、普通 SSH、fallback）都保持 in-band 解析，不伪造退出码。
   - 公开 WebSocket `Capabilities` 不新增字段；事件通道状态只影响 service 内部 transcript 判定。
 - 本地结构化 runtime：`termx-pwsh`、`termx-bash`（见 CONFIG §3.2）。只有这些 runtime ID 的本地 PTY 会创建带外事件通道；直接启动的普通 shell 保持 raw-only，`structured_events=false`。
-- 本地 `termx-pwsh` 的宿主输出事件 `O`：`{"v":1,"event":"O","id":"<command-id>","data":"<base64 UTF-8>"}`。`O` 只在 active command-id 存在时发送，与 `C/D` 同一 FIFO；service 按 command-id/代次追加 transcript，不生成 xterm output。命令外的 prompt、输入回显与 `D` 后输出没有 active id，不得进入 transcript；命令执行中的交互提示（如 `Read-Host`）仍有 active id，目前作为 `O` 记录。native/直接 console 的文本由 `C..D` PTY 兜底，仅在整条命令没有 `O` 时并入 transcript；TUI/脱离当前 console 不承诺文本。默认不使用 OSC/token/sleep 或 PTY 尾段猜测。
+- 本地 `termx-pwsh` 的宿主输出事件 `O`：`{"v":1,"event":"O","id":"<command-id>","data":"<base64 UTF-8>"}`。`O` 只在 active command-id 存在时发送，与 `C/D` 同一 FIFO；service 按 command-id/代次追加 transcript，不生成 xterm output。命令外的 prompt、输入回显与 `D` 后输出没有 active id，不得进入 transcript；命令执行中的交互提示（如 `Read-Host`）仍有 active id，目前作为 `O` 记录。native/直接 console 的文本由 `C..D` PTY 兜底，仅在整条命令没有 `O` 时并入 transcript。混合 `O`+PTY、`D{dropped:true}`（队列满/关闭丢弃过 `O`）或 PTY 屏障失败时，命令标记 `incomplete=true`；不伪造退出码/状态。远端 helper 事件暂不携带 `O` 的 `data`。TUI/脱离当前 console 不承诺文本。默认不使用 OSC/token/sleep 或 PTY 尾段猜测。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全

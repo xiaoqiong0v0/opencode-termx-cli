@@ -76,6 +76,7 @@ fn event_with_meta(
         started_at_ms,
         ended_at_ms,
         data: None,
+        dropped: false,
     }
 }
 
@@ -585,6 +586,7 @@ fn command_abort_cancels_pending_send_record() {
         started_at_ms: None,
         ended_at_ms: None,
         data: None,
+        dropped: false,
     };
     assert!(
         !apply_event(&mut registry, &id, &mut tracker, &abort, t0).expect("X"),
@@ -633,6 +635,7 @@ fn command_abort_clears_active_tracker() {
         started_at_ms: None,
         ended_at_ms: None,
         data: None,
+        dropped: false,
     };
     assert!(!apply_event(&mut registry, &id, &mut tracker, &abort, t0).expect("X"));
     assert_eq!(tracker.active_command_id(), None, "X 应清空 active");

@@ -752,6 +752,30 @@ impl Registry {
         Ok(entry.transcript.record_pty_output_for_current(text, now))
     }
 
+    /// 把当前（最后一条）命令标记为输出不完整。
+    ///
+    /// 只翻 `incomplete` 标记，不改变状态/退出码/`best_effort`；未知终端返回
+    /// [`CoreError::NotFound`]。
+    pub fn mark_transcript_incomplete(&mut self, id: &TerminalId) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry.transcript.mark_output_incomplete())
+    }
+
+    /// 按代次把命令标记为输出不完整；代次不匹配时无变更。
+    ///
+    /// 供带外 `D` 的 `dropped` 与 PTY 屏障失败使用：命令可能已结束，标记仍
+    /// 要落到同一条记录上。未知终端返回 [`CoreError::NotFound`]。
+    pub fn mark_transcript_incomplete_for_generation(
+        &mut self,
+        id: &TerminalId,
+        generation: u64,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry
+            .transcript
+            .mark_output_incomplete_for_generation(generation))
+    }
+
     /// 以 `shell_integration` 来源结束当前命令。
     ///
     /// 用于不携带代次证据的调用方（如 in-band OSC）；带外事件通道应使用

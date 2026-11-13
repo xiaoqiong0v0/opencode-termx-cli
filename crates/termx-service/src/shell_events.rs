@@ -111,12 +111,18 @@ pub fn apply_event(
                 return Ok(false);
             };
             let ended_at = event.ended_at_ms.and_then(from_unix_millis).unwrap_or(now);
-            registry.record_transcript_end_for_generation_at(
+            let ended = registry.record_transcript_end_for_generation_at(
                 terminal_id,
                 exit_code,
                 generation,
                 ended_at,
-            )
+            )?;
+            if event.dropped {
+                // 宿主队列丢弃过 O 帧：文本可能缺失，但退出码/状态保持真实。
+                // 已由静默判定结束的记录也要补上标记。
+                registry.mark_transcript_incomplete_for_generation(terminal_id, generation)?;
+            }
+            Ok(ended)
         }
         ShellEventKind::PromptStart | ShellEventKind::PromptEnd => Ok(false),
         ShellEventKind::CommandOutput => {

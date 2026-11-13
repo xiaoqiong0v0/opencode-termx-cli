@@ -134,6 +134,9 @@ pub enum HelperEvent {
         /// `D` 命令结束的 Unix 毫秒时间戳（UTC）；旧 helper 不填。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ended_at_ms: Option<i64>,
+        /// `D` 表示有 `O` 帧被丢弃；旧 helper 不填。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dropped: bool,
     },
     /// 进程树快照，对应一次 `tree` 请求。
     ///
@@ -241,6 +244,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 started_at_ms: Some(1_700_000_000_000),
                 ended_at_ms: Some(1_700_000_001_000),
+                dropped: true,
             },
             HelperEvent::Tree {
                 processes: vec![crate::ProcNode {
@@ -315,11 +319,19 @@ mod tests {
             command: None,
             started_at_ms: None,
             ended_at_ms: None,
+            dropped: false,
         };
         let value: JsonValue =
             serde_json::from_str(&serde_json::to_string(&shell_event).expect("序列化失败"))
                 .expect("JSON 解析失败");
-        for key in ["code", "id", "command", "started_at_ms", "ended_at_ms"] {
+        for key in [
+            "code",
+            "id",
+            "command",
+            "started_at_ms",
+            "ended_at_ms",
+            "dropped",
+        ] {
             assert!(value.get(key).is_none(), "{key} 不应出现");
         }
 
@@ -336,6 +348,7 @@ mod tests {
                 command: None,
                 started_at_ms: None,
                 ended_at_ms: None,
+                dropped: false,
             }
         );
 

@@ -30,15 +30,19 @@ export type ReadHeaderNote =
  * @param source 数据来源（buffer/history/status）
  * @param state 终端/结果状态
  * @param note 是否附加提示
- * @returns `[termx read] terminal=... source=... state=...[ note=...]`
+ * @param incomplete 输出文本是否已知不完整（混合 host/native、丢弃或屏障失败）
+ * @returns `[termx read] terminal=... source=... state=...[ incomplete=true][ note=...]`
  */
 export function formatReadHeader(
   name: string,
   source: ReadHeaderSource,
   state: ReadHeaderState,
   note?: ReadHeaderNote,
+  incomplete = false,
 ): string {
-  const header = `[termx read] terminal=${name} source=${source} state=${state}`;
+  const header = `[termx read] terminal=${name} source=${source} state=${state}${
+    incomplete ? " incomplete=true" : ""
+  }`;
   return note ? `${header} note=${note}` : header;
 }
 
@@ -71,12 +75,14 @@ export interface ResultBlockMeta {
   exitCode?: number | null;
   /** 静默完成（完成判定不确定）。 */
   bestEffort?: boolean;
+  /** 输出文本已知不完整（混合 host/native、丢弃或屏障失败）。 */
+  incomplete?: boolean;
 }
 
 /**
  * 生成稳定的结果块标记：`--- termx result i/N [flags] ---`。
  *
- * flags 只含紧凑 ASCII 状态（error/interrupted/exit_code/best_effort），
+ * flags 只含紧凑 ASCII 状态（error/interrupted/exit_code/best_effort/incomplete），
  * 绝不包含命令文本。
  *
  * @param index 当前块序号（从 1 开始）
@@ -137,6 +143,7 @@ function resultFlags(meta?: ResultBlockMeta): string[] {
     if (exitCode !== undefined) flags.push(`exit_code=${exitCode}`);
   }
   if (meta.bestEffort) flags.push("best_effort");
+  if (meta.incomplete) flags.push("incomplete");
   return flags;
 }
 

@@ -125,6 +125,9 @@ struct WireEvent {
     ended_at_ms: Option<i64>,
     #[serde(default)]
     data: Option<String>,
+    /// `D` 表示命令有 `O` 帧因队列满/关闭被丢弃。
+    #[serde(default)]
+    dropped: bool,
 }
 
 /// 监听端只持有 `AsyncRead`；服务端不需要回写。
@@ -167,6 +170,7 @@ where
             started_at_ms: wire.started_at_ms,
             ended_at_ms: wire.ended_at_ms,
             data: wire.data,
+            dropped: wire.dropped,
         };
         if sender.send(event).await.is_err() {
             break;
@@ -335,5 +339,11 @@ mod tests {
                 .expect("旧 D 事件应兼容");
         assert_eq!(legacy.event, "D");
         assert_eq!(legacy.data, None);
+        assert!(!legacy.dropped);
+
+        let dropped: WireEvent =
+            serde_json::from_str(r#"{"v":1,"event":"D","code":0,"id":"cmd-1","dropped":true}"#)
+                .expect("带 dropped 的 D 事件应可解析");
+        assert!(dropped.dropped);
     }
 }

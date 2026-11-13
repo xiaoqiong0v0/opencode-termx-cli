@@ -2720,6 +2720,7 @@ async fn ingest_shell_events(
         let command_end = event.kind == crate::shell_events::ShellEventKind::CommandEnd
             && event.id.is_some()
             && tracker.active_command_id() == event.id.as_deref();
+        let mut barrier_incomplete = None;
         if command_end
             && !ordering::barrier_before_command_end(
                 Arc::clone(&backend),
@@ -2735,17 +2736,25 @@ async fn ingest_shell_events(
                 terminal_id = %terminal_id,
                 "输出屏障未完成，仍应用命令结束事件（PTY 兜底输出顺序可能不完整）"
             );
+            barrier_incomplete = tracker.active_generation();
         }
 
         let applied = {
             let mut registry = lock_registry(&registry);
-            crate::shell_events::apply_event(
+            let result = crate::shell_events::apply_event(
                 &mut registry,
                 &terminal_id,
                 &mut tracker,
                 &event,
                 OffsetDateTime::now_utc(),
-            )
+            );
+            if let Some(generation) = barrier_incomplete {
+                // 顺序屏障失败意味着该命令的 PTY 文本可能缺失；只补
+                // incomplete 标记，不伪造退出码、不改变结束状态。
+                let _ =
+                    registry.mark_transcript_incomplete_for_generation(&terminal_id, generation);
+            }
+            result
         };
         match applied {
             Ok(_) => {}
@@ -3369,6 +3378,21 @@ mod tests {
             started_at_ms: None,
             ended_at_ms: None,
             data: None,
+            dropped: false,
+        })
+    }
+
+    /// 构造带 `dropped=true` 的 `D` 事件。
+    fn shell_dropped_end_event(code: Option<i32>, id: &str) -> ProcEvent {
+        ProcEvent::ShellEvent(ShellEvent {
+            kind: ShellEventKind::CommandEnd,
+            code,
+            id: Some(id.to_string()),
+            command: None,
+            started_at_ms: None,
+            ended_at_ms: None,
+            data: None,
+            dropped: true,
         })
     }
 
@@ -3382,6 +3406,7 @@ mod tests {
             started_at_ms: None,
             ended_at_ms: None,
             data: Some(BASE64_STANDARD.encode(text.as_bytes())),
+            dropped: false,
         })
     }
 
@@ -3415,6 +3440,34 @@ mod tests {
         assert_eq!(command.exit_code, Some(7));
         assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
         assert!(!command.best_effort);
+        assert!(!command.incomplete);
+    }
+
+    #[tokio::test]
+    async fn dropped_command_end_marks_transcript_incomplete() {
+        let (registry, terminal_id) = proc_event_terminal();
+        {
+            let mut guard = lock_registry(&registry);
+            guard
+                .record_transcript_command(&TerminalId::new(terminal_id.clone()), "first", now())
+                .expect("记录命令");
+        }
+        feed_proc_events(
+            &registry,
+            &terminal_id,
+            vec![
+                shell_proc_event(ShellEventKind::CommandStart, None, "cmd-1"),
+                shell_dropped_end_event(Some(0), "cmd-1"),
+            ],
+            false,
+        )
+        .await;
+
+        let command = first_transcript(&registry, &terminal_id);
+        assert_eq!(command.status, termx_protocol::TranscriptStatus::Done);
+        assert_eq!(command.exit_code, Some(0), "dropped 不得伪造/清除退出码");
+        assert!(!command.best_effort, "dropped 不得改变 best_effort");
+        assert!(command.incomplete, "宿主丢弃 O 帧必须标记 incomplete");
     }
 
     #[test]

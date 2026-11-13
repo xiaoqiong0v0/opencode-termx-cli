@@ -584,6 +584,7 @@ fn translate_shell_event(event: ShellEvent) -> HelperEvent {
         command: event.command,
         started_at_ms: event.started_at_ms,
         ended_at_ms: event.ended_at_ms,
+        dropped: event.dropped,
     }
 }
 
@@ -632,6 +633,7 @@ fn translate_event(event: ProcEvent) -> HelperEvent {
             command: event.command,
             started_at_ms: event.started_at_ms,
             ended_at_ms: event.ended_at_ms,
+            dropped: event.dropped,
         },
     }
 }
@@ -751,6 +753,7 @@ mod tests {
             started_at_ms: Some(1_700_000_000_000),
             ended_at_ms: Some(1_700_000_001_000),
             data: None,
+            dropped: true,
         });
         assert_eq!(
             event,
@@ -761,6 +764,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 started_at_ms: Some(1_700_000_000_000),
                 ended_at_ms: Some(1_700_000_001_000),
+                dropped: true,
             }
         );
     }
@@ -813,6 +817,7 @@ mod tests {
                 started_at_ms: None,
                 ended_at_ms: None,
                 data: None,
+                dropped: false,
             }
         }
 

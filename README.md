@@ -44,6 +44,7 @@
 - 加载：opencode 自动发现 `.opencode/plugins/`；本项目**不需要根 `opencode.json`**（`plugin` 数组仅用于 npm/远程 spec，勿登记本地文件）。
 - 前置：先显式启动 `termx-service --config-dir <DIR> [--log-dir <DIR> --log-enabled true]`（配置目录不再推导平台默认；`TERMX_CONFIG_DIR` 仅作为显式来源）。
 - 工具：`termx_exec` / `termx_local` / `termx_ssh` / `termx_list` / `termx_status` / `termx_read` / `termx_send` / `termx_resize` / `termx_signal` / `termx_terminate` / `termx_prune` / `termx_attach` / `termx_detach` / `termx_claim` / `termx_release`。
+- 输出完整性：混合 host+native、宿主事件帧丢弃或 PTY 顺序屏障失败时，命令记录带 `incomplete=true`（`exec`/`read` 首行和 `--last` 标记 `[incomplete]`）；退出码/状态仍来自真实事件，不伪造。已知限制：Read-Host 等交互提示会作为命令输出记录；远端 helper 暂不转发 `O` 文本；单条命令输出上限 64 KiB。
 - 加载时机：opencode 启动时加载；修改插件/配置或重新生成后需重启 opencode。
 - 自测：`node scripts/termx-plugin-selftest.mjs`（需 service 运行，直接引用跟踪源码）。
 

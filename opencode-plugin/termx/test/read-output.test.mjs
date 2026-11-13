@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  formatReadHeader,
   formatResultBlock,
   formatResultMarker,
   joinResultBlocks,
@@ -56,6 +57,29 @@ test("error, interrupted and best_effort flags live in the marker only", () => {
   assert.equal(
     formatResultMarker(1, 1, { status: "done", exitCode: 0 }),
     "--- termx result 1/1 ---",
+  );
+});
+
+test("incomplete flag is compact and lives in the marker", () => {
+  assert.equal(
+    formatResultMarker(1, 2, { status: "done", incomplete: true }),
+    "--- termx result 1/2 [incomplete] ---",
+  );
+  assert.equal(
+    formatResultMarker(2, 2, {
+      status: "done",
+      bestEffort: true,
+      incomplete: true,
+    }),
+    "--- termx result 2/2 [best_effort incomplete] ---",
+  );
+  assert.equal(
+    formatReadHeader("t", "history", "idle", "best_effort", true),
+    "[termx read] terminal=t source=history state=idle incomplete=true note=best_effort",
+  );
+  assert.equal(
+    formatReadHeader("t", "history", "idle"),
+    "[termx read] terminal=t source=history state=idle",
   );
 });
 

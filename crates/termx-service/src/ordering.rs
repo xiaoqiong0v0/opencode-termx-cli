@@ -240,6 +240,7 @@ mod tests {
             started_at_ms: None,
             ended_at_ms: None,
             data: None,
+            dropped: false,
         }
     }
 

@@ -67,6 +67,10 @@ pub struct ShellEvent {
     /// 使用 base64 是为了避免 JSON 转义、换行与二进制/非 UTF-8 边界问题；
     /// 单帧输出由宿主按 UTF-8 字符边界分片，service 按到达顺序拼接。
     pub data: Option<String>,
+    /// `D` 表示该命令有 `O` 帧因事件队列满/关闭被丢弃；其他事件为 `false`。
+    ///
+    /// 只用于把 transcript 标记为 `incomplete`，不伪造退出码、不改变结束状态。
+    pub dropped: bool,
 }
 
 #[cfg(test)]

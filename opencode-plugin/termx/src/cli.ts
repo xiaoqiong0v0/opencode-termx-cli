@@ -181,6 +181,7 @@ interface TranscriptCommand {
   status?: string;
   exit_code?: number | null;
   best_effort?: boolean;
+  incomplete?: boolean;
   output?: string;
 }
 
@@ -876,12 +877,18 @@ function formatExecResult(t: Translator, command: TranscriptCommand): string {
     command.status === "error" ||
     command.status === "interrupted" ||
     (exitCode !== undefined && exitCode !== 0);
+  const incomplete = command.incomplete === true;
   if (failed) {
     const state = command.status === "interrupted" ? "interrupted" : "error";
-    return `${EXEC_HEADER} state=${state} exit_code=${exitCode ?? "unknown"}\n\n${body}`;
+    const suffix = incomplete ? " incomplete=true" : "";
+    return `${EXEC_HEADER} state=${state} exit_code=${exitCode ?? "unknown"}${suffix}\n\n${body}`;
   }
   if (command.best_effort) {
-    return `${EXEC_HEADER} state=done best_effort=true\n\n${body}`;
+    const suffix = incomplete ? " incomplete=true" : "";
+    return `${EXEC_HEADER} state=done best_effort=true${suffix}\n\n${body}`;
+  }
+  if (incomplete) {
+    return `${EXEC_HEADER} state=done incomplete=true\n\n${body}`;
   }
   return output || t("exec.noOutput");
 }
@@ -1131,12 +1138,24 @@ async function readCurrent(
   if (view.busy) {
     if (source === "buffer") {
       const snapshot = stripTrailingNewline(view.last?.output ?? "");
-      const header = formatReadHeader(name, "buffer", "busy", "partial");
+      const header = formatReadHeader(
+        name,
+        "buffer",
+        "busy",
+        "partial",
+        view.last?.incomplete === true,
+      );
       return formatReadResult(header, snapshot, noOutput);
     }
     if (source === "history") {
       // busy 时 history 只给最后一条已完成命令，绝不把运行中命令当结果。
-      const header = formatReadHeader(name, "history", "busy", "completed-only");
+      const header = formatReadHeader(
+        name,
+        "history",
+        "busy",
+        "completed-only",
+        view.lastCompleted?.incomplete === true,
+      );
       return formatReadResult(
         header,
         commandOutput(view.lastCompleted, includeCommand, noOutput),
@@ -1197,6 +1216,7 @@ function formatLastResults(
           status: command.status,
           exitCode: command.exit_code,
           bestEffort: command.best_effort,
+          incomplete: command.incomplete,
         },
       ),
     ),
@@ -1232,7 +1252,7 @@ function commandOutput(
   return includeCommand ? `$ ${command.command}\n${body || noOutput}` : body;
 }
 
-/** 正常 idle 结果：默认只给输出；best_effort/error 才显示首行。 */
+/** 正常 idle 结果：默认只给输出；best_effort/error/incomplete 才显示首行。 */
 function formatIdleRead(
   name: string,
   includeCommand: boolean,
@@ -1241,9 +1261,10 @@ function formatIdleRead(
 ): string {
   const output = commandOutput(last, includeCommand, noOutput);
   const note = idleNote(last);
-  if (!note) return formatReadResult("", output, noOutput, false);
-  const state: ReadHeaderState = note === "best_effort" ? "idle" : "error";
-  const header = formatReadHeader(name, "history", state, note);
+  const incomplete = last?.incomplete === true;
+  if (!note && !incomplete) return formatReadResult("", output, noOutput, false);
+  const state: ReadHeaderState = note === "best_effort" || !note ? "idle" : "error";
+  const header = formatReadHeader(name, "history", state, note, incomplete);
   return formatReadResult(header, output, noOutput);
 }
 

@@ -2117,11 +2117,12 @@ mod tests {
         assert_eq!(legacy.exit_code, None);
         assert_eq!(legacy.source, None);
         assert!(!legacy.best_effort);
+        assert!(!legacy.incomplete);
 
         // 默认值不应出现在序列化结果中。
         let legacy_json: JsonValue =
             serde_json::from_str(&to_json(&legacy).expect("序列化失败")).expect("JSON 解析失败");
-        for key in ["exit_code", "source", "best_effort"] {
+        for key in ["exit_code", "source", "best_effort", "incomplete"] {
             assert!(
                 legacy_json.get(key).is_none(),
                 "{key} 不应出现在旧形状 JSON 中"
@@ -2138,12 +2139,14 @@ mod tests {
             exit_code: Some(1),
             source: Some(TranscriptSource::ProcessGroup),
             best_effort: true,
+            incomplete: true,
         };
         let full_json: JsonValue =
             serde_json::from_str(&to_json(&full).expect("序列化失败")).expect("JSON 解析失败");
         assert_eq!(full_json["exit_code"], 1);
         assert_eq!(full_json["source"], "process_group");
         assert_eq!(full_json["best_effort"], true);
+        assert_eq!(full_json["incomplete"], true);
 
         let back: TranscriptCommand =
             from_json(&to_json(&full).expect("序列化失败")).expect("反序列化失败");
@@ -2215,6 +2218,10 @@ pub struct TranscriptCommand {
     /// 结束判定是否为 best-effort（例如静默推断）；默认 `false`。
     #[serde(default, skip_serializing_if = "is_false")]
     pub best_effort: bool,
+    /// 输出文本是否已知不完整（混合 `O`+PTY、事件队列丢弃或屏障失败）；
+    /// 默认 `false`，语义只是“可能缺少文本”，不改变状态/退出码。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incomplete: bool,
 }
 
 /// `terminal.transcript` 参数。
