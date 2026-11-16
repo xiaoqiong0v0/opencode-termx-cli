@@ -10,10 +10,10 @@ import type { MessageKey, Translator } from "./i18n.js";
 import { normalizeExecText, PayloadError, resolvePayload } from "./payload.js";
 import type { ResolvedPayload } from "./payload.js";
 import {
+  formatLastResultsBudgeted,
   formatReadHeader,
   formatReadResult,
-  formatResultBlock,
-  joinResultBlocks,
+  LAST_TOTAL_BUDGET_BYTES,
   lastItem,
 } from "./read-output.js";
 import type { ReadHeaderNote, ReadHeaderState, ReadSource } from "./read-output.js";
@@ -1192,35 +1192,25 @@ async function readLast(
   }
 
   const completed = view.commands.filter((command) => command.status !== "running");
-  const body = formatLastResults(completed.slice(-last), noOutput);
+  const body = formatLastResultsBudgeted(
+    completed.slice(-last).map((command) => ({
+      output: stripTrailingNewline(command.output ?? ""),
+      meta: {
+        status: command.status,
+        exitCode: command.exit_code,
+        bestEffort: command.best_effort,
+        incomplete: command.incomplete,
+      },
+    })),
+    noOutput,
+    LAST_TOTAL_BUDGET_BYTES,
+    env.t("read.lastDropped"),
+  );
   if (view.busy) {
     const header = formatReadHeader(name, "history", "busy", "completed-only");
     return formatReadResult(header, body, noOutput);
   }
   return formatReadResult("", body, noOutput, false);
-}
-
-/** 把已选中的已完成命令格式化为稳定结果块（绝不写命令文本）。 */
-function formatLastResults(
-  commands: TranscriptCommand[],
-  noOutput: string,
-): string {
-  return joinResultBlocks(
-    commands.map((command, index) =>
-      formatResultBlock(
-        index + 1,
-        commands.length,
-        stripTrailingNewline(command.output ?? ""),
-        noOutput,
-        {
-          status: command.status,
-          exitCode: command.exit_code,
-          bestEffort: command.best_effort,
-          incomplete: command.incomplete,
-        },
-      ),
-    ),
-  );
 }
 
 /** 读取 transcript 末条命令并判定 busy（last.status === "running"）。 */

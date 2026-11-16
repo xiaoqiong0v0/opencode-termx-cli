@@ -63,10 +63,14 @@ Rules:
     "$ <command>". Normal idle results are output only; busy/timeout/error/best_effort/incomplete
     add a "[termx read] ..." first line (incomplete uses " incomplete=true").
     --last N (-l N) returns the outputs of the last N completed commands (status != running) as
-    blocks marked "--- termx result i/N ---"; markers may include [best_effort] / [incomplete].
-    It never includes command text, cursor, terminal URL or browser URL. Normal idle has no
-    header; if still busy after the bounded wait the header uses note=completed-only. --last
-    cannot be combined with -s, --includeCommand, or legacy flags. Legacy
+    blocks marked "--- termx result i/N ---"; markers may include [best_effort] / [incomplete] /
+    [truncated]. It never includes command text, cursor, terminal URL or browser URL. Normal idle
+    has no header; if still busy after the bounded wait the header uses note=completed-only. The
+    combined output is bounded by a total budget of 128 KiB (UTF-8 bytes, including markers):
+    older blocks are dropped whole from the oldest end first, and if the newest block alone
+    exceeds the budget its tail is kept and marked [truncated]; dropped blocks are reported by a
+    leading i18n line (not counted in the budget). --last cannot be combined with -s,
+    --includeCommand, or legacy flags. Legacy
     --cursor/--max-bytes/--tail-lines/--tail-chars still work but are not the default path.
   - search scans raw output backwards. --nth 1 is the last match; default returns from that
     match to the end; --only-matches returns just the matched line. No line numbers or
@@ -134,8 +138,11 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
     “$ <command>”。正常 idle 只返回输出；busy/超时/error/best_effort/incomplete 才加
     “[termx read] ...” 首行（incomplete 用 “ incomplete=true”）。--last N（-l N）按块返回
     最后 N 条已完成命令（status != running）的输出，块标记为 “--- termx result i/N ---”；
-    标记内可能带 [best_effort] / [incomplete]；绝不包含命令文本、cursor、终端 URL 或浏览器
-    URL。正常 idle 不显示首行；等待上限后仍 busy 时首行为 note=completed-only。--last 不能与
+    标记内可能带 [best_effort] / [incomplete] / [truncated]；绝不包含命令文本、cursor、终端
+    URL 或浏览器 URL。正常 idle 不显示首行；等待上限后仍 busy 时首行为 note=completed-only。
+    合计输出受总预算 128 KiB（UTF-8 字节，含标记行）限制：超预算时从最旧的块整体丢弃，
+    若最新单块自身超预算则保留其末尾并加 [truncated] 标记；被丢弃块数会在结果最前加一行
+    本地化说明（该行不计入预算）。--last 不能与
     -s、--includeCommand 或旧参数同时使用。legacy --cursor/--max-bytes/--tail-lines/
     --tail-chars 仍可用，但不是默认路径。
   - search 从末尾倒搜原始输出；--nth 1 为最后一个匹配。默认返回该匹配到末尾；
@@ -211,6 +218,8 @@ const en = {
     "-w has been removed. exec waits up to exec.timeoutMs by default; use --async for immediate return.",
   "read.noOutput": "No output yet.",
   "read.disconnected": "Terminal disconnected before output could be read.",
+  "read.lastDropped":
+    "[read --last: {count} older result block(s) dropped (total budget 128 KiB)]",
 
   "cli.ok.detachedAll": "detached={count}",
   "cli.ok.terminatedAll": "terminated={count}",
@@ -295,6 +304,8 @@ const zh: Record<MessageKey, string> = {
     "-w 已移除。exec 默认最多等待 exec.timeoutMs；需要立即异步请用 --async。",
   "read.noOutput": "暂时没有输出。",
   "read.disconnected": "读取输出前终端已断开。",
+  "read.lastDropped":
+    "[read --last：因总预算 128 KiB 丢弃了 {count} 个更早的结果块]",
 
   "cli.ok.detachedAll": "detached={count}",
   "cli.ok.terminatedAll": "terminated={count}",
