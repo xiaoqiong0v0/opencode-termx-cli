@@ -115,3 +115,7 @@
 - Web 页面（W2）：同一测试断言 `xterm.js` 为完整构建（含 `Terminal` 且长度 > 200 KiB）、`app.js` 含 `terminal.list`/`terminal.send`/`subscribe`/`web-hello`；另用 `--web-port 8138` 临时启动，HTTP 检查 `/`、`/static/*` 200，并用 WebSocket 客户端验证 `web-hello` 与 `terminal.list` 响应。
 - 单实例/端口一致性：`cargo test -p termx-service --test single_instance`（同目录第二次 `Service::bind` 返回 `AlreadyRunning` 且不覆盖 port、释放后可重新绑定）、`cargo test -p termx-service lock::`（同进程二次加锁被拒、Drop 后可重新加锁）。
 - 改动上述任一交互点时，必须同批更新本表的「顺序契约」与对应测试。
+
+## 6. service e2e 验证
+
+- `pwsh scripts/run-termx-e2e.ps1`：service 级 e2e 统一入口（payload / read-last / incomplete 三套件，默认 all），构建 service 与插件 dist 后逐套件启动 `termx-service` 跑断言（`scripts/e2e/*.mjs`），按套件隔离 config 目录并只停自己启动的服务；改动 #28/#35 等命令记录与输出顺序契约后应跑一遍回归。
