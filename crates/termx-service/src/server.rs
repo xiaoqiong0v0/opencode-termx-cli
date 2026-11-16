@@ -2084,6 +2084,7 @@ fn find_default_private_key(home: &Path) -> Option<PathBuf> {
 /// 并发契约：registry 的 `std::sync::Mutex` 只在同步短操作中持有；
 /// `spawn` / `terminate` / `foreground_pgrp` 全部放到 `spawn_blocking`，
 /// 且不在持锁期间等待。
+#[allow(clippy::too_many_arguments)]
 async fn handle_create(
     id: String,
     mut params: CreateParams,
@@ -2248,7 +2249,7 @@ async fn handle_create(
     if let Some(channel) = event_channel {
         let (receiver, cancel) = channel.split();
         tokio::spawn(ingest_shell_events(
-            Arc::clone(&registry),
+            Arc::clone(registry),
             TerminalId::new(result.terminal_id.clone()),
             receiver,
             cancel,

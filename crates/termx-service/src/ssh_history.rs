@@ -263,6 +263,7 @@ impl SshHistory {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(self.lock_path())?;
         lock.lock_exclusive()?;
         Ok(lock)

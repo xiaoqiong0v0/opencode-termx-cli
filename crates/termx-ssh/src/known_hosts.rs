@@ -164,6 +164,7 @@ impl KnownHosts {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(self.lock_path())
             .map_err(|error| KnownHostsError::Lock(error.to_string()))?;
         lock.lock_exclusive()

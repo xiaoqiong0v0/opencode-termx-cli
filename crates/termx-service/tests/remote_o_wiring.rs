@@ -20,11 +20,11 @@ use common::{TestService, call, connect, create_terminal, handshake_root};
 use tempfile::tempdir;
 use termx_core::{BackendFactory, CoreError, MockBackend, SpawnedBackend, TerminalBackend};
 use termx_proc::{OutputStream, ProcEvent};
+use termx_protocol::shell_events::{ShellEvent, ShellEventKind};
 use termx_protocol::{
     CreateParams, ProcNode, StatusResult, TerminalLocator, TranscriptCommand, TranscriptSource,
     TranscriptStatus,
 };
-use termx_protocol::shell_events::{ShellEvent, ShellEventKind};
 use termx_service::{RemoteInjectionConfig, ServiceConfig};
 use tokio::sync::mpsc::{self, Sender};
 
