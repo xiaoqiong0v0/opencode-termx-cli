@@ -203,6 +203,59 @@ fn output_is_forwarded_before_command_end() {
 }
 
 #[test]
+fn output_event_data_is_forwarded_before_command_end() {
+    let dir = tempfile::tempdir().expect("创建临时目录");
+    let record = dir.path().join("endpoint.txt");
+
+    let mut helper = Helper::start();
+    helper.handshake();
+    helper.send(&spawn_probe(
+        &record,
+        &[
+            ("TERMX_EVENT_PROBE_HOLD_MS", PROBE_HOLD_MS),
+            ("TERMX_EVENT_PROBE_SCRIPT", "A,B,C,O,D"),
+        ],
+    ));
+
+    // `O` 帧必须携带 base64 data，且与 C/D 同走 FIFO：先于 D 到达协议流。
+    let events = helper.collect_until(|event| match event {
+        HelperEvent::ShellEvent { event, .. } => event == "D",
+        HelperEvent::Exited { .. } | HelperEvent::Signaled { .. } | HelperEvent::Error { .. } => {
+            true
+        }
+        _ => false,
+    });
+
+    let mut saw_output = false;
+    for event in &events {
+        match event {
+            HelperEvent::ShellEvent {
+                event, id, data, ..
+            } if event == "O" => {
+                assert_eq!(id.as_deref(), Some("cmd-1"), "O 应携带 command-id");
+                let bytes = STANDARD
+                    .decode(data.as_deref().expect("O 应携带 data"))
+                    .expect("O.data 非 base64");
+                assert_eq!(
+                    String::from_utf8(bytes).expect("O.data 应为 UTF-8"),
+                    shell_event_probe::DEFAULT_OUTPUT,
+                    "O.data 应端到端透传探针输出"
+                );
+                saw_output = true;
+            }
+            HelperEvent::ShellEvent { event, .. } if event == "D" => {
+                assert!(saw_output, "D 转发前必须已转发 O 帧: {events:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_output, "应收到带 data 的 O 帧: {events:?}");
+
+    helper.send(&HelperRequest::Terminate);
+}
+
+#[test]
 fn wrong_token_delivers_no_events() {
     let dir = tempfile::tempdir().expect("创建临时目录");
     let record = dir.path().join("endpoint.txt");

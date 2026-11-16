@@ -75,8 +75,7 @@ Rules:
     information page; --json returns the raw structure. Prompts and command echo are removed.
     It is only meaningful for structured terminals (for example termx-pwsh); use read/search
     for ordinary programs and shells. Known limits: interactive prompts such as Read-Host are
-    recorded as command output; remote helper events do not carry O text yet (PTY path only);
-    per-command output is bounded (64 KiB, marked truncated).
+    recorded as command output; per-command output is bounded (64 KiB, marked truncated).
   - Use -- before a positional that starts with "-".
   - --allow-injection authorizes writing the helper/shell scripts to the remote host when
     creating the SSH terminal; it applies to this creation only and is not persisted.
@@ -144,7 +143,7 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   - transcript 返回信息页记录的命令（起止时间、状态、清洗后输出，incomplete=true 表示文本
     可能缺失）；--json 返回原始结构。提示符与命令回显已由 service 去除。只有结构化终端
     （如 termx-pwsh）才有信息页；普通程序/shell 请用 read/search。已知限制：Read-Host 等
-    交互提示会作为命令输出记录；远端 helper 事件暂不携带 O 文本（只走 PTY 路径）；单条命令
+    交互提示会作为命令输出记录；单条命令
     输出有上限（64 KiB，超限带截断标记）。
   - 以 - 开头的 positional 请放在 -- 之后。
   - --allow-injection 表示本次创建 SSH 终端时允许向远端写入 helper/shell 脚本；

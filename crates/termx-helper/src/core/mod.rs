@@ -584,6 +584,7 @@ fn translate_shell_event(event: ShellEvent) -> HelperEvent {
         command: event.command,
         started_at_ms: event.started_at_ms,
         ended_at_ms: event.ended_at_ms,
+        data: event.data,
         dropped: event.dropped,
     }
 }
@@ -633,6 +634,7 @@ fn translate_event(event: ProcEvent) -> HelperEvent {
             command: event.command,
             started_at_ms: event.started_at_ms,
             ended_at_ms: event.ended_at_ms,
+            data: event.data,
             dropped: event.dropped,
         },
     }
@@ -746,6 +748,30 @@ mod tests {
         use termx_protocol::shell_events::ShellEventKind;
 
         let event = translate_shell_event(ShellEvent {
+            kind: ShellEventKind::CommandOutput,
+            code: None,
+            id: Some("cmd-1".to_string()),
+            command: None,
+            started_at_ms: None,
+            ended_at_ms: None,
+            data: Some("aGVsbG8=".to_string()),
+            dropped: false,
+        });
+        assert_eq!(
+            event,
+            HelperEvent::ShellEvent {
+                event: "O".to_string(),
+                code: None,
+                id: Some("cmd-1".to_string()),
+                command: None,
+                started_at_ms: None,
+                ended_at_ms: None,
+                data: Some("aGVsbG8=".to_string()),
+                dropped: false,
+            }
+        );
+
+        let event = translate_shell_event(ShellEvent {
             kind: ShellEventKind::CommandEnd,
             code: Some(7),
             id: Some("cmd-1".to_string()),
@@ -764,6 +790,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 started_at_ms: Some(1_700_000_000_000),
                 ended_at_ms: Some(1_700_000_001_000),
+                data: None,
                 dropped: true,
             }
         );

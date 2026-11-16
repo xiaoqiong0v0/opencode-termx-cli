@@ -115,7 +115,7 @@ pub enum HelperEvent {
         /// 信号名，如 `SIGTERM`；未知编号回退为 `SIG<num>`。
         signal: String,
     },
-    /// 远端 shell 带外事件；`event` 为 `A` / `B` / `C` / `D`。
+    /// 远端 shell 带外事件；`event` 为 `A` / `B` / `C` / `D` / `O`。
     ShellEvent {
         /// 单字母事件名。
         event: String,
@@ -134,6 +134,9 @@ pub enum HelperEvent {
         /// `D` 命令结束的 Unix 毫秒时间戳（UTC）；旧 helper 不填。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ended_at_ms: Option<i64>,
+        /// `O` 命令输出的 base64 编码 UTF-8 文本；旧 helper 不填。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
         /// `D` 表示有 `O` 帧被丢弃；旧 helper 不填。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dropped: bool,
@@ -244,6 +247,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 started_at_ms: Some(1_700_000_000_000),
                 ended_at_ms: Some(1_700_000_001_000),
+                data: Some("aGVsbG8=".to_string()),
                 dropped: true,
             },
             HelperEvent::Tree {
@@ -319,6 +323,7 @@ mod tests {
             command: None,
             started_at_ms: None,
             ended_at_ms: None,
+            data: None,
             dropped: false,
         };
         let value: JsonValue =
@@ -330,6 +335,7 @@ mod tests {
             "command",
             "started_at_ms",
             "ended_at_ms",
+            "data",
             "dropped",
         ] {
             assert!(value.get(key).is_none(), "{key} 不应出现");
@@ -348,6 +354,7 @@ mod tests {
                 command: None,
                 started_at_ms: None,
                 ended_at_ms: None,
+                data: None,
                 dropped: false,
             }
         );

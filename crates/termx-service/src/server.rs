@@ -2176,13 +2176,6 @@ async fn handle_create(
     } else {
         None
     };
-    // 新端 `termx-pwsh` 用带外 `O` 作为 transcript 输出来源：PTY 只负责
-    // xterm 显示，不再追加 transcript，避免 O + PTY 双写与尾段污染。
-    // 旧端兼容（保留 PTY transcript + allow_late_output）必须显式用
-    // `TERMX_PWSH_PTY_TRANSCRIPT=1` 打开，不能作为新端默认路径。
-    let transcript_output_from_events =
-        event_channel.is_some() && is_pwsh_runtime(&params) && !pwsh_pty_transcript_fallback();
-
     // 只做参数/冲突预检，不提前终止旧后端：否则旧进程退出的 `exited` 可能
     // 抢在 `register_create` 落 `interrupted` 之前。置换统一在锁内完成。
     let factory = {
@@ -2208,6 +2201,14 @@ async fn handle_create(
     // 只有本地通道真正建立或远端 helper 通道生效时才关闭 in-band fallback；
     // 本地通道创建失败时仍保留 send/in-band 记录，避免 transcript 丢失。
     let event_channel_active = event_channel.is_some() || remote_events;
+    // 新端 `termx-pwsh` 用带外 `O` 作为 transcript 输出来源：PTY 只负责
+    // xterm 显示，不再追加 transcript，避免 O + PTY 双写与尾段污染。本地
+    // 通道与远端 helper 通道同口径：只要有事件通道且为 pwsh runtime 就以
+    // `O` 为主，PTY 输出降为兜底（结束时有 O 丢弃、无 O 并入、必要时标
+    // incomplete）。旧端兼容（保留 PTY transcript + allow_late_output）必须
+    // 显式用 `TERMX_PWSH_PTY_TRANSCRIPT=1` 打开，不能作为新端默认路径。
+    let transcript_output_from_events =
+        event_channel_active && is_pwsh_runtime(&params) && !pwsh_pty_transcript_fallback();
     let foreground_pgrp = read_foreground_pgrp(Arc::clone(&backend)).await;
 
     let registered = {

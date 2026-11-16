@@ -1245,6 +1245,7 @@ async fn handle_event(
             command,
             started_at_ms,
             ended_at_ms,
+            data,
             dropped,
         } => {
             let Some(kind) = ShellEventKind::parse(&event) else {
@@ -1260,9 +1261,8 @@ async fn handle_event(
                         command,
                         started_at_ms,
                         ended_at_ms,
-                        // 远端 helper 协议尚未转发 `O` 的 data；远端 transcript
-                        // 继续走 PTY 输出路径。
-                        data: None,
+                        // `O` 的 base64 输出直接透传，service 按代次与 command-id 追加。
+                        data,
                         dropped,
                     },
                 ))
@@ -1720,6 +1720,7 @@ mod tests {
                 command: Some("echo hi".to_string()),
                 started_at_ms: Some(1_700_000_000_000),
                 ended_at_ms: Some(1_700_000_001_000),
+                data: Some("aGVsbG8=".to_string()),
                 dropped: true,
             },
             &tx,
@@ -1737,7 +1738,7 @@ mod tests {
                     command: Some("echo hi".to_string()),
                     started_at_ms: Some(1_700_000_000_000),
                     ended_at_ms: Some(1_700_000_001_000),
-                    data: None,
+                    data: Some("aGVsbG8=".to_string()),
                     dropped: true,
                 }
             ))
@@ -1752,6 +1753,7 @@ mod tests {
                     command: None,
                     started_at_ms: None,
                     ended_at_ms: None,
+                    data: None,
                     dropped: false,
                 },
                 &tx,

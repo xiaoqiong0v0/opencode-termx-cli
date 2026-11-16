@@ -7,10 +7,14 @@
 
 use std::{env, io::Write, os::unix::net::UnixStream, thread, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 /// 触发探针的测试函数名；父测试用它重新执行自身。
 pub const PROBE_TEST_NAME: &str = "shell_event_probe_child";
 /// 未指定时发送的事件序列。
 const DEFAULT_SCRIPT: &str = "A,B,C,D";
+/// 未指定环境变量时 `O` 帧携带的输出文本。
+pub const DEFAULT_OUTPUT: &str = "TERMX_O_DATA_MARKER";
 /// 发送事件后默认保持连接的时间，便于父测试在 terminate 前观察 socket。
 const DEFAULT_HOLD_MS: u64 = 30_000;
 
@@ -51,11 +55,17 @@ pub fn run() {
         .filter(|item| !item.is_empty())
     {
         let mut frame = serde_json::json!({ "v": 1, "event": item });
-        if item == "C" || item == "D" {
+        if item == "C" || item == "D" || item == "O" {
             frame["id"] = serde_json::json!("cmd-1");
         }
         if item == "D" {
             frame["code"] = serde_json::json!(7);
+        }
+        if item == "O" {
+            let output =
+                env::var("TERMX_EVENT_PROBE_OUTPUT").unwrap_or_else(|_| DEFAULT_OUTPUT.to_string());
+            // 与 termx-shell-events 解析口径一致：data 为 base64 编码的 UTF-8 文本。
+            frame["data"] = serde_json::json!(STANDARD.encode(output.as_bytes()));
         }
         if writeln!(stream, "{frame}").is_err() {
             break;

@@ -421,7 +421,10 @@ impl Registry {
     /// `transcript_output_from_events=true` 表示命令输出改由带外 `O` 事件提供，
     /// PTY 输出只用于显示、不再追加到 transcript；此时也不启用迟到的 PTY
     /// 尾段兜底（`allow_late_output`），静默结束不提前提升兜底（避免与迟到
-    /// `O` 重复）。旧端/远端/raw 终端传 `false`。
+    /// `O` 重复）。本地 `termx-pwsh` 与远端 helper 事件通道（ssh + pty +
+    /// 结构化 runtime + helper `shell_events`）都会传 `true`；旧端、raw
+    /// 终端、非 pwsh runtime 与无事件通道的远端（旧 helper / fallback）传
+    /// `false`。
     pub fn register_create_with(
         &mut self,
         params: CreateParams,

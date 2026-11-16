@@ -328,12 +328,12 @@
   - `hello_ok.capabilities` 含 `shell_events` 表示 helper 支持事件通道；旧 helper 无该能力时客户端不下发事件请求，行为与之前一致。
   - `spawn.events`（缺省 `false`）仅在客户端需要且 helper 声明能力时置 `true`；`started.events`（缺省 `false`）回报本次是否实际建立通道，创建失败只降级、不阻断 spawn。
   - Unix 远端：helper 为每个会话创建私有临时目录（`0700`）与 Unix domain socket（`0600`），生成随机 token，并通过 `TERMX_EVENT_ENDPOINT=unix:<path>` / `TERMX_EVENT_TOKEN` 注入子进程环境；只 accept 一次、首行校验 token、单帧上限，会话结束后清理 socket。不在 stdout 输出事件，也不新增 TCP 端口。
-  - 子进程按 JSON Lines 发送 `A/B/C/D`；helper 转成 `shell_event{event, code?, id?, dropped?}` 协议帧。Unix 使用 UDS；Windows 使用命名管道（`pipe:<name>`），同一 token/帧格式与降级语义。`dropped` 目前只有本地 `termx-pwsh` `D` 使用；helper 转发时保留该字段。
+  - 子进程按 JSON Lines 发送 `A/B/C/D/O`；helper 转成 `shell_event{event, code?, id?, data?, dropped?}` 协议帧（`data` 仅 `O` 事件携带，base64 UTF-8）。Unix 使用 UDS；Windows 使用命名管道（`pipe:<name>`），同一 token/帧格式与降级语义。`dropped` 目前只有本地 `termx-pwsh` `D` 使用；helper 转发时保留该字段。
   - `termx-ssh` 把 `shell_event` 映射为 `ProcEvent::ShellEvent`；service 复用本地通道的 command-id + transcript 代次判定，`D` 命中时以 `source: "shell_integration"` 写入真实 `exit_code`，不匹配/迟到 `D` 被忽略。
   - 关闭 in-band OSC 的判定是严格三级门槛：`ssh + pty + basename(cmd)` 属于结构化程序（`termx-pwsh`/`termx-bash`，后端快照 `shell_events()`）、helper 声明 `shell_events`、`started.events=true`；任一不满足（含旧 helper、普通 SSH、fallback）都保持 in-band 解析，不伪造退出码。
   - 公开 WebSocket `Capabilities` 不新增字段；事件通道状态只影响 service 内部 transcript 判定。
 - 本地结构化 runtime：`termx-pwsh`、`termx-bash`（见 CONFIG §3.2）。只有这些 runtime ID 的本地 PTY 会创建带外事件通道；直接启动的普通 shell 保持 raw-only，`structured_events=false`。
-- 本地 `termx-pwsh` 的宿主输出事件 `O`：`{"v":1,"event":"O","id":"<command-id>","data":"<base64 UTF-8>"}`。`O` 只在 active command-id 存在时发送，与 `C/D` 同一 FIFO；service 按 command-id/代次追加 transcript，不生成 xterm output。命令外的 prompt、输入回显与 `D` 后输出没有 active id，不得进入 transcript；命令执行中的交互提示（如 `Read-Host`）仍有 active id，目前作为 `O` 记录。native/直接 console 的文本由 `C..D` PTY 兜底，仅在整条命令没有 `O` 时并入 transcript。混合 `O`+PTY、`D{dropped:true}`（队列满/关闭丢弃过 `O`）或 PTY 屏障失败时，命令标记 `incomplete=true`；不伪造退出码/状态。远端 helper 事件暂不携带 `O` 的 `data`。TUI/脱离当前 console 不承诺文本。默认不使用 OSC/token/sleep 或 PTY 尾段猜测。
+- 本地 `termx-pwsh` 的宿主输出事件 `O`：`{"v":1,"event":"O","id":"<command-id>","data":"<base64 UTF-8>"}`。`O` 只在 active command-id 存在时发送，与 `C/D` 同一 FIFO；service 按 command-id/代次追加 transcript，不生成 xterm output。命令外的 prompt、输入回显与 `D` 后输出没有 active id，不得进入 transcript；命令执行中的交互提示（如 `Read-Host`）仍有 active id，目前作为 `O` 记录。native/直接 console 的文本由 `C..D` PTY 兜底，仅在整条命令没有 `O` 时并入 transcript。混合 `O`+PTY、`D{dropped:true}`（队列满/关闭丢弃过 `O`）或 PTY 屏障失败时，命令标记 `incomplete=true`；不伪造退出码/状态。远端 helper 事件已携带 `O` 的 `data`（base64 UTF-8），service 与本地同口径：`O` 为主、PTY 兜底。TUI/脱离当前 console 不承诺文本。默认不使用 OSC/token/sleep 或 PTY 尾段猜测。
 - 新增字段向后兼容；破坏性变更升主版本。
 
 ## 12. 安全

@@ -65,7 +65,7 @@ D  -> 命令结束，使用 C 的 command-id
 - `D` 的 O 队列 drain 最多等 2s，并且与入队 `D` 一起在 `_commandLock` 内完成：其他线程不能在 drain 后、D 前再入队 O；超时只影响顺序保证，D 仍会入队。
 - service 侧 PTY 顺序屏障失败/超时只记录警告并仍然应用 `D`：命令边界与退出码不丢，同时把该命令标记为 `incomplete=true`。
 - 命令执行中的交互输入（如 `Read-Host` 的提示与按键回显）仍在 active id 内，会作为 `O` 记录；它们属于该命令的可见输出，不是独立 prompt。
-- 远端 helper 事件通道目前不转发 `O` 的 `data`：远端结构化终端的 transcript 仍走 PTY 兜底路径，`incomplete` 只反映本地 `O`/PTY 混合与丢弃。
+- 远端 helper 事件通道已转发 `O` 的 `data`：远端结构化终端与本地同口径，`O` 为主、PTY 兜底（结束时有 `O` 丢弃兜底、无 `O` 并入、必要时标 `incomplete`）。
 - 单条命令 transcript 输出上限 64 KiB；超限时保留前段并追加 `[output truncated]`，`incomplete` 不会因此自动置位（截断标记自身即证据）。
 
 ## 已知残余风险（不伪造状态）
