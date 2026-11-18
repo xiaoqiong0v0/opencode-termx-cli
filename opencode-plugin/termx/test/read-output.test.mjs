@@ -87,6 +87,25 @@ test("incomplete flag is compact and lives in the marker", () => {
   );
 });
 
+test("interactive flag is compact and lives in the marker", () => {
+  assert.equal(
+    formatResultMarker(1, 2, { status: "done", interactive: true }),
+    "--- termx result 1/2 [interactive] ---",
+  );
+  assert.equal(
+    formatResultMarker(2, 2, {
+      status: "done",
+      incomplete: true,
+      interactive: true,
+    }),
+    "--- termx result 2/2 [incomplete interactive] ---",
+  );
+  assert.equal(
+    formatReadHeader("t", "history", "idle", undefined, false, true),
+    "[termx read] terminal=t source=history state=idle interactive=true",
+  );
+});
+
 test("joinResultBlocks separates blocks with one blank line", () => {
   const blocks = [
     formatResultBlock(1, 2, "one", EMPTY),

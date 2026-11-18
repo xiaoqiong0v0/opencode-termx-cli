@@ -2118,11 +2118,18 @@ mod tests {
         assert_eq!(legacy.source, None);
         assert!(!legacy.best_effort);
         assert!(!legacy.incomplete);
+        assert!(!legacy.interactive);
 
         // 默认值不应出现在序列化结果中。
         let legacy_json: JsonValue =
             serde_json::from_str(&to_json(&legacy).expect("序列化失败")).expect("JSON 解析失败");
-        for key in ["exit_code", "source", "best_effort", "incomplete"] {
+        for key in [
+            "exit_code",
+            "source",
+            "best_effort",
+            "incomplete",
+            "interactive",
+        ] {
             assert!(
                 legacy_json.get(key).is_none(),
                 "{key} 不应出现在旧形状 JSON 中"
@@ -2140,6 +2147,7 @@ mod tests {
             source: Some(TranscriptSource::ProcessGroup),
             best_effort: true,
             incomplete: true,
+            interactive: true,
         };
         let full_json: JsonValue =
             serde_json::from_str(&to_json(&full).expect("序列化失败")).expect("JSON 解析失败");
@@ -2147,6 +2155,7 @@ mod tests {
         assert_eq!(full_json["source"], "process_group");
         assert_eq!(full_json["best_effort"], true);
         assert_eq!(full_json["incomplete"], true);
+        assert_eq!(full_json["interactive"], true);
 
         let back: TranscriptCommand =
             from_json(&to_json(&full).expect("序列化失败")).expect("反序列化失败");
@@ -2222,6 +2231,12 @@ pub struct TranscriptCommand {
     /// 默认 `false`，语义只是“可能缺少文本”，不改变状态/退出码。
     #[serde(default, skip_serializing_if = "is_false")]
     pub incomplete: bool,
+    /// 命令执行期间是否观察到等待输入（如 `Read-Host` 提示）。
+    ///
+    /// 弱语义：来自 PTY 静默启发式，长时间无输出的普通命令也可能命中；
+    /// 只作提示（输出里可能含交互提示与输入回显），不改变状态/退出码。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interactive: bool,
 }
 
 /// `terminal.transcript` 参数。

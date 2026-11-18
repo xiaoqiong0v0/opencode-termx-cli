@@ -43,7 +43,9 @@ Rules:
     overrides) for that command's transcript to finish. A normal success returns only the output
     text; empty output, errors, best-effort completion, incomplete output and timeouts add a
     "[termx exec] ..." first line. incomplete=true means the recorded text may be missing
-    host/native segments (mixed output, dropped event frames or a failed order barrier); the exit
+    host/native segments (mixed output, dropped event frames or a failed order barrier);
+    interactive=true means the command waited for input (e.g. Read-Host), so its output may
+    include the prompt and typed echo (best-effort signal, text is not filtered); the exit
     code/status is still real. It does not echo the command or use silence as a command boundary.
     --async returns immediately; -w has been removed. Multi-line or multiple-command text is NOT
     merged into one command: each executed command is recorded as a separate transcript record,
@@ -60,11 +62,12 @@ Rules:
     exec.timeoutMs (--timeout overrides); if still running it returns a status header only unless
     -s buffer is given. -s history reads the last completed command; -s buffer reads the live
     snapshot (idle falls back to the last completed command). --includeCommand prefixes
-    "$ <command>". Normal idle results are output only; busy/timeout/error/best_effort/incomplete
-    add a "[termx read] ..." first line (incomplete uses " incomplete=true").
+    "$ <command>". Normal idle results are output only; busy/timeout/error/best_effort/incomplete/
+    interactive add a "[termx read] ..." first line (incomplete uses " incomplete=true",
+    interactive uses " interactive=true").
     --last N (-l N) returns the outputs of the last N completed commands (status != running) as
     blocks marked "--- termx result i/N ---"; markers may include [best_effort] / [incomplete] /
-    [truncated]. It never includes command text, cursor, terminal URL or browser URL. Normal idle
+    [interactive] / [truncated]. It never includes command text, cursor, terminal URL or browser URL. Normal idle
     has no header; if still busy after the bounded wait the header uses note=completed-only. The
     combined output is bounded by a total budget of 128 KiB (UTF-8 bytes, including markers):
     older blocks are dropped whole from the oldest end first, and if the newest block alone
@@ -79,7 +82,8 @@ Rules:
     information page; --json returns the raw structure. Prompts and command echo are removed.
     It is only meaningful for structured terminals (for example termx-pwsh); use read/search
     for ordinary programs and shells. Known limits: interactive prompts such as Read-Host are
-    recorded as command output; per-command output is bounded (64 KiB, marked truncated).
+    recorded as command output (the record's [status ...] line carries interactive; text is not
+    filtered); per-command output is bounded (64 KiB, marked truncated).
   - Use -- before a positional that starts with "-".
   - --allow-injection authorizes writing the helper/shell scripts to the remote host when
     creating the SSH terminal; it applies to this creation only and is not persisted.
@@ -123,8 +127,9 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   - exec 向已存在终端发送命令，默认最多同步等待 exec.timeoutMs（默认 5 秒，可用 --timeout
     覆盖）直到该命令 transcript 结束。正常成功只返回输出正文；空输出、错误、静默完成、
     输出不完整（incomplete=true）和超时会在首行加 “[termx exec] ...”。incomplete=true 表示
-    记录文本可能缺少 host/native 段（混合输出、事件帧被丢弃或顺序屏障失败），退出码/状态
-    仍来自真实事件。不回显命令，也不用静默猜测命令边界。--async 立即返回；-w 已移除。
+    记录文本可能缺少 host/native 段（混合输出、事件帧被丢弃或顺序屏障失败）；interactive=true
+    表示执行期间等待过输入（如 Read-Host），输出可能含提示与输入回显（弱语义，不做文本过滤）。
+    退出码/状态仍来自真实事件。不回显命令，也不用静默猜测命令边界。--async 立即返回；-w 已移除。
     多行或多条命令的文本不会被 exec 合并成一条命令：每条实际执行的命令都是独立的
     transcript 记录，exec 只能匹配其中一条；需要收集结果时用 read --last N。
   - exec/send 的载荷来源：内联文本（默认）、--base64 <b64>、--file PATH。--base64 允许
@@ -135,10 +140,11 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   - read 只返回当前/最后一条命令的输出。busy 时先最多等待 exec.timeoutMs（--timeout 覆盖）；
     仍在运行且未显式 -s buffer 时只返回状态首行。-s history 读最后一条已完成命令；
     -s buffer 读实时快照（空闲时回退到最后一条已完成命令）。--includeCommand 会在输出前加
-    “$ <command>”。正常 idle 只返回输出；busy/超时/error/best_effort/incomplete 才加
-    “[termx read] ...” 首行（incomplete 用 “ incomplete=true”）。--last N（-l N）按块返回
+    “$ <command>”。正常 idle 只返回输出；busy/超时/error/best_effort/incomplete/interactive 才加
+    “[termx read] ...” 首行（incomplete 用 “ incomplete=true”，interactive 用
+    “ interactive=true”）。--last N（-l N）按块返回
     最后 N 条已完成命令（status != running）的输出，块标记为 “--- termx result i/N ---”；
-    标记内可能带 [best_effort] / [incomplete] / [truncated]；绝不包含命令文本、cursor、终端
+    标记内可能带 [best_effort] / [incomplete] / [interactive] / [truncated]；绝不包含命令文本、cursor、终端
     URL 或浏览器 URL。正常 idle 不显示首行；等待上限后仍 busy 时首行为 note=completed-only。
     合计输出受总预算 128 KiB（UTF-8 字节，含标记行）限制：超预算时从最旧的块整体丢弃，
     若最新单块自身超预算则保留其末尾并加 [truncated] 标记；被丢弃块数会在结果最前加一行
@@ -148,10 +154,11 @@ const HELP_ZH = `termx_cli：termx 终端的单工具 CLI。
   - search 从末尾倒搜原始输出；--nth 1 为最后一个匹配。默认返回该匹配到末尾；
     --only-matches 只返回匹配所在行。不返回行号或绝对位置，历史被裁剪后旧位置不保证可用。
   - transcript 返回信息页记录的命令（起止时间、状态、清洗后输出，incomplete=true 表示文本
-    可能缺失）；--json 返回原始结构。提示符与命令回显已由 service 去除。只有结构化终端
-    （如 termx-pwsh）才有信息页；普通程序/shell 请用 read/search。已知限制：Read-Host 等
-    交互提示会作为命令输出记录；单条命令
-    输出有上限（64 KiB，超限带截断标记）。
+    可能缺失，interactive=true 表示执行期间曾等待输入）；--json 返回原始结构。提示符与命令
+    回显已由 service 去除。只有结构化终端（如 termx-pwsh）才有信息页；普通程序/shell 请用
+    read/search。已知限制：Read-Host 等交互提示会作为命令输出记录（记录首行 [status ...] 带
+    interactive，文本不做过滤；仅结构化终端、命令仍 running 期间才可能标记）；单条命令输出有
+    上限（64 KiB，超限带截断标记）。
   - 以 - 开头的 positional 请放在 -- 之后。
   - --allow-injection 表示本次创建 SSH 终端时允许向远端写入 helper/shell 脚本；
     仅对本次创建生效，不做持久化保存。

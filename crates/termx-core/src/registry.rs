@@ -1815,6 +1815,11 @@ impl Registry {
         if let Some(entry) = self.by_id.get_mut(id) {
             entry.interaction = state;
             entry.confidence = confidence;
+            // 弱标记：命令执行期间观察到等待输入（如 Read-Host），供
+            // transcript 提示“输出里可能含交互提示与输入回显”。
+            if state == InteractionState::WaitingInput {
+                entry.transcript.mark_awaited_input();
+            }
         }
         for update in updates {
             seq = self.publish(id, update.into_event())?;

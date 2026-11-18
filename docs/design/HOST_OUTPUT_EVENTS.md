@@ -14,7 +14,7 @@ D  -> 命令结束，使用 C 的 command-id
 
 - `O` 由 `ConsoleHostUserInterface` 的输出路径发出；只在该命令 active id 存在时发送。
 - 命令外的 prompt、输入回显发生在 `C` 前或 `D` 后，没有 active id，因此不会成为 `O`。
-- 命令执行期间的交互输入（如 `Read-Host` 的提示与用户按键回显）仍在 active id 内，**目前会作为 `O` 被记录**：它属于该命令的可见输出，不是独立的 prompt。
+- 命令执行期间的交互输入（如 `Read-Host` 的提示与用户按键回显）仍在 active id 内，**会作为 `O` 被记录**：它属于该命令的可见输出，不是独立的 prompt。service 在等待输入判定命中时给该命令打 `interactive=true`（弱语义，提示输出里可能含提示/回显；仅结构化终端、命令仍 running 期间才可能标记；不做文本过滤，避免误删真实输出）。
 - `C/O/D` 共用同一条 JSON Lines FIFO；service 按 command-id/代次追加，D 结束命令。
 - `O` 不产生 xterm output 事件；xterm 继续消费 PTY 流。
 - `D` 可携带 `dropped=true`：宿主事件队列满/关闭导致至少一个 `O` 帧被丢弃。
@@ -65,7 +65,7 @@ D  -> 命令结束，使用 C 的 command-id
 - 宿主事件队列是有界的（`BlockingCollection` 容量 1024）。队列满时 `TryAdd` 失败并丢弃该帧（含 O 文本），不阻塞提示符、也不无限增长；宿主在下一条 `D` 上带 `dropped=true`，service 把该命令标记为 `incomplete=true`。极端突发输出仍可能缺少尾部文本，可通过 `terminal.read` 的 PTY raw 流补看。事件管道断开后 `_pendingOutput` 在 `Run()` 退出时清零并唤醒 drain 等待者，后续命令不再空等满 2s。
 - `D` 的 O 队列 drain 最多等 2s，并且与入队 `D` 一起在 `_commandLock` 内完成：其他线程不能在 drain 后、D 前再入队 O；超时只影响顺序保证，D 仍会入队，个别 O 帧可能晚于 D 到达。service 在 `D` 清空 active 后保留 `last_ended`（command-id + 代次），迟到的 `O` 按 command-id 匹配它受控写入刚结束的命令，下一条 `C`/`X` 清空 `last_ended` 锁死归因边界。
 - service 侧 PTY 顺序屏障失败/超时只记录警告并仍然应用 `D`：命令边界与退出码不丢；该命令仅在还没有 `O`（`event_output_seen=false`）时标记 `incomplete=true`，宿主命令 `O` 已覆盖输出时不误标。`D` 后迟到的 `O`/PTY 兜底（`termx-pwsh` 的 `allow_late_output`）受控追加后重估 `incomplete`：无 `dropped`、无 PTY 溢出、且 `O` 覆盖全部可见 PTY 兜底行时才清。
-- 命令执行中的交互输入（如 `Read-Host` 的提示与按键回显）仍在 active id 内，会作为 `O` 记录；它们属于该命令的可见输出，不是独立 prompt。
+- 命令执行中的交互输入（如 `Read-Host` 的提示与按键回显）仍在 active id 内，会作为 `O` 记录；它们属于该命令的可见输出，不是独立 prompt。等待输入判定命中时该命令带 `interactive=true`（弱语义，不做文本过滤）。
 - 远端 helper 事件通道已转发 `O` 的 `data`：远端结构化终端与本地同口径，`O` 为主、PTY 兜底（结束时有 `O` 不并入输出但保留比对证据、无 `O` 并入、必要时标 `incomplete`）。
 - 单条命令 transcript 输出上限 64 KiB；超限时保留前段并追加 `[output truncated]`，`incomplete` 不会因此自动置位（截断标记自身即证据）。
 

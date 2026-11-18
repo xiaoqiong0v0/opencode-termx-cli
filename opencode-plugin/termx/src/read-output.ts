@@ -31,7 +31,8 @@ export type ReadHeaderNote =
  * @param state 终端/结果状态
  * @param note 是否附加提示
  * @param incomplete 输出文本是否已知不完整（混合 host/native、丢弃或屏障失败）
- * @returns `[termx read] terminal=... source=... state=...[ incomplete=true][ note=...]`
+ * @param interactive 命令执行期间是否曾等待输入（弱语义）
+ * @returns `[termx read] terminal=... source=... state=...[ incomplete=true][ interactive=true][ note=...]`
  */
 export function formatReadHeader(
   name: string,
@@ -39,10 +40,11 @@ export function formatReadHeader(
   state: ReadHeaderState,
   note?: ReadHeaderNote,
   incomplete = false,
+  interactive = false,
 ): string {
   const header = `[termx read] terminal=${name} source=${source} state=${state}${
     incomplete ? " incomplete=true" : ""
-  }`;
+  }${interactive ? " interactive=true" : ""}`;
   return note ? `${header} note=${note}` : header;
 }
 
@@ -77,6 +79,8 @@ export interface ResultBlockMeta {
   bestEffort?: boolean;
   /** 输出文本已知不完整（混合 host/native、丢弃或屏障失败）。 */
   incomplete?: boolean;
+  /** 命令执行期间曾等待输入（弱语义，输出里可能含提示与输入回显）。 */
+  interactive?: boolean;
   /** 输出文本已按 `--last` 总字节预算截断（保留末尾）。 */
   truncated?: boolean;
 }
@@ -84,8 +88,8 @@ export interface ResultBlockMeta {
 /**
  * 生成稳定的结果块标记：`--- termx result i/N [flags] ---`。
  *
- * flags 只含紧凑 ASCII 状态（error/interrupted/exit_code/best_effort/incomplete），
- * 绝不包含命令文本。
+ * flags 只含紧凑 ASCII 状态（error/interrupted/exit_code/best_effort/incomplete/
+ * interactive），绝不包含命令文本。
  *
  * @param index 当前块序号（从 1 开始）
  * @param total 本次返回的块总数
@@ -146,6 +150,7 @@ function resultFlags(meta?: ResultBlockMeta): string[] {
   }
   if (meta.bestEffort) flags.push("best_effort");
   if (meta.incomplete) flags.push("incomplete");
+  if (meta.interactive) flags.push("interactive");
   if (meta.truncated) flags.push("truncated");
   return flags;
 }

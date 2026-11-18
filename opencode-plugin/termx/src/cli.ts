@@ -182,6 +182,7 @@ interface TranscriptCommand {
   exit_code?: number | null;
   best_effort?: boolean;
   incomplete?: boolean;
+  interactive?: boolean;
   output?: string;
 }
 
@@ -878,17 +879,19 @@ function formatExecResult(t: Translator, command: TranscriptCommand): string {
     command.status === "interrupted" ||
     (exitCode !== undefined && exitCode !== 0);
   const incomplete = command.incomplete === true;
+  const interactive = command.interactive === true;
   if (failed) {
     const state = command.status === "interrupted" ? "interrupted" : "error";
-    const suffix = incomplete ? " incomplete=true" : "";
+    const suffix = `${incomplete ? " incomplete=true" : ""}${interactive ? " interactive=true" : ""}`;
     return `${EXEC_HEADER} state=${state} exit_code=${exitCode ?? "unknown"}${suffix}\n\n${body}`;
   }
   if (command.best_effort) {
-    const suffix = incomplete ? " incomplete=true" : "";
+    const suffix = `${incomplete ? " incomplete=true" : ""}${interactive ? " interactive=true" : ""}`;
     return `${EXEC_HEADER} state=done best_effort=true${suffix}\n\n${body}`;
   }
-  if (incomplete) {
-    return `${EXEC_HEADER} state=done incomplete=true\n\n${body}`;
+  if (incomplete || interactive) {
+    const suffix = `${incomplete ? "incomplete=true" : ""}${incomplete && interactive ? " " : ""}${interactive ? "interactive=true" : ""}`;
+    return `${EXEC_HEADER} state=done ${suffix}\n\n${body}`;
   }
   return output || t("exec.noOutput");
 }
@@ -1144,6 +1147,7 @@ async function readCurrent(
         "busy",
         "partial",
         view.last?.incomplete === true,
+        view.last?.interactive === true,
       );
       return formatReadResult(header, snapshot, noOutput);
     }
@@ -1155,6 +1159,7 @@ async function readCurrent(
         "busy",
         "completed-only",
         view.lastCompleted?.incomplete === true,
+        view.lastCompleted?.interactive === true,
       );
       return formatReadResult(
         header,
@@ -1200,6 +1205,7 @@ async function readLast(
         exitCode: command.exit_code,
         bestEffort: command.best_effort,
         incomplete: command.incomplete,
+        interactive: command.interactive,
       },
     })),
     noOutput,
@@ -1242,7 +1248,7 @@ function commandOutput(
   return includeCommand ? `$ ${command.command}\n${body || noOutput}` : body;
 }
 
-/** 正常 idle 结果：默认只给输出；best_effort/error/incomplete 才显示首行。 */
+/** 正常 idle 结果：默认只给输出；best_effort/error/incomplete/interactive 才显示首行。 */
 function formatIdleRead(
   name: string,
   includeCommand: boolean,
@@ -1252,9 +1258,12 @@ function formatIdleRead(
   const output = commandOutput(last, includeCommand, noOutput);
   const note = idleNote(last);
   const incomplete = last?.incomplete === true;
-  if (!note && !incomplete) return formatReadResult("", output, noOutput, false);
+  const interactive = last?.interactive === true;
+  if (!note && !incomplete && !interactive) {
+    return formatReadResult("", output, noOutput, false);
+  }
   const state: ReadHeaderState = note === "best_effort" || !note ? "idle" : "error";
-  const header = formatReadHeader(name, "history", state, note, incomplete);
+  const header = formatReadHeader(name, "history", state, note, incomplete, interactive);
   return formatReadResult(header, output, noOutput);
 }
 
@@ -1324,7 +1333,14 @@ async function doTranscript(tokens: string[], env: CommandEnv): Promise<string> 
   const blocks = commands.map((command) => {
     const started = clockOf(command.started_at);
     const ended = command.ended_at ? clockOf(command.ended_at) : "…";
-    let block = `${started} → ${ended} [${command.status || "unknown"}]\n${command.command}`;
+    const flags = [
+      command.status || "unknown",
+      command.incomplete ? "incomplete" : "",
+      command.interactive ? "interactive" : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    let block = `${started} → ${ended} [${flags}]\n${command.command}`;
     if (command.output) block += `\n${command.output}`;
     return block;
   });

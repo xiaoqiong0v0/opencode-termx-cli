@@ -78,6 +78,51 @@ fn observe_output_emits_waiting_input_and_updates_entry() {
 }
 
 #[test]
+fn waiting_input_marks_running_transcript_command_interactive() {
+    let mut registry = registry();
+    let (id, _) = create(&mut registry, "readhost");
+    registry
+        .record_transcript_command(&id, "Read-Host 'name'", at(0))
+        .expect("记录命令");
+
+    // 提示文本到达后静默超过阈值（1s）→ 启发式 waiting_input。
+    registry
+        .observe_output(&id, b"name: ", at(0))
+        .expect("摄取应成功");
+    registry
+        .sample_interaction(&id, at(2000), None, &[])
+        .expect("采样应成功");
+    assert_eq!(
+        registry.get(&id).expect("终端应存在").interaction,
+        InteractionState::WaitingInput
+    );
+
+    let locator = termx_protocol::TerminalLocator {
+        terminal_id: Some(id.to_string()),
+        root_session_id: None,
+        name: None,
+    };
+    let commands = registry
+        .transcript(&locator, None)
+        .expect("读取 transcript")
+        .commands;
+    assert!(
+        commands[0].interactive,
+        "waiting_input 接线后 transcript 命令应带 interactive"
+    );
+
+    // 新命令不继承标记。
+    registry
+        .record_transcript_command(&id, "Get-Date", at(3000))
+        .expect("记录第二条");
+    let commands = registry
+        .transcript(&locator, None)
+        .expect("读取 transcript")
+        .commands;
+    assert!(!commands[1].interactive, "新命令不得继承 interactive 标记");
+}
+
+#[test]
 fn sample_interaction_emits_foreground_change_and_return_to_root() {
     let mut registry = registry();
     let (id, root_pgid) = create(&mut registry, "job");

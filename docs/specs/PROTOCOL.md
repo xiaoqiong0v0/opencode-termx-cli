@@ -87,7 +87,7 @@
 | `terminal.status` | `{ locator }` | `{ snapshot }`；`snapshot.structured_events` 表示是否有带外 shell 事件能力 |
 | `terminal.read` | `{ locator, cursor, max_bytes? }` | `{ chunks, cursor, reset? }` |
 | `terminal.output` | `{ locator, tail_lines? \| tail_chars? \| pattern?, nth?, only_matches? }` | `{ text }`；按命令输出文本做尾部截取或倒搜（结构化终端读 transcript，raw-only 先清洗），不返回行号 |
-| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output, exit_code?, source?, best_effort?, incomplete?}], revision }` |
+| `terminal.transcript` | `{ locator, limit? }` | `{ commands: [{command, started_at, ended_at?, status, output, exit_code?, source?, best_effort?, incomplete?, interactive?}], revision }` |
 | `terminal.send` | `{ locator, data(base64)?, text?, enter? }` | `{ ok }` |
 | `terminal.resize` | `{ locator, cols, rows }` | `{ ok }` |
 | `terminal.signal` | `{ locator, signal }` | `{ ok }` |
@@ -226,14 +226,15 @@
   [{ "command": "ls", "started_at": "2026-01-01T00:00:00Z",
      "ended_at": "2026-01-01T00:00:01Z", "status": "done", "output": "a.txt\nb.txt",
      "exit_code": 0, "source": "shell_integration", "best_effort": false,
-     "incomplete": false }]
+     "incomplete": false, "interactive": false }]
   ```
   `ended_at` 在 `running` 时为 `null`；`output` 已由 service 清洗。
   - `exit_code`：可选退出码；无法确定时缺省（不得伪造）。旧客户端可忽略。
   - `source`：结束证据来源，`shell_integration` / `process_group` / `unknown`；未结束时缺省。
   - `best_effort`：结束判定是否为 best-effort（如静默推断）；缺省 `false`。
   - `incomplete`：输出文本是否已知不完整（混合 `O`+PTY、宿主事件帧丢弃或 PTY 屏障失败）；缺省 `false`。它只是文本缺失标记，不改变状态/退出码。
-  - 四个字段均向后兼容：旧 JSON 缺失时分别默认为 `null`/`null`/`false`/`false`，且默认值不参与序列化。
+  - `interactive`：命令执行期间是否观察到等待输入（如 `Read-Host` 提示）；缺省 `false`。弱语义（来自 PTY 静默启发式，长静默命令也可能命中），只提示输出里可能含交互提示与输入回显，不改变状态/退出码、不做文本过滤。
+  - 五个字段均向后兼容：旧 JSON 缺失时分别默认为 `null`/`null`/`false`/`false`/`false`，且默认值不参与序列化。
   - **P1 本地单行 marker（当前默认关闭）**：命令内 marker 会被 shell 回显并写入历史，污染 raw/历史记录；`TRANSCRIPT_MARKER_ENABLED=false` 时完全不注入，精确 `exit_code` 暂不产出，等待 hook-based integration。开启时才在本地 `pty` 终端满足 `enter=true`、`text` 存在且 `data` 缺省时，服务端按 shell 追加不可见 OSC 序列（不改变 transcript 记录的原始 `command`）：
     - bash/zsh/sh：`<cmd>; __termx_ec=$?; printf '\033]133;D;%s\007' "$__termx_ec"`；
     - pwsh/powershell：先取 `$?`，再回落 `$LASTEXITCODE`，最后回落到 `1`，用 `[Console]::Write` 输出同一 `133;D` marker。

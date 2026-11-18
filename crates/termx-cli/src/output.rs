@@ -263,7 +263,14 @@ pub fn print_transcript(commands: &[TranscriptCommand]) -> Result<(), CliError> 
             .ended_at
             .as_deref()
             .map_or_else(|| "…".to_string(), clock);
-        writeln!(out, "{started} → {ended} [{}]", scalar(&command.status))?;
+        let mut flags = scalar(&command.status).to_string();
+        if command.incomplete {
+            flags.push_str(" incomplete");
+        }
+        if command.interactive {
+            flags.push_str(" interactive");
+        }
+        writeln!(out, "{started} → {ended} [{flags}]")?;
         writeln!(out, "{}", command.command)?;
         if !command.output.is_empty() {
             writeln!(out, "{}", command.output)?;

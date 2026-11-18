@@ -77,6 +77,11 @@ struct CommandRecord {
     /// `O`/PTY 到达后重估时不得清除 `incomplete`；屏障失败等可逆原因
     /// 才允许重估撤销。
     dropped: bool,
+    /// 命令执行期间观察到等待输入（弱语义，来自 PTY 静默启发式）。
+    ///
+    /// 只用于给模型提示“输出里可能含交互提示与输入回显”，不改变状态、
+    /// 退出码或文本清洗。
+    awaited_input: bool,
     /// PTY 兜底因超过上限被截断；结束时据此标记可能缺文本。
     pty_output_overflowed: bool,
     /// 单调递增的命令代次；用于带外事件按代次结束命令。
@@ -96,6 +101,7 @@ impl CommandRecord {
             source: self.source,
             best_effort: self.best_effort,
             incomplete: self.output_incomplete,
+            interactive: self.awaited_input,
         }
     }
 }
@@ -334,6 +340,7 @@ impl TranscriptBuffer {
             best_effort: false,
             output_incomplete: false,
             dropped: false,
+            awaited_input: false,
             pty_output_overflowed: pre_overflowed,
             generation: self.last_generation,
         });
@@ -584,6 +591,22 @@ impl TranscriptBuffer {
             return false;
         }
         last.output_incomplete = true;
+        self.bump();
+        true
+    }
+
+    /// 标记当前（最后一条）运行中命令曾等待输入（弱语义）。
+    ///
+    /// 供交互识别在判定 `waiting_input` 时调用；只翻 `awaited_input`，不改
+    /// 状态/退出码/输出。已标记或命令已结束时无变更。
+    pub fn mark_awaited_input(&mut self) -> bool {
+        let Some(last) = self.commands.back_mut() else {
+            return false;
+        };
+        if last.status != TranscriptStatus::Running || last.awaited_input {
+            return false;
+        }
+        last.awaited_input = true;
         self.bump();
         true
     }
@@ -1744,6 +1767,27 @@ mod tests {
         assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
         assert!(!command.best_effort);
         assert!(command.incomplete);
+    }
+
+    #[test]
+    fn mark_awaited_input_only_marks_running_command_once() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false);
+        let t0 = base();
+        let generation = buffer.record_command("Read-Host 'name'", t0);
+        assert!(buffer.mark_awaited_input(), "运行中命令应可标记交互");
+        assert!(!buffer.mark_awaited_input(), "重复标记不再变更");
+        assert!(
+            buffer.read(None).commands[0].interactive,
+            "transcript 应暴露 interactive"
+        );
+
+        assert!(buffer.record_command_end_for_generation_at(
+            None,
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        assert!(!buffer.mark_awaited_input(), "已结束命令不再标记");
     }
 
     #[test]
