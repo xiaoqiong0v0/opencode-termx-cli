@@ -25,8 +25,9 @@ D  -> 命令结束，使用 C 的 command-id
 
 - 本地 `termx-pwsh` 默认 `transcript_output_from_events=true`：PTY 输出只显示，不追加 transcript。
 - `O` 来源终端的命令**只由宿主 `D` 结束**：1s 静默判定完全不生效，避免 `Start-Sleep 3` 这类长时间无输出的命令在日志里提前变成 `best_effort done` 并返回空输出。
-- native/直接 console 命令没有 `O` 时，service 把 `C..D` 的 PTY 输出收进有界兜底缓冲；`D` 时若没有任何 `O`，并入 transcript。出现 `O` 则丢弃兜底，避免双写。
-- 混合 host + native 的命令（例如先 `Write-Output` 再调 native 程序）一旦同时出现 `O` 与 PTY 兜底，兜底仍会被丢弃（避免重复），但该命令会标记 `incomplete=true`：native 段文本可能缺失。`incomplete` 只是“文本可能不完整”的显式标记，不改变命令状态/退出码。
+- native/直接 console 命令没有 `O` 时，service 把 `C..D` 的 PTY 输出收进有界兜底缓冲；`D` 时若没有任何 `O`，并入 transcript。出现 `O` 时兜底不并入输出（避免双写），但缓冲保留作覆盖比对证据。
+- 混合 host + native 的命令（例如先 `Write-Output` 再调 native 程序）一旦同时出现 `O` 与 PTY 兜底，兜底不并入输出，但该命令会标记 `incomplete=true`：native 段文本可能缺失。`incomplete` 只是“文本可能不完整”的显式标记，不改变命令状态/退出码。
+- `D` 后迟到的 PTY 文本按 5s 宽限窗（本地收帧时钟）归因：窗口内算该命令排空尾段；超窗文本暂存到 pre-command 缓冲、归入下一条命令的兜底（超窗的交互下一命令回显不会污染上一条命令）。
 - 事件通道结束（宿主退出/管道断开）时，service 把该终端切回非事件输出模式（`output_from_events=false`）：不会再有 `O`/`D`，下一次 idle tick 的静默判定可提升已收集的 PTY 兜底。
 - 旧端/显式 `TERMX_PWSH_PTY_TRANSCRIPT=1` 才走旧 PTY transcript + `allow_late_output`，不是新端正常路径；该变量是 **service 进程级**开关，影响该进程后续创建的所有终端，不是单终端参数。
 - TUI/全屏程序仍由 PTY 显示；屏幕重绘不是文本，不进入 transcript，也不伪装成文本输出。
@@ -62,10 +63,10 @@ D  -> 命令结束，使用 C 的 command-id
 ## 已知限制
 
 - 宿主事件队列是有界的（`BlockingCollection` 容量 1024）。队列满时 `TryAdd` 失败并丢弃该帧（含 O 文本），不阻塞提示符、也不无限增长；宿主在下一条 `D` 上带 `dropped=true`，service 把该命令标记为 `incomplete=true`。极端突发输出仍可能缺少尾部文本，可通过 `terminal.read` 的 PTY raw 流补看。事件管道断开后 `_pendingOutput` 在 `Run()` 退出时清零并唤醒 drain 等待者，后续命令不再空等满 2s。
-- `D` 的 O 队列 drain 最多等 2s，并且与入队 `D` 一起在 `_commandLock` 内完成：其他线程不能在 drain 后、D 前再入队 O；超时只影响顺序保证，D 仍会入队。
-- service 侧 PTY 顺序屏障失败/超时只记录警告并仍然应用 `D`：命令边界与退出码不丢，同时把该命令标记为 `incomplete=true`。
+- `D` 的 O 队列 drain 最多等 2s，并且与入队 `D` 一起在 `_commandLock` 内完成：其他线程不能在 drain 后、D 前再入队 O；超时只影响顺序保证，D 仍会入队，个别 O 帧可能晚于 D 到达。service 在 `D` 清空 active 后保留 `last_ended`（command-id + 代次），迟到的 `O` 按 command-id 匹配它受控写入刚结束的命令，下一条 `C`/`X` 清空 `last_ended` 锁死归因边界。
+- service 侧 PTY 顺序屏障失败/超时只记录警告并仍然应用 `D`：命令边界与退出码不丢；该命令仅在还没有 `O`（`event_output_seen=false`）时标记 `incomplete=true`，宿主命令 `O` 已覆盖输出时不误标。`D` 后迟到的 `O`/PTY 兜底（`termx-pwsh` 的 `allow_late_output`）受控追加后重估 `incomplete`：无 `dropped`、无 PTY 溢出、且 `O` 覆盖全部可见 PTY 兜底行时才清。
 - 命令执行中的交互输入（如 `Read-Host` 的提示与按键回显）仍在 active id 内，会作为 `O` 记录；它们属于该命令的可见输出，不是独立 prompt。
-- 远端 helper 事件通道已转发 `O` 的 `data`：远端结构化终端与本地同口径，`O` 为主、PTY 兜底（结束时有 `O` 丢弃兜底、无 `O` 并入、必要时标 `incomplete`）。
+- 远端 helper 事件通道已转发 `O` 的 `data`：远端结构化终端与本地同口径，`O` 为主、PTY 兜底（结束时有 `O` 不并入输出但保留比对证据、无 `O` 并入、必要时标 `incomplete`）。
 - 单条命令 transcript 输出上限 64 KiB；超限时保留前段并追加 `[output truncated]`，`incomplete` 不会因此自动置位（截断标记自身即证据）。
 
 ## 已知残余风险（不伪造状态）

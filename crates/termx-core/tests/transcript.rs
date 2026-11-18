@@ -330,7 +330,13 @@ fn generation_end_accepts_host_end_time() {
         .expect("新建宿主命令");
     assert!(
         registry
-            .record_transcript_end_for_generation_at(&id, Some(7), generation, ended)
+            .record_transcript_end_for_generation_at(
+                &id,
+                Some(7),
+                generation,
+                ended,
+                start + time::Duration::seconds(1),
+            )
             .expect("按宿主时间结束")
     );
 

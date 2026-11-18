@@ -2751,10 +2751,11 @@ async fn ingest_shell_events(
                 OffsetDateTime::now_utc(),
             );
             if let Some(generation) = barrier_incomplete {
-                // 顺序屏障失败意味着该命令的 PTY 文本可能缺失；只补
-                // incomplete 标记，不伪造退出码、不改变结束状态。
-                let _ =
-                    registry.mark_transcript_incomplete_for_generation(&terminal_id, generation);
+                // 顺序屏障失败只意味着 PTY 兜底可能缺失；已有 O 覆盖的宿主
+                // 命令不误标（迟到 O/PTY 到达后由 transcript 重估兜底）。
+                // 只补 incomplete 标记，不伪造退出码、不改变结束状态。
+                let _ = registry
+                    .mark_transcript_incomplete_for_barrier_failure(&terminal_id, generation);
             }
             result
         };

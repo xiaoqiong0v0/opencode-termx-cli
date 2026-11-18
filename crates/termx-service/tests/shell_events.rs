@@ -4,6 +4,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use termx_core::{MockFactory, Registry, TerminalId, format_rfc3339};
 use termx_protocol::{CreateParams, Mode, TerminalLocator, TranscriptSource, TranscriptStatus};
 use termx_service::shell_events::{
@@ -657,4 +658,452 @@ fn command_abort_clears_active_tracker() {
         .commands;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, TranscriptStatus::Running);
+}
+
+#[test]
+fn late_output_after_command_end_is_written_to_ended_command() {
+    let mut registry = registry();
+    let created = registry.create(params()).expect("create");
+    let id = TerminalId::new(created.terminal_id.clone());
+    let t0 = base();
+    let mut tracker = ShellEventTracker::new();
+
+    registry
+        .record_transcript_command(&id, "first", t0)
+        .expect("记录命令");
+    assert!(
+        !apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &event(ShellEventKind::CommandStart, None, "cmd-1"),
+            t0,
+        )
+        .expect("C")
+    );
+    // D 先结束命令（active 清空、last_ended 记录）。
+    assert!(
+        apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+            t0,
+        )
+        .expect("D")
+    );
+    // D 后迟到的 O：按 command-id 匹配「刚结束的命令」受控写入。
+    let late = ShellEvent {
+        kind: ShellEventKind::CommandOutput,
+        code: None,
+        id: Some("cmd-1".to_string()),
+        command: None,
+        started_at_ms: None,
+        ended_at_ms: None,
+        data: Some(STANDARD.encode(b"token\n")),
+        dropped: false,
+    };
+    assert!(
+        apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &late,
+            t0 + time::Duration::milliseconds(10),
+        )
+        .expect("O")
+    );
+    let commands = registry
+        .transcript(&by_id(&created.terminal_id), None)
+        .expect("读取 transcript")
+        .commands;
+    assert_eq!(commands[0].command, "first");
+    assert_eq!(commands[0].output, "token", "D 后迟到的 O 不得丢失");
+}
+
+#[test]
+fn late_output_for_old_command_is_dropped_after_new_command_starts() {
+    let mut registry = registry();
+    let created = registry.create(params()).expect("create");
+    let id = TerminalId::new(created.terminal_id.clone());
+    let t0 = base();
+    let mut tracker = ShellEventTracker::new();
+
+    registry
+        .record_transcript_command(&id, "first", t0)
+        .expect("记录命令");
+    assert!(
+        !apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &event(ShellEventKind::CommandStart, None, "cmd-1"),
+            t0,
+        )
+        .expect("C")
+    );
+    assert!(
+        apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+            t0,
+        )
+        .expect("D")
+    );
+
+    // 新命令开始：last_ended 清空。
+    registry
+        .record_transcript_command(&id, "second", t0 + time::Duration::seconds(1))
+        .expect("记录第二条");
+    assert!(
+        !apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &event(ShellEventKind::CommandStart, None, "cmd-2"),
+            t0 + time::Duration::seconds(1),
+        )
+        .expect("C2")
+    );
+
+    // 旧命令的迟到 O：不再匹配，丢弃（归因边界锁定）。
+    let late = ShellEvent {
+        kind: ShellEventKind::CommandOutput,
+        code: None,
+        id: Some("cmd-1".to_string()),
+        command: None,
+        started_at_ms: None,
+        ended_at_ms: None,
+        data: Some(STANDARD.encode(b"late\n")),
+        dropped: false,
+    };
+    assert!(
+        !apply_event(
+            &mut registry,
+            &id,
+            &mut tracker,
+            &late,
+            t0 + time::Duration::seconds(2),
+        )
+        .expect("O")
+    );
+
+    let commands = registry
+        .transcript(&by_id(&created.terminal_id), None)
+        .expect("读取 transcript")
+        .commands;
+    assert_eq!(commands[1].command, "second");
+    assert_eq!(commands[1].output, "", "旧命令迟到 O 不得污染新命令");
+}
+
+/// mixed 命令最小复现：C → O(host) → PTY 全文 → D，native 行未被 O 覆盖，
+/// 应标 incomplete。模拟 ConPTY 的混合回显（命令回显 + host 行 + native 行）。
+#[test]
+fn mixed_output_marks_incomplete_when_native_line_uncovered() {
+    let mut registry = registry();
+    let created = registry.create(params()).expect("create");
+    let id = TerminalId::new(created.terminal_id.clone());
+    registry
+        .set_transcript_output_from_events(&id, true)
+        .expect("O 语义");
+    let t0 = base();
+    let mut tracker = ShellEventTracker::new();
+    let command = "Write-Output host; cmd /c echo native";
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event_with_meta(
+            ShellEventKind::CommandStart,
+            None,
+            "cmd-1",
+            Some(command),
+            Some(millis(t0)),
+            None,
+        ),
+        t0,
+    )
+    .expect("C");
+
+    let output_event = ShellEvent {
+        kind: ShellEventKind::CommandOutput,
+        code: None,
+        id: Some("cmd-1".to_string()),
+        command: None,
+        started_at_ms: None,
+        ended_at_ms: None,
+        data: Some(STANDARD.encode(b"host\r\n")),
+        dropped: false,
+    };
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &output_event,
+        t0 + time::Duration::milliseconds(100),
+    )
+    .expect("O");
+
+    // ConPTY 混合文本：命令回显 + host 输出 + native 输出 + 新 prompt。
+    let pty_text = format!("PS> {command}\r\nhost\r\nnative\r\nPS> ");
+    registry
+        .record_pty_transcript_output(&id, &pty_text, t0 + time::Duration::milliseconds(200))
+        .expect("PTY 兜底");
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+        t0 + time::Duration::milliseconds(300),
+    )
+    .expect("D");
+
+    let commands = registry
+        .transcript(&by_id(&created.terminal_id), None)
+        .expect("读取 transcript")
+        .commands;
+    let last = commands.last().expect("应有命令记录");
+    assert_eq!(last.output.trim(), "host", "输出应只含 O 文本");
+    assert!(
+        last.incomplete,
+        "native 行未被 O 覆盖，应标 incomplete（实际 output={:?}）",
+        last.output
+    );
+}
+
+/// PTY 先于 O 到达的变体：C → PTY 全文 → O(host) → D，仍应标 incomplete。
+#[test]
+fn mixed_output_marks_incomplete_when_pty_arrives_before_output_event() {
+    let mut registry = registry();
+    let created = registry.create(params()).expect("create");
+    let id = TerminalId::new(created.terminal_id.clone());
+    registry
+        .set_transcript_output_from_events(&id, true)
+        .expect("O 语义");
+    let t0 = base();
+    let mut tracker = ShellEventTracker::new();
+    let command = "Write-Output host; cmd /c echo native";
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event_with_meta(
+            ShellEventKind::CommandStart,
+            None,
+            "cmd-1",
+            Some(command),
+            Some(millis(t0)),
+            None,
+        ),
+        t0,
+    )
+    .expect("C");
+
+    let pty_text = format!("PS> {command}\r\nhost\r\nnative\r\nPS> ");
+    registry
+        .record_pty_transcript_output(&id, &pty_text, t0 + time::Duration::milliseconds(100))
+        .expect("PTY 兜底");
+
+    let output_event = ShellEvent {
+        kind: ShellEventKind::CommandOutput,
+        code: None,
+        id: Some("cmd-1".to_string()),
+        command: None,
+        started_at_ms: None,
+        ended_at_ms: None,
+        data: Some(STANDARD.encode(b"host\r\n")),
+        dropped: false,
+    };
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &output_event,
+        t0 + time::Duration::milliseconds(200),
+    )
+    .expect("O");
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+        t0 + time::Duration::milliseconds(300),
+    )
+    .expect("D");
+
+    let commands = registry
+        .transcript(&by_id(&created.terminal_id), None)
+        .expect("读取 transcript")
+        .commands;
+    let last = commands.last().expect("应有命令记录");
+    assert!(
+        last.incomplete,
+        "PTY 先到时 native 行仍应触发 incomplete（实际 output={:?}）",
+        last.output
+    );
+}
+
+/// PTY 在 C 之前到达的变体（真实 ConPTY 下命令回显先于 C 事件）：
+/// 早到文本暂存 pre-command 缓冲，新命令创建时并入兜底——native 段
+/// 不得静默丢失，仍应标 incomplete。
+#[test]
+fn mixed_output_with_pty_before_command_start() {
+    let mut registry = registry();
+    let created = registry.create(params()).expect("create");
+    let id = TerminalId::new(created.terminal_id.clone());
+    registry
+        .set_transcript_output_from_events(&id, true)
+        .expect("O 语义");
+    let t0 = base();
+    let mut tracker = ShellEventTracker::new();
+    let command = "Write-Output host; cmd /c echo native";
+
+    // PTY 先到：无 Running 记录，暂存 pre-command 缓冲。
+    let pty_text = format!("PS> {command}\r\nhost\r\nnative\r\nPS> ");
+    registry
+        .record_pty_transcript_output(&id, &pty_text, t0)
+        .expect("早到 PTY");
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event_with_meta(
+            ShellEventKind::CommandStart,
+            None,
+            "cmd-1",
+            Some(command),
+            Some(millis(t0)),
+            None,
+        ),
+        t0 + time::Duration::milliseconds(100),
+    )
+    .expect("C");
+
+    let output_event = ShellEvent {
+        kind: ShellEventKind::CommandOutput,
+        code: None,
+        id: Some("cmd-1".to_string()),
+        command: None,
+        started_at_ms: None,
+        ended_at_ms: None,
+        data: Some(STANDARD.encode(b"host\r\n")),
+        dropped: false,
+    };
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &output_event,
+        t0 + time::Duration::milliseconds(200),
+    )
+    .expect("O");
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+        t0 + time::Duration::milliseconds(300),
+    )
+    .expect("D");
+
+    let commands = registry
+        .transcript(&by_id(&created.terminal_id), None)
+        .expect("读取 transcript")
+        .commands;
+    let last = commands.last().expect("应有命令记录");
+    assert_eq!(last.output.trim(), "host", "输出应只含 O 文本");
+    assert!(
+        last.incomplete,
+        "早到 PTY 暂存并入后 native 行应触发 incomplete（实际 output={:?}）",
+        last.output
+    );
+}
+
+/// D 结束后迟到的 prompt/尾段块不得撤销 settle 已标的 incomplete：
+/// 真实 ConPTY 会在 D 之后补发新 prompt 块，若重估只看该块（settle 清空
+/// 缓冲后仅剩 prompt）会误判「已覆盖」而清标记（e2e 间歇失败根因）。
+#[test]
+fn late_prompt_chunk_after_end_keeps_incomplete_evidence() {
+    let mut registry = registry();
+    let created = registry.create(params()).expect("create");
+    let id = TerminalId::new(created.terminal_id.clone());
+    registry
+        .set_transcript_output_from_events(&id, true)
+        .expect("O 语义");
+    let t0 = base();
+    let mut tracker = ShellEventTracker::new();
+    let command = "Write-Output host; cmd /c echo native";
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event_with_meta(
+            ShellEventKind::CommandStart,
+            None,
+            "cmd-1",
+            Some(command),
+            Some(millis(t0)),
+            None,
+        ),
+        t0,
+    )
+    .expect("C");
+
+    let output_event = ShellEvent {
+        kind: ShellEventKind::CommandOutput,
+        code: None,
+        id: Some("cmd-1".to_string()),
+        command: None,
+        started_at_ms: None,
+        ended_at_ms: None,
+        data: Some(STANDARD.encode(b"host\r\n")),
+        dropped: false,
+    };
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &output_event,
+        t0 + time::Duration::milliseconds(100),
+    )
+    .expect("O");
+
+    let pty_text = format!("PS> {command}\r\nhost\r\nnative\r\n");
+    registry
+        .record_pty_transcript_output(&id, &pty_text, t0 + time::Duration::milliseconds(200))
+        .expect("PTY 兜底");
+
+    apply_event(
+        &mut registry,
+        &id,
+        &mut tracker,
+        &event(ShellEventKind::CommandEnd, Some(0), "cmd-1"),
+        t0 + time::Duration::milliseconds(300),
+    )
+    .expect("D");
+
+    // D 之后 ConPTY 补发的新 prompt 块（迟到 PTY）。
+    registry
+        .record_pty_transcript_output(&id, "PS> ", t0 + time::Duration::milliseconds(400))
+        .expect("迟到 prompt 块");
+
+    let commands = registry
+        .transcript(&by_id(&created.terminal_id), None)
+        .expect("读取 transcript")
+        .commands;
+    let last = commands.last().expect("应有命令记录");
+    assert!(
+        last.incomplete,
+        "迟到 prompt 块不得撤销 settle 已标的 incomplete（实际 output={:?}）",
+        last.output
+    );
 }

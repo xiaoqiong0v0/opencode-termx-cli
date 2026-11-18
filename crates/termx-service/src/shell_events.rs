@@ -3,8 +3,9 @@
 //! 传输、token 校验与 JSON Lines 帧解析在 [`termx_shell_events`] 中；本模块
 //! 只保留与 registry 相关的判定逻辑：
 //! - `C` 绑定当时最后一条 transcript 命令的代次；
-//! - `O` 只有 command-id 与当前 active 一致时解码 base64/UTF-8 并追加到该
-//!   代次命令，不生成 xterm 输出；
+//! - `O` 按 command-id 匹配当前 active 或刚被 `D` 结束的命令（`D` 后迟到
+//!   的 `O` 受控写入），解码 base64/UTF-8 后追加到该代次命令，不生成 xterm
+//!   输出；
 //! - `D` 只有 command-id 与代次都匹配时才结束 transcript，避免旧命令的迟到
 //!   `D` 关掉新命令；
 //! - 通道失败/断开只让 transcript 退化为静默判定，不伪造退出码。
@@ -26,9 +27,14 @@ struct ActiveCommand {
 }
 
 /// 记录当前 `C` 的 command-id 与代次，并用它们校验后续 `D`。
+///
+/// `last_ended` 保留刚被 `D` 结束的命令身份：`D` 之后仍可能迟到 `O`（宿主
+/// `WaitForOutputDrain` 超时后 `D` 先入队），按 command-id + 代次匹配它即可
+/// 受控写入；下一条 `C`/`X` 到达后清空，锁死归因边界。
 #[derive(Debug, Default)]
 pub struct ShellEventTracker {
     active: Option<ActiveCommand>,
+    last_ended: Option<ActiveCommand>,
 }
 
 impl ShellEventTracker {
@@ -45,6 +51,22 @@ impl ShellEventTracker {
     /// 当前 active command 绑定的 transcript 代次。
     pub fn active_generation(&self) -> Option<u64> {
         self.active.as_ref().map(|active| active.generation)
+    }
+
+    /// 解析 `O` 事件应写入的命令代次：优先匹配当前 active，其次匹配刚被 `D`
+    /// 结束的命令（`D` 后迟到的 `O`）；都不匹配返回 `None`（归因边界外丢弃）。
+    pub fn output_generation(&self, id: Option<&str>) -> Option<u64> {
+        if let Some(active) = &self.active {
+            if id == Some(active.id.as_str()) {
+                return Some(active.generation);
+            }
+        }
+        if let Some(ended) = &self.last_ended {
+            if id == Some(ended.id.as_str()) {
+                return Some(ended.generation);
+            }
+        }
+        None
     }
 
     /// 观察事件；只有与当前 `C` 匹配的 `D` 返回 `(代次, 退出码)`。
@@ -64,6 +86,8 @@ impl ShellEventTracker {
                     id,
                     generation: current_generation,
                 });
+                // 新命令开始：旧命令的迟到 `O` 不再匹配，锁死归因边界。
+                self.last_ended = None;
                 None
             }
             ShellEventKind::CommandEnd => {
@@ -72,15 +96,17 @@ impl ShellEventTracker {
                     return None;
                 }
                 let generation = active.generation;
-                self.active = None;
+                self.last_ended = self.active.take();
                 Some((generation, event.code))
             }
             ShellEventKind::PromptStart | ShellEventKind::PromptEnd => None,
             // `O` 不改变 active 命令；匹配与追加由 `apply_event` 处理。
             ShellEventKind::CommandOutput => None,
-            // `X`：多行输入未执行，丢弃当前 active，避免迟到的 `D` 误结束。
+            // `X`：多行输入未执行，丢弃当前 active，避免迟到的 `D` 误结束；
+            // 同时清空 last_ended，避免被撤销命令的迟到 `O` 被误写。
             ShellEventKind::CommandAbort => {
                 self.active = None;
+                self.last_ended = None;
                 None
             }
         }
@@ -116,11 +142,12 @@ pub fn apply_event(
                 exit_code,
                 generation,
                 ended_at,
+                now,
             )?;
             if event.dropped {
-                // 宿主队列丢弃过 O 帧：文本可能缺失，但退出码/状态保持真实。
-                // 已由静默判定结束的记录也要补上标记。
-                registry.mark_transcript_incomplete_for_generation(terminal_id, generation)?;
+                // 宿主队列丢弃过 O 帧：文本不可逆缺失，置 dropped 与 incomplete；
+                // 退出码/状态保持真实，已由静默判定结束的记录也要补上标记。
+                registry.mark_transcript_dropped_for_generation(terminal_id, generation)?;
             }
             Ok(ended)
         }
@@ -148,13 +175,9 @@ fn apply_command_output(
     event: &ShellEvent,
     now: OffsetDateTime,
 ) -> Result<bool, CoreError> {
-    let Some(active_id) = tracker.active_command_id() else {
-        return Ok(false);
-    };
-    if event.id.as_deref() != Some(active_id) {
-        return Ok(false);
-    }
-    let Some(generation) = tracker.active_generation() else {
+    // `D` 后迟到的 `O` 按 command-id 匹配「刚结束的命令」受控写入；不匹配
+    // 当前 active 或 last_ended 的 `O` 一律丢弃（归因边界）。
+    let Some(generation) = tracker.output_generation(event.id.as_deref()) else {
         return Ok(false);
     };
     let Some(data) = event.data.as_deref() else {

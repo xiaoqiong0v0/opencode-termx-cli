@@ -419,9 +419,11 @@ impl Registry {
     /// 其他语义与 [`Registry::register_create`] 完全一致。
     ///
     /// `transcript_output_from_events=true` 表示命令输出改由带外 `O` 事件提供，
-    /// PTY 输出只用于显示、不再追加到 transcript；此时也不启用迟到的 PTY
-    /// 尾段兜底（`allow_late_output`），静默结束不提前提升兜底（避免与迟到
-    /// `O` 重复）。本地 `termx-pwsh` 与远端 helper 事件通道（ssh + pty +
+    /// PTY 输出只用于显示、不再追加到 transcript，仅作为无 `O` 命令的兜底；
+    /// 静默结束不提前提升兜底（避免与迟到 `O` 重复）。`termx-pwsh` 仍启用
+    /// 迟到输出（`allow_late_output`）：ConPTY 上 D 可能先于最后一段 PTY
+    /// 兜底到达，屏障失败后允许迟到 `O`/PTY 受控追加并重估 `incomplete`。
+    /// 本地 `termx-pwsh` 与远端 helper 事件通道（ssh + pty +
     /// 结构化 runtime + helper `shell_events`）都会传 `true`；旧端、raw
     /// 终端、非 pwsh runtime 与无事件通道的远端（旧 helper / fallback）传
     /// `false`。
@@ -475,14 +477,16 @@ impl Registry {
         let pgid = backend.pgid();
         let ssh = params.ssh.is_some();
         let runtime_id = params.runtime_id.clone();
-        let allow_late_output = !transcript_output_from_events
-            && (params.runtime_id.as_deref() == Some("termx-pwsh")
-                || params
-                    .cmd
-                    .trim()
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .is_some_and(|name| name == "termx-pwsh"));
+        // 只对 termx-pwsh 启用：Windows ConPTY 无法保证 D 在最后一段输出
+        // （含 PTY 兜底）之后到达，屏障失败/超时后仍可能迟到 O/PTY。带外
+        // `O` 与 PTY 兜底两条路径共用该开关，不扩大到其它 runtime。
+        let allow_late_output = params.runtime_id.as_deref() == Some("termx-pwsh")
+            || params
+                .cmd
+                .trim()
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|name| name == "termx-pwsh");
 
         let entry = TerminalEntry {
             id: id.clone(),
@@ -755,20 +759,9 @@ impl Registry {
         Ok(entry.transcript.record_pty_output_for_current(text, now))
     }
 
-    /// 把当前（最后一条）命令标记为输出不完整。
-    ///
-    /// 只翻 `incomplete` 标记，不改变状态/退出码/`best_effort`；未知终端返回
-    /// [`CoreError::NotFound`]。
-    pub fn mark_transcript_incomplete(&mut self, id: &TerminalId) -> Result<bool, CoreError> {
-        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
-        Ok(entry.transcript.mark_output_incomplete())
-    }
-
-    /// 按代次把命令标记为输出不完整；代次不匹配时无变更。
-    ///
-    /// 供带外 `D` 的 `dropped` 与 PTY 屏障失败使用：命令可能已结束，标记仍
-    /// 要落到同一条记录上。未知终端返回 [`CoreError::NotFound`]。
-    pub fn mark_transcript_incomplete_for_generation(
+    /// 按代次记录宿主丢弃了 `O` 帧（`D{dropped:true}`）：同时置 `dropped` 与
+    /// `incomplete`；代次不匹配时无变更。未知终端返回 [`CoreError::NotFound`]。
+    pub fn mark_transcript_dropped_for_generation(
         &mut self,
         id: &TerminalId,
         generation: u64,
@@ -776,7 +769,21 @@ impl Registry {
         let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
         Ok(entry
             .transcript
-            .mark_output_incomplete_for_generation(generation))
+            .mark_output_dropped_for_generation(generation))
+    }
+
+    /// 按代次把命令标记为屏障失败导致的不完整；仅当该命令还没有 `O` 时才
+    /// 标记（宿主命令的 `O` 已覆盖输出时不误标）。未知终端返回
+    /// [`CoreError::NotFound`]。
+    pub fn mark_transcript_incomplete_for_barrier_failure(
+        &mut self,
+        id: &TerminalId,
+        generation: u64,
+    ) -> Result<bool, CoreError> {
+        let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
+        Ok(entry
+            .transcript
+            .mark_output_incomplete_for_barrier_failure(generation))
     }
 
     /// 以 `shell_integration` 来源结束当前命令。
@@ -818,27 +825,32 @@ impl Registry {
         generation: u64,
         now: OffsetDateTime,
     ) -> Result<bool, CoreError> {
-        self.record_transcript_end_for_generation_at(id, exit_code, generation, now)
+        self.record_transcript_end_for_generation_at(id, exit_code, generation, now, now)
     }
 
     /// 按代次结束当前命令，并使用宿主 `D` 提供的结束时间。
     ///
     /// 与 [`Registry::record_transcript_end_for_generation`] 相同，但
-    /// `ended_at` 来自事件时间而非 service 处理时间。
+    /// `ended_at` 来自事件时间而非 service 处理时间；`local_now` 是本地收帧
+    /// 时刻，迟到输出宽限窗以它为准（远端宿主的 `ended_at` 可能有时钟偏差）。
     pub fn record_transcript_end_for_generation_at(
         &mut self,
         id: &TerminalId,
         exit_code: Option<i32>,
         generation: u64,
         ended_at: OffsetDateTime,
+        local_now: OffsetDateTime,
     ) -> Result<bool, CoreError> {
         let entry = self.by_id.get_mut(id).ok_or(CoreError::NotFound)?;
-        Ok(entry.transcript.record_command_end_for_generation_at(
-            exit_code,
-            TranscriptSource::ShellIntegration,
-            generation,
-            ended_at,
-        ))
+        Ok(entry
+            .transcript
+            .record_command_end_for_generation_with_local_now(
+                exit_code,
+                TranscriptSource::ShellIntegration,
+                generation,
+                ended_at,
+                local_now,
+            ))
     }
 
     /// 对所有终端执行静默结束判定，返回被标记为 `done` 的命令数。

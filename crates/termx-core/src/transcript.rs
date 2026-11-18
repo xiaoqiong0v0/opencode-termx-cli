@@ -25,6 +25,15 @@ pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// 输出超过上限时追加一次的可读标记。
 pub const OUTPUT_TRUNCATED_MARKER: &str = "\n[output truncated]\n";
 
+/// D 之后迟到 PTY 文本的归因宽限窗：窗口内视为该命令的排空尾段，超窗
+/// 文本归因到下一条命令（pre-command 暂存）。
+///
+/// 判据是命令结束时按**本地收帧时钟**记下的 `late_window_end`（不用宿主
+/// `ended_at`，远端终端宿主与 service 时钟可能有偏差）。取值依据：宿主侧
+/// D 前的输出 drain 上限 2s，加上事件通道与 ConPTY 管道在高负载下的传输
+/// 余量；超过 5s 的文本几乎必然属于交互输入的下一命令回显。
+const LATE_PTY_GRACE: time::Duration = time::Duration::seconds(5);
+
 /// 单条命令的内部记录（时间保留为可计算类型）。
 #[derive(Debug, Clone)]
 struct CommandRecord {
@@ -34,6 +43,11 @@ struct CommandRecord {
     started_at: OffsetDateTime,
     /// 结束时间；运行中为 `None`。
     ended_at: Option<OffsetDateTime>,
+    /// 迟到 PTY 归因宽限窗的截止时刻（**本地收帧时钟**）。
+    ///
+    /// 命令结束时由本地 `now + LATE_PTY_GRACE` 计算，不使用宿主 `ended_at`
+    /// （宿主时钟与 service 时钟可能有偏差，远端终端尤其明显）。
+    late_window_end: Option<OffsetDateTime>,
     /// 当前状态。
     status: TranscriptStatus,
     /// 原始输出（保留 ANSI，读取时清洗）。
@@ -57,6 +71,12 @@ struct CommandRecord {
     ///
     /// 只描述“可能缺少文本”，不改变状态、退出码或 `best_effort`。
     output_incomplete: bool,
+    /// 宿主事件队列满/关闭丢弃了 `O` 帧（`D{dropped:true}`）。
+    ///
+    /// 与 `output_incomplete` 区分：`dropped` 是不可逆的文本丢失，迟到
+    /// `O`/PTY 到达后重估时不得清除 `incomplete`；屏障失败等可逆原因
+    /// 才允许重估撤销。
+    dropped: bool,
     /// PTY 兜底因超过上限被截断；结束时据此标记可能缺文本。
     pty_output_overflowed: bool,
     /// 单调递增的命令代次；用于带外事件按代次结束命令。
@@ -91,6 +111,13 @@ pub struct TranscriptBuffer {
     last_generation: u64,
     /// `terminal.send` 记录但尚未被宿主的 `C` 事件认领的代次。
     pending_generation: Option<u64>,
+    /// 早到 PTY 缓冲：无 Running 记录可挂靠时（上一命令已结束、新命令的
+    /// `C`/send 记录尚未创建）暂存 PTY 文本，`push_command` 时并入新记录的
+    /// 兜底。ConPTY 的命令回显/输出可能先于带外 `C` 事件到达，拒收会让
+    /// native 段静默丢失。
+    pre_command_pty: String,
+    /// 早到 PTY 缓冲曾溢出丢头；并入新命令时带出 `pty_output_overflowed`。
+    pre_command_pty_overflowed: bool,
     /// 已保留命令，按时间升序。
     commands: VecDeque<CommandRecord>,
     /// 当前命令输出的 OSC 133/633 增量扫描器（跨输出分块保持状态）。
@@ -144,6 +171,8 @@ impl TranscriptBuffer {
             revision: 0,
             last_generation: 0,
             pending_generation: None,
+            pre_command_pty: String::new(),
+            pre_command_pty_overflowed: false,
             commands: VecDeque::new(),
             scanner: OscScanner::new(),
             in_band_osc,
@@ -278,16 +307,25 @@ impl TranscriptBuffer {
             if last.status == TranscriptStatus::Running {
                 last.status = TranscriptStatus::Done;
                 last.ended_at = Some(now);
+                last.late_window_end = Some(now + LATE_PTY_GRACE);
             }
         }
         self.last_generation = self.last_generation.saturating_add(1);
+        // 早到 PTY 缓冲（`C` 事件之前到达的回显/native 文本）并入新记录
+        // 的兜底；溢出标记由 stash 侧维护（缓冲满丢头时置位）。
+        let pre_overflowed = self.pre_command_pty_overflowed;
+        let pre_pty = std::mem::take(&mut self.pre_command_pty);
+        self.pre_command_pty_overflowed = false;
+        let pre_pty =
+            &pre_pty[..floor_char_boundary(&pre_pty, pre_pty.len().min(MAX_OUTPUT_BYTES))];
         self.commands.push_back(CommandRecord {
             command: command.trim_end_matches(['\r', '\n']).to_string(),
             started_at: now,
             ended_at: None,
+            late_window_end: None,
             status: TranscriptStatus::Running,
             output: String::new(),
-            pty_output: String::new(),
+            pty_output: pre_pty.to_string(),
             event_output_seen: false,
             truncated: false,
             last_output_at: now,
@@ -295,7 +333,8 @@ impl TranscriptBuffer {
             source: None,
             best_effort: false,
             output_incomplete: false,
-            pty_output_overflowed: false,
+            dropped: false,
+            pty_output_overflowed: pre_overflowed,
             generation: self.last_generation,
         });
         while self.commands.len() > self.capacity {
@@ -378,6 +417,11 @@ impl TranscriptBuffer {
             last.event_output_seen = true;
         }
         if self.append_output(text, now) {
+            if let Some(last) = self.commands.back_mut() {
+                // 迟到 O 到齐后重估：只有确认文本完整（无 dropped、无溢出、
+                // 且覆盖全部 PTY 兜底行）时才撤销屏障失败误标的 incomplete。
+                reevaluate_incomplete(last);
+            }
             self.bump();
             true
         } else {
@@ -395,51 +439,148 @@ impl TranscriptBuffer {
         if text.is_empty() {
             return false;
         }
-        let Some(last) = self.commands.back_mut() else {
-            return false;
+        // 迟到 PTY：命令已真实结束（Done）且没有 O 时，只有显式允许迟到输出
+        // （Windows ConPTY 的 termx-pwsh）才追加；其余终态一律拒收。下一条
+        // 命令已开始（Running）走正常缓存路径，不串命令。
+        let allow_late_output = self.allow_late_output;
+        let late = self
+            .commands
+            .back()
+            .is_some_and(|last| last.status == TranscriptStatus::Done);
+        // PTY 与带外事件是两条并发通道：PTY 输出可能先于 `C` 事件到达，
+        // 因此 Running 记录（已由 send/C 创建）一律缓存。上一命令已 Done
+        // 后的 PTY 文本按宽限窗归因：D 后 [`LATE_PTY_GRACE`] 内视为该命令
+        // 的排空尾段（无 O 并入输出/有 O 参与重估）；超窗文本属于下一条
+        // 命令（交互逐键回显等），ConPTY 终端暂存 pre_command_pty、待新命
+        // 令创建时并入其兜底，其余终端保持拒收，不改变既有行为。
+        let last = self.commands.back();
+        let Some(last) = last else {
+            return self.stash_pre_command_pty(text);
         };
-        if last.status != TranscriptStatus::Running {
-            return false;
+        if last.status != TranscriptStatus::Running && !late {
+            if !self.allow_late_output {
+                return false;
+            }
+            return self.stash_pre_command_pty(text);
         }
-        last.last_output_at = now;
-        if last.pty_output.len() >= MAX_OUTPUT_BYTES {
-            last.pty_output_overflowed = true;
-            return false;
+        if late {
+            // 宽限窗用本地收帧时钟（`late_window_end`），宿主 `ended_at`
+            // 可能有跨机时钟偏差，不能作为判据。
+            let within_grace = last.late_window_end.is_some_and(|deadline| now <= deadline);
+            if !within_grace {
+                return self.stash_pre_command_pty(text);
+            }
         }
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(last.pty_output.len());
-        let take = floor_char_boundary(text, remaining.min(text.len()));
-        if take < text.len() {
-            last.pty_output_overflowed = true;
+        let changed = {
+            let Some(last) = self.commands.back_mut() else {
+                return false;
+            };
+            if last.status != TranscriptStatus::Running && !(late && allow_late_output) {
+                return false;
+            }
+            last.last_output_at = now;
+            if last.pty_output.len() >= MAX_OUTPUT_BYTES {
+                last.pty_output_overflowed = true;
+                return false;
+            }
+            let remaining = MAX_OUTPUT_BYTES.saturating_sub(last.pty_output.len());
+            let take = floor_char_boundary(text, remaining.min(text.len()));
+            if take < text.len() {
+                last.pty_output_overflowed = true;
+            }
+            last.pty_output.push_str(&text[..take]);
+            if late {
+                if last.event_output_seen {
+                    // 有 O：迟到兜底块追加进缓冲后重估；缓冲保留完整证据
+                    // （不 clear），迟到块只能加强「未覆盖」证据，不能凭单个
+                    // 被清洗掉的 prompt 块清掉 settle 已标的 incomplete。
+                    reevaluate_incomplete(last);
+                } else {
+                    // 无 O：兜底并入输出，再重估（清除屏障失败的「无输出」
+                    // 误标）。
+                    let fallback = std::mem::take(&mut last.pty_output);
+                    append_output_limited(last, &fallback);
+                    reevaluate_incomplete(last);
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.bump();
         }
-        last.pty_output.push_str(&text[..take]);
-        false
+        changed
     }
 
-    /// 把当前（最后一条）命令标记为输出不完整；返回是否发生变更。
+    /// 暂存早到 PTY 文本：无 Running 记录可挂靠时先存入 pre-command 缓冲，
+    /// 待下一条命令创建（`push_command`）时并入其兜底。
     ///
-    /// 只翻转 `incomplete` 标记并递增修订号，不改变状态、退出码或
-    /// `best_effort`；重复标记不再计费。
-    pub fn mark_output_incomplete(&mut self) -> bool {
-        let Some(last) = self.commands.back_mut() else {
-            return false;
-        };
-        if last.output_incomplete {
-            return false;
+    /// 缓冲受 [`MAX_OUTPUT_BYTES`] 上限保护，溢出只保留末尾（末尾是最新
+    /// 文本，含 native 段的可能性最高）；后续并入新记录时会带上溢出标记。
+    /// 返回是否发生了变更（首次暂存或缓冲增长均计一次变更）。
+    fn stash_pre_command_pty(&mut self, text: &str) -> bool {
+        if self.pre_command_pty.len() >= MAX_OUTPUT_BYTES {
+            // 缓冲已满：丢弃更早的头部，保留末尾（最新文本优先），并记录
+            // 溢出——并入新命令时带出 pty_output_overflowed 证据。
+            let keep = floor_char_boundary(&self.pre_command_pty, MAX_OUTPUT_BYTES / 2);
+            self.pre_command_pty.drain(..keep);
+            self.pre_command_pty_overflowed = true;
         }
-        last.output_incomplete = true;
+        let remaining = MAX_OUTPUT_BYTES.saturating_sub(self.pre_command_pty.len());
+        if text.len() > remaining {
+            // 只放得下尾部：最新文本优先，同样记录溢出。
+            let mut start = text.len() - remaining;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.pre_command_pty.push_str(&text[start..]);
+            self.pre_command_pty_overflowed = true;
+        } else {
+            self.pre_command_pty.push_str(text);
+        }
         self.bump();
         true
     }
 
-    /// 按代次把命令标记为输出不完整；代次不匹配时无变更。
+    /// 按代次记录宿主丢弃了 `O` 帧（`D{dropped:true}`）：同时置 `dropped` 与
+    /// `incomplete`。
     ///
-    /// 供 `D` 携带的 `dropped` 与屏障失败使用：命令可能已经结束，标记仍要
-    /// 落到同一条记录上；不伪造退出码、不改变 `best_effort`。
-    pub fn mark_output_incomplete_for_generation(&mut self, generation: u64) -> bool {
+    /// `dropped` 是不可逆的文本丢失：迟到 `O`/PTY 到达后重估不得清除
+    /// `incomplete`。代次不匹配时无变更；重复标记不再计费。
+    pub fn mark_output_dropped_for_generation(&mut self, generation: u64) -> bool {
         let Some(last) = self.commands.back_mut() else {
             return false;
         };
-        if last.generation != generation || last.output_incomplete {
+        if last.generation != generation {
+            return false;
+        }
+        let mut changed = false;
+        if !last.dropped {
+            last.dropped = true;
+            changed = true;
+        }
+        if !last.output_incomplete {
+            last.output_incomplete = true;
+            changed = true;
+        }
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// 按代次把命令标记为屏障失败导致的不完整；仅当该命令还没有 `O`
+    /// （`event_output_seen=false`）时才标记。
+    ///
+    /// 屏障失败只意味着 PTY 兜底可能缺失；宿主命令的 `O` 已覆盖输出时
+    /// 不误标，迟到 `O`/PTY 到达后由 [`reevaluate_incomplete`] 重估兜底。
+    /// 代次不匹配或已标记时无变更。
+    pub fn mark_output_incomplete_for_barrier_failure(&mut self, generation: u64) -> bool {
+        let Some(last) = self.commands.back_mut() else {
+            return false;
+        };
+        if last.generation != generation || last.event_output_seen || last.output_incomplete {
             return false;
         }
         last.output_incomplete = true;
@@ -491,7 +632,7 @@ impl TranscriptBuffer {
         let Some(last) = self.commands.back_mut() else {
             return false;
         };
-        let changed = finish_command(last, exit_code, source, now);
+        let changed = finish_command(last, exit_code, source, now, now);
         if changed {
             self.bump();
         }
@@ -516,7 +657,13 @@ impl TranscriptBuffer {
     /// 按代次结束命令，并使用宿主 `D` 提供的结束时间。
     ///
     /// 代次不匹配时不生效；其余语义与
-    /// [`Self::record_command_end_for_generation`] 相同。
+    /// [`Self::record_command_end_for_generation`] 相同。本地收帧时刻按
+    /// `ended_at` 处理（测试/同机调用方使用）；带外事件应使用
+    /// [`Self::record_command_end_for_generation_with_local_now`] 传独立本地时刻。
+    ///
+    /// 注意：本方法是兼容便捷入口，会把宿主 `ended_at` 当作本地收帧时刻；
+    /// 远端终端（宿主时钟可能不同）必须走 `_with_local_now` 版本，否则迟到
+    /// PTY 归因宽限窗会按宿主时钟计算。
     pub fn record_command_end_for_generation_at(
         &mut self,
         exit_code: Option<i32>,
@@ -524,13 +671,31 @@ impl TranscriptBuffer {
         generation: u64,
         ended_at: OffsetDateTime,
     ) -> bool {
+        self.record_command_end_for_generation_with_local_now(
+            exit_code, source, generation, ended_at, ended_at,
+        )
+    }
+
+    /// 按代次结束命令：`ended_at` 为宿主事件时间（可为远端时钟），
+    /// `local_now` 为 service 本地收帧时刻。
+    ///
+    /// 迟到 PTY 宽限窗用 `local_now + LATE_PTY_GRACE` 记录，避免跨机时钟
+    /// 偏差破坏归因边界。代次不匹配时不生效。
+    pub fn record_command_end_for_generation_with_local_now(
+        &mut self,
+        exit_code: Option<i32>,
+        source: TranscriptSource,
+        generation: u64,
+        ended_at: OffsetDateTime,
+        local_now: OffsetDateTime,
+    ) -> bool {
         let Some(last) = self.commands.back_mut() else {
             return false;
         };
         if last.generation != generation {
             return false;
         }
-        let changed = finish_command(last, exit_code, source, ended_at);
+        let changed = finish_command(last, exit_code, source, ended_at, local_now);
         if changed {
             self.bump();
         }
@@ -570,6 +735,7 @@ impl TranscriptBuffer {
         settle_pty_output(last);
         last.status = TranscriptStatus::Done;
         last.ended_at = Some(last.last_output_at);
+        last.late_window_end = Some(now + LATE_PTY_GRACE);
         last.source = Some(TranscriptSource::ProcessGroup);
         last.best_effort = true;
         self.bump();
@@ -589,6 +755,7 @@ impl TranscriptBuffer {
         settle_pty_output(last);
         last.status = status;
         last.ended_at = Some(now);
+        last.late_window_end = Some(now + LATE_PTY_GRACE);
         self.bump();
         true
     }
@@ -671,8 +838,10 @@ impl Default for TranscriptBuffer {
 
 /// 在命令结束时收敛 PTY 兜底：
 /// - 没有 `O`：把兜底并入正式输出；兜底溢出则标记不完整。
-/// - 有 `O`：丢弃兜底；若兜底里存在 `O` 未覆盖的可见行（native 段），
-///   或兜底溢出，则只标记 `incomplete`，不追加、不伪造退出码。
+/// - 有 `O`：兜底只做覆盖比对（`incomplete` 判据），**不并入也不清空**——
+///   保留完整缓冲作为证据，供 D 后迟到 O/PTY 块重估：迟到 O 覆盖全部
+///   可见行时可撤销误标；迟到 PTY 块只能加强「未覆盖」证据，不能凭单个
+///   被清洗掉的 prompt 块撤销 settle 已标的 incomplete。
 fn settle_pty_output(record: &mut CommandRecord) {
     if record.pty_output.is_empty() {
         if record.pty_output_overflowed {
@@ -697,7 +866,6 @@ fn settle_pty_output(record: &mut CommandRecord) {
     if has_uncovered_visible_lines(&fallback, &events) {
         record.output_incomplete = true;
     }
-    record.pty_output.clear();
 }
 
 /// PTY 兜底里是否有 `O` 文本未覆盖的可见行。
@@ -709,6 +877,29 @@ fn has_uncovered_visible_lines(fallback: &str, events: &str) -> bool {
         .any(|line| !events.contains(line))
 }
 
+/// 追加迟到输出后重估 `incomplete`：按当前证据重新判定，宁可误报也不丢
+/// “文本可能不完整”的证据。
+///
+/// 判定规则（任一命中即不完整）：
+/// - 宿主丢弃过 `O`（`dropped`）；
+/// - PTY 兜底溢出（`pty_output_overflowed`）；
+/// - PTY 兜底里存在 `O` 未覆盖的可见行（native 段）。
+///
+/// 同时承担“标记”与“撤销”：屏障失败误标而迟到输出已补全时清 `incomplete`，
+/// 迟到 PTY 暴露未覆盖的 native 段时置 `incomplete`。
+fn reevaluate_incomplete(record: &mut CommandRecord) {
+    let incomplete = record.dropped
+        || record.pty_output_overflowed
+        || (!record.pty_output.is_empty() && {
+            let fallback = clean_output(&record.command, &record.pty_output);
+            let events = clean_output(&record.command, &record.output);
+            has_uncovered_visible_lines(&fallback, &events)
+        });
+    if record.output_incomplete != incomplete {
+        record.output_incomplete = incomplete;
+    }
+}
+
 /// 结束一条命令记录：`running` 或可升级的 `best_effort done` 才生效。
 ///
 /// 返回是否发生变更；不触碰修订号，由调用方统一 bump。
@@ -716,7 +907,8 @@ fn finish_command(
     record: &mut CommandRecord,
     exit_code: Option<i32>,
     source: TranscriptSource,
-    now: OffsetDateTime,
+    ended_at: OffsetDateTime,
+    local_now: OffsetDateTime,
 ) -> bool {
     let upgradeable = record.status == TranscriptStatus::Done && record.best_effort;
     if record.status != TranscriptStatus::Running && !upgradeable {
@@ -724,7 +916,8 @@ fn finish_command(
     }
     settle_pty_output(record);
     record.status = TranscriptStatus::Done;
-    record.ended_at = Some(now);
+    record.ended_at = Some(ended_at);
+    record.late_window_end = Some(local_now + LATE_PTY_GRACE);
     record.exit_code = exit_code;
     record.source = Some(source);
     record.best_effort = false;
@@ -744,6 +937,7 @@ fn revive_done(record: &mut CommandRecord) -> bool {
     }
     record.status = TranscriptStatus::Running;
     record.ended_at = None;
+    record.late_window_end = None;
     record.exit_code = None;
     record.source = None;
     record.best_effort = false;
@@ -836,11 +1030,19 @@ pub fn clean_output(command: &str, raw: &str) -> String {
             continue;
         }
         // PTY 可能在命令回显尚未写完时被截断（ConPTY 光标/分块），
-        // 留下命令前缀。它仍是回显，不是程序输出。
+        // 留下命令前缀；PSReadLine 重绘还可能留下从单词中间开始的残片
+        // （`rite-Output ...`），或带提示符前缀的整条回显。它们都是回显，
+        // 不是输出；但「输出恰好等于命令里的某个词」是合法的（如
+        // `echo foo` 输出 `foo`），不能按后缀一刀切。短命令（`ls`）不做
+        // 子串整行匹配，避免吞掉含该串的合法输出。
         let compact_line = compact_for_echo(&stripped);
+        let looks_like_full_echo =
+            compact_command.len() >= 8 && compact_line.contains(&compact_command);
         if !compact_command.is_empty()
             && compact_line.len() >= 8
-            && compact_command.starts_with(&compact_line)
+            && (compact_command.starts_with(&compact_line)
+                || looks_like_full_echo
+                || is_mid_token_echo_fragment(command, &stripped))
         {
             continue;
         }
@@ -867,6 +1069,28 @@ pub fn clean_output(command: &str, raw: &str) -> String {
 /// 去掉全部空白，用于比对多行命令与折叠成单行的 PTY 回显。
 fn compact_for_echo(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+/// 判断一行是否是从单词中间开始的命令回显残片。
+///
+/// PSReadLine 重绘可能在 UTF-16/ANSI 分块边界丢字符，留下
+/// `rite-Output "file 'quoted' ok"` 这类片段：它是命令的子串，且在原命令里
+/// 紧邻的前一个字符仍是单词字符（字母/数字/下划线）。合法的命令输出
+/// （如 `echo foo` 的 `foo`）虽然也是命令子串，但前面是空白/引号/行首。
+fn is_mid_token_echo_fragment(command: &str, line: &str) -> bool {
+    let line = line.trim();
+    if line.len() < 8 {
+        return false;
+    }
+    match command.find(line) {
+        // 整行就是命令开头（提示符/光标控制已被剥掉）。
+        Some(0) => true,
+        Some(pos) => command[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_'),
+        None => false,
+    }
 }
 
 /// 判断 shell 启动横幅/版权行（这些不是命令输出）。
@@ -1509,9 +1733,9 @@ mod tests {
             generation,
             t0,
         ));
-        assert!(buffer.mark_output_incomplete_for_generation(generation));
+        assert!(buffer.mark_output_incomplete_for_barrier_failure(generation));
         assert!(
-            !buffer.mark_output_incomplete_for_generation(generation),
+            !buffer.mark_output_incomplete_for_barrier_failure(generation),
             "重复标记不再变更"
         );
 
@@ -1520,6 +1744,107 @@ mod tests {
         assert_eq!(command.source, Some(TranscriptSource::ShellIntegration));
         assert!(!command.best_effort);
         assert!(command.incomplete);
+    }
+
+    #[test]
+    fn late_pty_beyond_grace_is_attributed_to_next_command() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let first = buffer.record_command_at("first", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            None,
+            TranscriptSource::ShellIntegration,
+            first,
+            t0,
+        ));
+
+        // 超出 5s 宽限窗：不得并入已结束命令（交互下一命令回显的归因边界）。
+        assert!(
+            buffer.record_pty_output_for_current("dir-echo\r\n", t0 + time::Duration::seconds(6),)
+        );
+        let commands = buffer.read(None).commands;
+        assert_eq!(commands[0].output, "", "超窗迟到文本不得并入上一条命令");
+
+        // 下一条命令创建时，暂存文本并入其兜底，并在结束时成为其输出。
+        let second = buffer.record_command_at("second", t0 + time::Duration::seconds(7));
+        assert!(buffer.record_command_end_for_generation_at(
+            None,
+            TranscriptSource::ShellIntegration,
+            second,
+            t0 + time::Duration::seconds(8),
+        ));
+        let commands = buffer.read(None).commands;
+        assert!(
+            commands[1].output.contains("dir-echo"),
+            "暂存文本应归因到下一条命令（实际 {:?}）",
+            commands[1].output
+        );
+    }
+
+    #[test]
+    fn late_pty_within_grace_still_merges_into_ended_command() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("cmd /c echo native", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            None,
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        assert!(
+            buffer.record_pty_output_for_current("native\r\n", t0 + time::Duration::seconds(1),)
+        );
+        let commands = buffer.read(None).commands;
+        assert!(
+            commands[0].output.contains("native"),
+            "宽限窗内迟到文本应并入刚结束命令（症状 B 语义）"
+        );
+    }
+
+    #[test]
+    fn late_pty_grace_uses_local_clock_not_host_ended_at() {
+        // 宿主时钟偏差（ended_at 比本地早 1 小时）不得让宽限窗失效：
+        // 判据是本地收帧时刻记下的 late_window_end。
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("cmd /c echo native", t0);
+        let skewed_host_end = t0 - time::Duration::hours(1);
+        assert!(buffer.record_command_end_for_generation_with_local_now(
+            None,
+            TranscriptSource::ShellIntegration,
+            generation,
+            skewed_host_end,
+            t0,
+        ));
+        assert!(
+            buffer.record_pty_output_for_current("native\r\n", t0 + time::Duration::seconds(1),),
+            "宿主时钟偏差下宽限窗仍应按本地时钟生效"
+        );
+        let commands = buffer.read(None).commands;
+        assert!(commands[0].output.contains("native"));
+    }
+
+    #[test]
+    fn pre_command_pty_overflow_marks_next_command_incomplete() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        // 无任何命令记录时到达的超大 PTY 文本全部进入 pre-command 缓冲。
+        let huge = "x".repeat(MAX_OUTPUT_BYTES + 1024);
+        assert!(buffer.record_pty_output_for_current(&huge, t0));
+
+        let generation = buffer.record_command_at("cmd", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            None,
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        let command = &buffer.read(None).commands[0];
+        assert!(
+            command.incomplete,
+            "pre-command 缓冲溢出必须带出 incomplete 证据"
+        );
     }
 
     #[test]
@@ -1732,6 +2057,23 @@ mod tests {
     }
 
     #[test]
+    fn clean_output_strips_prompt_prefixed_and_suffix_echo_frames() {
+        // PSReadLine 重绘：提示符前缀的整条回显 + 丢首字符的后缀回显帧。
+        let raw = "> Write-Output \"file 'quoted' ok\"\r\nrite-Output \"file 'quoted' ok\"\r\nfile 'quoted' ok\r\nPS D:\\>";
+        assert_eq!(
+            clean_output("Write-Output \"file 'quoted' ok\"", raw),
+            "file 'quoted' ok"
+        );
+    }
+
+    #[test]
+    fn clean_output_keeps_short_command_output_containing_command_text() {
+        // 短命令不得按子串整行匹配：`false.txt` 含 `ls`，但它是合法输出。
+        let raw = "ls\r\nfalse.txt\r\nPS D:\\>";
+        assert_eq!(clean_output("ls", raw), "false.txt");
+    }
+
+    #[test]
     fn clean_output_keeps_blank_lines_inside_output() {
         let raw = "printf 'a\\n\\nb'\r\na\r\n\r\nb\r\nC:\\>";
         assert_eq!(clean_output("printf 'a\\n\\nb'", raw), "a\n\nb");
@@ -1814,5 +2156,147 @@ mod tests {
         );
         let cleaned = clean_output("echo big", &raw);
         assert!(cleaned.ends_with("[output truncated]"), "实际: {cleaned:?}");
+    }
+
+    #[test]
+    fn barrier_failure_skips_incomplete_when_output_seen() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc(8, false);
+        let t0 = base();
+        let generation = buffer.record_command("Write-Output token", t0);
+        assert!(buffer.record_output_for_generation(generation, "token\n", t0));
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        // 屏障失败：已有 O 覆盖，不误标 incomplete。
+        assert!(!buffer.mark_output_incomplete_for_barrier_failure(generation));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "token");
+        assert!(!command.incomplete, "O 已覆盖的宿主命令不得被屏障失败误标");
+    }
+
+    #[test]
+    fn barrier_failure_incomplete_cleared_by_late_output() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("Write-Output token", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        // 屏障失败 + 无 O：标 incomplete。
+        assert!(buffer.mark_output_incomplete_for_barrier_failure(generation));
+        assert!(buffer.read(None).commands[0].incomplete);
+        // 迟到 O 到齐：incomplete 清除。
+        assert!(buffer.record_output_for_generation(
+            generation,
+            "token\n",
+            t0 + time::Duration::milliseconds(10),
+        ));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "token");
+        assert!(!command.incomplete, "迟到 O 到齐后应清除屏障失败误标");
+    }
+
+    #[test]
+    fn late_output_with_dropped_keeps_incomplete() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("Write-Output token", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        // 宿主丢弃了 O 帧：dropped + incomplete。
+        assert!(buffer.mark_output_dropped_for_generation(generation));
+        // 迟到 O 到达：追加成功，但 dropped 使 incomplete 保持。
+        assert!(buffer.record_output_for_generation(
+            generation,
+            "partial\n",
+            t0 + time::Duration::milliseconds(10),
+        ));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "partial");
+        assert!(command.incomplete, "宿主丢弃过 O 时 incomplete 不得清除");
+    }
+
+    #[test]
+    fn late_pty_fallback_appended_when_allowed() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("cmd /c echo token", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        // 屏障失败：无 O 标 incomplete。
+        assert!(buffer.mark_output_incomplete_for_barrier_failure(generation));
+        // 迟到 PTY 兜底：追加并并入输出，清除「无输出」误标。
+        assert!(
+            buffer
+                .record_pty_output_for_current("token\r\n", t0 + time::Duration::milliseconds(10),)
+        );
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "token");
+        assert!(
+            !command.incomplete,
+            "纯 PTY 兜底成为唯一输出后应清 incomplete"
+        );
+    }
+
+    #[test]
+    fn late_pty_fallback_marks_incomplete_for_uncovered_native() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("Write-Output host; cmd /c echo native", t0);
+        assert!(buffer.record_output_for_generation(generation, "host\n", t0));
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        // 屏障失败：已有 O（host）时不误标。
+        assert!(!buffer.mark_output_incomplete_for_barrier_failure(generation));
+        // 迟到 PTY 兜底带 native 段：未覆盖 → 置 incomplete。
+        assert!(buffer.record_pty_output_for_current(
+            "host\r\nnative\r\n",
+            t0 + time::Duration::milliseconds(10),
+        ));
+        let command = &buffer.read(None).commands[0];
+        assert_eq!(command.output, "host", "PTY 兜底不得追加到 O 文本");
+        assert!(command.incomplete, "native 段未覆盖必须标记 incomplete");
+    }
+
+    #[test]
+    fn late_output_rejected_after_next_command_starts() {
+        let mut buffer = TranscriptBuffer::with_in_band_osc_and_late_output(8, false, true);
+        let t0 = base();
+        let generation = buffer.record_command("first", t0);
+        assert!(buffer.record_command_end_for_generation_at(
+            Some(0),
+            TranscriptSource::ShellIntegration,
+            generation,
+            t0,
+        ));
+        // 新命令开始。
+        buffer.record_command("second", t0 + time::Duration::seconds(1));
+        // 旧命令的迟到 O（代次不匹配）必须被拒收，归因边界锁定。
+        assert!(!buffer.record_output_for_generation(
+            generation,
+            "late\n",
+            t0 + time::Duration::seconds(2),
+        ));
+        let result = buffer.read(None);
+        assert_eq!(result.commands[1].command, "second");
+        assert_eq!(result.commands[1].output, "");
     }
 }
